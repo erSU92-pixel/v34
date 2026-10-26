@@ -1,0 +1,40 @@
+name: XAUUSD Apex Spot Quant Bot
+
+on:
+  schedule:
+    # Berjalan otomatis setiap 15 menit
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    # Memungkinkan eksekusi manual dari tab Actions di GitHub
+
+jobs:
+  run-quant-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas requests
+
+      - name: Run Apex Bot Engine
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
+          RISK_PERCENT: ${{ secrets.RISK_PERCENT }}
+          ENFORCE_SESSION_FILTER: "true"
+        run: |
+          python bot.py
