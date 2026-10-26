@@ -55,15 +55,14 @@ def _env_bool(k: str, d: bool = True) -> bool:
 class Config:
     telegram_token: str = _env_str("TELEGRAM_TOKEN")
     telegram_chat_id: str = _env_str("TELEGRAM_CHAT_ID")
-    github_token: str = _env_str("GITHUB_TOKEN")
+    github_token: str = _env_str("GH_TOKEN")
     gist_id: str = _env_str("GIST_ID")
     
-    # Twelve Data Free API Key untuk XAU/USD Spot (atau gunakan key kustom Anda)
+    # Twelve Data Free API Key untuk XAU/USD Spot
     twelve_data_api_key: str = _env_str("TWELVE_DATA_API_KEY", "demo")
     ticker: str = "XAU/USD"
     
     # Sesi Waktu Likuiditas Utama (UTC Hours)
-    # London Session: 07:00 - 16:00 UTC | New York Session: 12:00 - 21:00 UTC
     enforce_session_filter: bool = _env_bool("ENFORCE_SESSION_FILTER", True)
     session_start_utc: int = 7   # Mulai Sesi London
     session_end_utc: int = 21    # Akhir Sesi New York
@@ -173,7 +172,6 @@ def fetch_spot_data(interval: str, outputsize: int = 300) -> pd.DataFrame:
         df = pd.DataFrame(data["values"])
         df = df.rename(columns={"datetime": "datetime", "open": "open", "high": "high", "low": "low", "close": "close"})
         
-        # Konversi tipe data string ke float
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
             
@@ -195,19 +193,16 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c = df["close"]
     
-    # RSI (EWM Method)
     d = c.diff()
     g = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     l = (-d).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     rs = g / l.replace(0, np.nan)
     df["rsi"] = 100 - 100 / (1 + rs)
     
-    # ATR
     prev_c = c.shift(1)
     tr = pd.concat([df["high"] - df["low"], (df["high"] - prev_c).abs(), (df["low"] - prev_c).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
     
-    # EMA Suite
     df["ema9"] = c.ewm(span=9, adjust=False).mean()
     df["ema21"] = c.ewm(span=21, adjust=False).mean()
     df["ema50"] = c.ewm(span=50, adjust=False).mean()
@@ -225,8 +220,8 @@ def main() -> None:
     # 1. PILAR 1: TIME-BASED SESSION FILTER
     if CONFIG.enforce_session_filter:
         if not (CONFIG.session_start_utc <= current_utc_hour <= CONFIG.session_end_utc):
-        log.info(f"Current UTC hour ({current_utc_hour}) is outside active liquidity hours ({CONFIG.session_start_utc}:00 - {CONFIG.session_end_utc}:00 UTC). Exiting cleanly.")
-        sys.exit(0)
+            log.info(f"Current UTC hour ({current_utc_hour}) is outside active liquidity hours ({CONFIG.session_start_utc}:00 - {CONFIG.session_end_utc}:00 UTC). Exiting cleanly.")
+            sys.exit(0)
 
     # 2. Tarik Data Spot M15 dan H1
     df = fetch_spot_data("15min", outputsize=300)
@@ -327,10 +322,8 @@ def main() -> None:
     print(msg.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", ""))
     print("=======================================================\n")
     
-    # Kirim Notifikasi ke Telegram
     send_telegram_alert(msg)
     
-    # 9. Simpan State ke Gist
     state["last_bar"] = bar_time
     state["last_side"] = side
     save_state(state)
