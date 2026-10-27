@@ -45,12 +45,11 @@ jobs:
           import yfinance as yf
           import websockets
 
-          MIN_REQUIRED_BARS = 2000  # Minimal data untuk bisa dihitung secara statistik
+          MIN_REQUIRED_BARS = 2000  # Tolak data jika kurang dari 2000 baris
 
           def format_df(df, source_name):
               if len(df) < MIN_REQUIRED_BARS:
-                  raise ValueError(f"Data dari {source_name} terlalu sedikit ({len(df)} baris). Cari sumber lain.")
-              
+                  raise ValueError(f"Data dari {source_name} terlalu sedikit ({len(df)} baris).")
               df = df.sort_values('timestamp').reset_index(drop=True)
               os.makedirs('data', exist_ok=True)
               df.to_csv('data/xauusd_m5.csv', index=False)
@@ -63,24 +62,20 @@ jobs:
               url = f'https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=5000&apikey={api_key}'
               r = requests.get(url, timeout=15).json()
               if 'values' not in r: raise ValueError(f"Error Twelve Data: {r}")
-              
               df = pd.DataFrame(r['values'])
               df['timestamp'] = pd.to_datetime(df['datetime'], utc=True)
               for col in ['open', 'high', 'low', 'close', 'volume']:
                   df[col] = pd.to_numeric(df[col], errors='coerce')
               df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].iloc[::-1]
               format_df(df, "Twelve Data")
-              return True
 
           async def fetch_deriv():
               url = 'wss://api.derivws.com/trading/v1/options/ws/public'
               async with websockets.connect(url) as ws:
-                  # Deriv maksimal 5000 candle per request
                   req = {'ticks_history': 'frxXAUUSD', 'style': 'candles', 'granularity': 300, 'count': 5000, 'end': 'latest', 'req_id': 1}
                   await ws.send(json.dumps(req))
                   data = json.loads(await ws.recv())
                   if 'candles' not in data: raise ValueError(f"Error Deriv: {data}")
-                  
                   df = pd.DataFrame(data['candles'])
                   df['timestamp'] = pd.to_datetime(df['epoch'], unit='s', utc=True)
                   df['volume'] = 0
@@ -90,55 +85,39 @@ jobs:
           def get_deriv_data():
               print("[2/3] Mencoba Deriv API...")
               asyncio.run(fetch_deriv())
-              return True
 
           def get_yahoo_data():
               print("[3/3] Mencoba Yahoo Finance...")
               df = yf.download('GC=F', period='60d', interval='5m', progress=False)
               if df.empty: raise ValueError("Error Yahoo Finance: Data kosong")
               if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-              
               df = df.reset_index()
               df.columns = [str(c).lower() for c in df.columns]
               if 'datetime' in df.columns: df = df.rename(columns={'datetime': 'timestamp'})
               elif 'date' in df.columns: df = df.rename(columns={'date': 'timestamp'})
-              
               df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
               df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
               
-              # --- AUTO OFFSET ---
               try:
                   print("   -> Menghitung Offset Harga (Futures vs Spot)...")
                   spot = yf.download('XAUUSD=X', period='1d', interval='1m', progress=False)
                   if not spot.empty:
-                      spot_price = spot['Close'].iloc[-1]
-                      futures_price = df['close'].iloc[-1]
-                      offset = spot_price - futures_price
+                      offset = spot['Close'].iloc[-1] - df['close'].iloc[-1]
                       print(f"   -> Offset terdeteksi: {offset:.2f} USD")
-                      df['open'] += offset
-                      df['high'] += offset
-                      df['low'] += offset
-                      df['close'] += offset
-              except Exception as e:
-                  print(f"   -> Gagal menghitung offset: {e}")
-              
+                      df['open'] += offset; df['high'] += offset; df['low'] += offset; df['close'] += offset
+              except Exception as e: print(f"   -> Offset gagal: {e}")
               format_df(df, "Yahoo Finance (Offset Adjusted)")
-              return True
 
-          # --- EKSEKUSI BERLAPIS ---
-          try:
-              get_twelve_data()
+          try: get_twelve_data()
           except Exception as e:
               print(f"[-] Twelve Data gagal: {e}")
-              try:
-                  get_deriv_data()
+              try: get_deriv_data()
               except Exception as e:
                   print(f"[-] Deriv gagal: {e}")
-                  try:
-                      get_yahoo_data()
+                  try: get_yahoo_data()
                   except Exception as e:
                       print(f"[-] Yahoo gagal: {e}")
-                      sys.exit("SEMUA SUMBER DATA GAGAL ATAU DATA TERLALU SEDIKIT. PROSES DIBATALKAN.")
+                      sys.exit("SEMUA SUMBER DATA GAGAL ATAU DATA TERLALU SEDIKIT.")
           EOF
           python download_data.py
 
