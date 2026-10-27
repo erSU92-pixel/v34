@@ -1,6 +1,7 @@
 """
 ================================================================================
-XAUUSD APEX V36.1 — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE (M5 EDITION)
+XAUUSD APEX V36.2 — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE
+Golden Alignment Edition (EMA 50 + 200, ATR Filter, 1:2 RR)
 ================================================================================
 """
 
@@ -25,11 +26,7 @@ from sklearn.ensemble import (
     VotingClassifier,
 )
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    f1_score,
-)
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from scipy.stats import norm
 
 # ==============================================================================
@@ -54,9 +51,9 @@ class GlobalConfig:
     MIN_DATA_BARS = 2000
 
 class LabelConfig:
-    PT_MULTIPLIER = 1.5
-    SL_MULTIPLIER = 1.0
-    MAX_VERTICAL_BARS = 6  # 6 candle x 5 menit = 30 menit maksimal hold
+    PT_MULTIPLIER = 2.0      # Perbesar Take Profit (1:2 RR)
+    SL_MULTIPLIER = 1.0      # Stop Loss standar ATR
+    MAX_VERTICAL_BARS = 12   # 12 candle M5 = 60 menit
 
 class CostConfig:
     SPREAD_USD = 0.20
@@ -65,20 +62,19 @@ class CostConfig:
 
     @classmethod
     def round_turn_cost_frac(cls, price: float) -> float:
-        total = cls.SPREAD_USD + cls.SLIPPAGE_USD + cls.COMMISSION_USD
-        return total / max(float(price), 1e-9)
+        return (cls.SPREAD_USD + cls.SLIPPAGE_USD + cls.COMMISSION_USD) / max(float(price), 1e-9)
 
 class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
     MAX_CONSECUTIVE_LOSSES = 15
-    MIN_CONFIDENCE = 0.52
+    MIN_CONFIDENCE = 0.58      # Titik seimbang (bukan 0.52, bukan 0.65)
     MAX_POSITION_FRAC = 1.0
 
 class CVConfig:
     N_SPLITS = 5
     MIN_TRAIN_FRAC = 0.30
-    EMBARGO_BARS = 6
+    EMBARGO_BARS = 12
 
 # ==============================================================================
 # 1. GOVERNANCE
@@ -86,7 +82,7 @@ class CVConfig:
 class ExperimentGovernance:
     def __init__(self):
         self.metadata = {
-            "version": "36.1.0-PROD",
+            "version": "36.2.0-PROD",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": "Global Head of Quantitative Risk & Trading Systems",
             "audit_status": "PENDING_EXTERNAL_AUDIT",
@@ -94,11 +90,7 @@ class ExperimentGovernance:
         self.audit_trail: List[Dict[str, Any]] = []
 
     def log(self, event: str, details: Dict[str, Any]) -> None:
-        entry = {
-            "time": datetime.now(timezone.utc).isoformat(),
-            "event": event,
-            "details": details,
-        }
+        entry = {"time": datetime.now(timezone.utc).isoformat(), "event": event, "details": details}
         self.audit_trail.append(entry)
         logger.info(f"[GOVERNANCE] {event}: {details}")
 
@@ -147,7 +139,7 @@ class DataLayer:
         df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
         bad_high = (df['high'] < df[['open', 'close']].max(axis=1))
         bad_low = (df['low'] > df[['open', 'close']].min(axis=1))
-        if bad_high.any() or bad_low.any(): raise ValueError(f"OHLC integrity violated.")
+        if bad_high.any() or bad_low.any(): raise ValueError("OHLC integrity violated.")
         return df
 
 # ==============================================================================
@@ -365,7 +357,6 @@ class Pipeline:
     def run(data_path: str, allow_synthetic: bool = False) -> Dict[str, Any]:
         governance.log("PIPELINE_START", {})
         raw = DataLayer.load_or_raise(data_path, allow_synthetic=allow_synthetic)
-        
         df = FeatureEngineering.transform(raw)
         df = LabelingLayer.apply_triple_barrier(df)
         
@@ -413,10 +404,22 @@ class Pipeline:
             direction, size = TradeSimulator.confidence_to_size(proba)
             if direction == 0 or size <= 0: continue
 
-            # --- FILTER TREN EMA 50 ---
-            current_price, ema_trend = df['close'].iat[i], df['ema_50'].iat[i]
-            if direction == 1 and current_price < ema_trend: continue
-            if direction == -1 and current_price > ema_trend: continue
+            # --- FILTER TREN GANDA (GOLDEN ALIGNMENT) ---
+            current_price = df['close'].iat[i]
+            ema_50 = df['ema_50'].iat[i]
+            ema_200 = df['ema_200'].iat[i]
+            atr_current = df['atr'].iat[i]
+            atr_mean = df['atr'].iloc[max(0, i-20):i].mean()
+            
+            # 1. Filter Volatilitas (Jangan trading jika ATR di bawah rata-rata, pasar sepi)
+            if not np.isfinite(atr_mean) or atr_current < (atr_mean * 0.8):
+                continue
+            
+            # 2. Filter Golden Alignment
+            if direction == 1:
+                if current_price < ema_50 or ema_50 < ema_200: continue
+            if direction == -1:
+                if current_price > ema_50 or ema_50 > ema_200: continue
 
             if not risk.check(equity, peak, day_start):
                 logger.error(f"[KILL SWITCH] {risk.reason} — halting.")
@@ -456,7 +459,7 @@ class Pipeline:
         return report
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.1")
+    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.2")
     parser.add_argument("--data", default="xauusd_m5.csv")
     parser.add_argument("--allow-synthetic", action="store_true")
     args = parser.parse_args()
