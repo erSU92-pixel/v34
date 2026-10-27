@@ -1,20 +1,10 @@
 """
 ================================================================================
-XAUUSD APEX V36.6 — FINAL
+XAUUSD APEX V36.7 — FINAL
 Institutional Quant Risk & Execution Engine (LIVE SIGNAL + ABLATION)
 
-Changelog vs V36.5:
-  M1.  Triple barrier: ambiguous (TP+SL same bar) → NaN, dropped from training.
-  M2.  GB → HistGradientBoostingClassifier(class_weight='balanced').
-  M4.  bars_per_year inferred from actual span (not 24*252 heuristic).
-  M5.  Warn if trade count < 100 (DSR/MC unreliable).
-  M6.  Diagnostic: position of MIN_CONFIDENCE within max_p distribution.
-  M7.  Ablation framework (--ablation):
-         none              → model + EMA filter (baseline)
-         random            → model trained, predictions shuffled in time
-                             (same confidence distribution, timing destroyed)
-         no_filter         → model, no EMA filter
-         random_no_filter  → shuffled predictions, no filter
+All fixes integrated: F1-F15 + M1-M7 + consecutive kill switch disabled for
+backtest (enable via RiskConfig.ENABLE_CONSECUTIVE_KILL for live).
 ================================================================================
 """
 
@@ -89,7 +79,7 @@ class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
     MAX_CONSECUTIVE_LOSSES = 20
-    ENABLE_CONSECUTIVE_KILL = False   # off untuk backtest, nyalakan untuk live
+    ENABLE_CONSECUTIVE_KILL = False
     MIN_CONFIDENCE = 0.60
     MAX_POSITION_FRAC = 1.0
 
@@ -143,7 +133,7 @@ def seed_everything(seed: int) -> None:
 class ExperimentGovernance:
     def __init__(self):
         self.metadata = {
-            "version": "36.6.0-FINAL",
+            "version": "36.7.0-FINAL",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": "Global Head of Quantitative Risk & Trading Systems",
             "audit_status": "PENDING_EXTERNAL_AUDIT",
@@ -485,7 +475,7 @@ class RiskEngine:
         self.reason: Optional[str] = None
         self.consecutive_losses = 0
 
-     def check(self, equity: float, peak: float, day_start: float) -> bool:
+    def check(self, equity: float, peak: float, day_start: float) -> bool:
         if self.tripped:
             return False
         if peak > 0 and (equity / peak - 1) <= -RiskConfig.MAX_DRAWDOWN_KILL:
@@ -644,7 +634,6 @@ class Pipeline:
                     f"(use_random={AblationConfig.use_random()}, "
                     f"use_ema_filter={AblationConfig.use_ema_filter()})")
 
-        # ---- Load & validate ------------------------------------------------
         raw = DataLayer.load_or_raise(data_path, allow_synthetic=allow_synthetic)
 
         if len(raw) < GlobalConfig.MIN_DATA_BARS:
@@ -664,10 +653,7 @@ class Pipeline:
             f"bars/year={bars_per_year} (span={span})"
         )
 
-        # ---- Features (all rows) -------------------------------------------
         df_full = FeatureEngineering.transform(raw)
-
-        # ---- Labels --------------------------------------------------------
         df = LabelingLayer.apply_triple_barrier(df_full)
         feature_cols = [
             c for c in df.columns
@@ -679,8 +665,7 @@ class Pipeline:
         logger.info(
             f"[DIAG] rows_with_features={n_with_features}, "
             f"labeled_trainable={len(df)}, "
-            f"dropped={n_with_features - len(df)} "
-            f"(ambiguous+unlabeled)"
+            f"dropped={n_with_features - len(df)}"
         )
 
         X = df[feature_cols].values
@@ -692,7 +677,6 @@ class Pipeline:
                       .sort_index().round(3).to_dict())
         logger.info(f"[DIAG] label distribution: {label_dist}")
 
-        # ---- CV ------------------------------------------------------------
         cv = PurgedWalkForwardCV()
         splits = list(cv.split(n))
         fold_of = np.full(n, -1, dtype=int)
@@ -727,7 +711,6 @@ class Pipeline:
                 f"bal_acc={fm['balanced_accuracy']:.3f}"
             )
 
-            # M7: shuffle predictions in time (same confidence, no timing skill)
             if AblationConfig.use_random():
                 shuffle_rng = np.random.default_rng(
                     GlobalConfig.RANDOM_STATE + AblationConfig.RANDOM_SEED_OFFSET + fold
@@ -745,7 +728,6 @@ class Pipeline:
         oof_idx = [oof_idx[k] for k in order]
         oof_proba = [oof_proba[k] for k in order]
 
-        # ---- Prob diagnostics ----------------------------------------------
         proba_arr = np.asarray(oof_proba)
         argmax_counts = np.bincount(proba_arr.argmax(axis=1), minlength=3).tolist()
         max_p = proba_arr.max(axis=1)
@@ -760,11 +742,9 @@ class Pipeline:
         )
         if threshold_pct > 85:
             logger.warning(
-                f"[WARN] Threshold rejects {threshold_pct:.0f}% of bars. "
-                f"Probabilities poorly calibrated — consider calibration before tuning."
+                f"[WARN] Threshold rejects {threshold_pct:.0f}% of bars."
             )
 
-        # ---- Backtest ------------------------------------------------------
         risk = RiskEngine()
         equity = GlobalConfig.INITIAL_CAPITAL
         peak = GlobalConfig.INITIAL_CAPITAL
@@ -841,8 +821,7 @@ class Pipeline:
 
         if 0 < len(trades) < 100:
             logger.warning(
-                f"[WARN] Only {len(trades)} trades. DSR / Monte Carlo "
-                f"unreliable below ~100 trades."
+                f"[WARN] Only {len(trades)} trades. DSR / Monte Carlo unreliable."
             )
 
         trade_returns = (np.array([t["net_return"] for t in trades])
@@ -905,9 +884,8 @@ class Pipeline:
             "audit_trail": governance.audit_trail,
         }
 
-        # ---- Live signal ---------------------------------------------------
         if AblationConfig.use_random():
-            logger.info("[LIVE] Skipped in ablation mode (shuffled predictions).")
+            logger.info("[LIVE] Skipped in ablation mode.")
             report["live_signal"] = {"status": "skipped",
                                      "reason": "ablation_random"}
         else:
@@ -921,7 +899,6 @@ class Pipeline:
                 logger.exception(f"[LIVE] failed: {e}")
                 report["live_signal"] = {"error": str(e)}
 
-        # ---- Persist -------------------------------------------------------
         out_name = f"V36_QUANT_EXECUTION_REPORT_{AblationConfig.MODE}.json"
         with open(out_name, "w") as f:
             json.dump(report, f, indent=2, default=str)
@@ -929,7 +906,6 @@ class Pipeline:
             json.dump(report, f, indent=2, default=str)
         logger.info(f"[REPORT] written: {out_name}")
 
-        # ---- Summary -------------------------------------------------------
         logger.info("=" * 64)
         logger.info(
             f"[{AblationConfig.MODE.upper()}] Trades: {len(trades)} | "
@@ -955,7 +931,6 @@ class Pipeline:
 
         return report
 
-    # ------------------------------------------------------------------
     @staticmethod
     def _live_signal(df: pd.DataFrame, df_full: pd.DataFrame,
                      feature_cols: List[str], X: np.ndarray,
@@ -1065,14 +1040,13 @@ class Pipeline:
 # 11. ENTRYPOINT
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.6 (final)")
+    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.7 (final)")
     parser.add_argument("--data", default="data/xauusd_h1.csv")
     parser.add_argument("--allow-synthetic", action="store_true")
     parser.add_argument(
         "--ablation",
         choices=list(AblationConfig.VALID),
         default="none",
-        help="Ablation mode for controlled experiments.",
     )
     args = parser.parse_args()
     Pipeline.run(
