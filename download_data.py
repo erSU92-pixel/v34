@@ -1,13 +1,5 @@
-"""
-XAUUSD data fetcher — multi-source with Dukascopy primary.
-Order: Dukascopy (15y) -> Twelve Data (7mo) -> Deriv -> Yahoo (2y).
-"""
-
-import os
-import sys
-import json
-import asyncio
-import requests
+"""XAUUSD data fetcher: Dukascopy -> TwelveData -> Deriv -> Yahoo."""
+import os, sys, json, asyncio, requests
 import pandas as pd
 import yfinance as yf
 import websockets
@@ -17,14 +9,13 @@ MIN_REQUIRED_BARS = 5000
 MAX_STALENESS = pd.Timedelta(hours=6)
 OUT_PATH = 'data/xauusd_h1.csv'
 SOURCE_PATH = 'data/source.txt'
-DUKASCOPY_START_YEAR = 2012  # 12+ years H1, manageable download
+DUKASCOPY_START_YEAR = 2012
 
 
 def save(df, source_name):
     if len(df) < MIN_REQUIRED_BARS:
         raise ValueError(f"{source_name}: too few bars ({len(df)}).")
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+    df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
     last = df['timestamp'].iloc[-1]
     age = pd.Timestamp.now(tz='UTC') - last
     if age > MAX_STALENESS:
@@ -36,7 +27,6 @@ def save(df, source_name):
     print(f"[SUKSES] {source_name}: {len(df)} bars, last={last}")
 
 
-# --- 1. DUKASCOPY ------------------------------------------------------------
 def get_dukascopy():
     print(f"[1/4] Dukascopy XAUUSD H1 from {DUKASCOPY_START_YEAR}...")
     try:
@@ -44,39 +34,28 @@ def get_dukascopy():
         from dukascopy_python.instruments import INSTRUMENT_FX_METALS_XAUUSD
     except ImportError:
         raise RuntimeError("dukascopy-python not installed")
-
     start = datetime(DUKASCOPY_START_YEAR, 1, 1, tzinfo=timezone.utc)
     end = datetime.now(timezone.utc)
-
     df = dukascopy_python.fetch(
         instrument=INSTRUMENT_FX_METALS_XAUUSD,
         interval=dukascopy_python.INTERVAL_HOUR_1,
         offer_side=dukascopy_python.OFFER_SIDE_BID,
-        start=start,
-        end=end,
+        start=start, end=end,
     )
-
     if df is None or len(df) == 0:
-        raise RuntimeError("Dukascopy returned empty DataFrame")
-
+        raise RuntimeError("Dukascopy returned empty")
     df = df.reset_index()
-    # Normalize column names across dukascopy-python versions
-    rename_map = {
-        'index': 'timestamp', 'datetime': 'timestamp', 'time': 'timestamp',
-        'tick_volume': 'volume',
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    df = df.rename(columns={'index':'timestamp','datetime':'timestamp',
+                            'time':'timestamp','tick_volume':'volume'})
     if 'timestamp' not in df.columns:
         raise RuntimeError(f"Dukascopy: no timestamp col. Got: {list(df.columns)}")
     if 'volume' not in df.columns:
         df['volume'] = 0
-
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+    df = df[['timestamp','open','high','low','close','volume']]
     save(df, f"Dukascopy XAUUSD H1 ({DUKASCOPY_START_YEAR}+)")
 
 
-# --- 2. TWELVE DATA ----------------------------------------------------------
 def get_twelve_data():
     key = os.environ.get('TWELVEDATA_API_KEY')
     if not key:
@@ -89,25 +68,22 @@ def get_twelve_data():
         raise ValueError(str(r)[:200])
     df = pd.DataFrame(r['values'])
     df['timestamp'] = pd.to_datetime(df['datetime'], utc=True)
-    for c in ['open', 'high', 'low', 'close']:
+    for c in ['open','high','low','close']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
-    # FIX: volume column often absent in Twelve Data XAU/USD
     if 'volume' in df.columns:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
     else:
         df['volume'] = 0
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].iloc[::-1]
+    df = df[['timestamp','open','high','low','close','volume']].iloc[::-1]
     save(df, "Twelve Data XAU/USD 1h")
 
 
-# --- 3. DERIV ----------------------------------------------------------------
 async def _fetch_deriv():
     url = 'wss://api.derivws.com/trading/v1/options/ws/public'
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps({
-            'ticks_history': 'frxXAUUSD', 'style': 'candles',
-            'granularity': 3600, 'count': 5000,
-            'end': 'latest', 'req_id': 1,
+            'ticks_history':'frxXAUUSD','style':'candles',
+            'granularity':3600,'count':5000,'end':'latest','req_id':1,
         }))
         data = json.loads(await ws.recv())
         if 'candles' not in data:
@@ -115,7 +91,7 @@ async def _fetch_deriv():
         df = pd.DataFrame(data['candles'])
         df['timestamp'] = pd.to_datetime(df['epoch'], unit='s', utc=True)
         df['volume'] = 0
-        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        df = df[['timestamp','open','high','low','close','volume']]
         save(df, "Deriv frxXAUUSD 1h")
 
 
@@ -124,11 +100,9 @@ def get_deriv():
     asyncio.run(_fetch_deriv())
 
 
-# --- 4. YAHOO (last resort) --------------------------------------------------
 def get_yahoo():
     print("[4/4] Yahoo GC=F 1h...")
-    df = yf.download('GC=F', period='2y', interval='1h',
-                     progress=False, auto_adjust=False)
+    df = yf.download('GC=F', period='2y', interval='1h', progress=False, auto_adjust=False)
     if df.empty:
         raise ValueError("empty")
     if isinstance(df.columns, pd.MultiIndex):
@@ -136,23 +110,19 @@ def get_yahoo():
     df = df.reset_index()
     df.columns = [str(c).lower() for c in df.columns]
     if 'datetime' in df.columns:
-        df = df.rename(columns={'datetime': 'timestamp'})
+        df = df.rename(columns={'datetime':'timestamp'})
     elif 'date' in df.columns:
-        df = df.rename(columns={'date': 'timestamp'})
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        df = df.rename(columns={'date':'timestamp'})
+    df = df[['timestamp','open','high','low','close','volume']]
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     save(df, "Yahoo GC=F 1h")
 
 
-# --- MAIN --------------------------------------------------------------------
 if __name__ == "__main__":
-    sources = [
-        ("Dukascopy", get_dukascopy),
-        ("TwelveData", get_twelve_data),
-        ("Deriv", get_deriv),
-        ("Yahoo", get_yahoo),
-    ]
-    for name, fn in sources:
+    for name, fn in [("Dukascopy", get_dukascopy),
+                     ("TwelveData", get_twelve_data),
+                     ("Deriv", get_deriv),
+                     ("Yahoo", get_yahoo)]:
         try:
             fn()
             sys.exit(0)
