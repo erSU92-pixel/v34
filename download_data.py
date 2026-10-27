@@ -1,4 +1,4 @@
-"""XAUUSD data fetcher: Dukascopy -> TwelveData -> Deriv -> Yahoo."""
+"""XAUUSD data fetcher: TwelveData -> Deriv -> Yahoo."""
 import os, sys, json, asyncio, requests
 import pandas as pd
 import yfinance as yf
@@ -6,14 +6,12 @@ import websockets
 from datetime import datetime, timezone
 
 MIN_REQUIRED_BARS = 2000
-MAX_STALENESS = pd.Timedelta(hours=6)
+MAX_STALENESS = pd.Timedelta(hours=12) # Diperlonggar untuk jaga-jaga weekend
 OUT_PATH = 'data/xauusd_h1.csv'
 SOURCE_PATH = 'data/source.txt'
-DUKASCOPY_START_YEAR = 2012
-
 
 def save(df, source_name):
-    # Potong data masa depan (Fix Twelve Data timezone issue)
+    # FIX TIMEZONE: Potong data masa depan (Twelve Data kadang ngaco)
     now_utc = pd.Timestamp.now(tz='UTC')
     df = df[df['timestamp'] <= now_utc]
     
@@ -33,45 +31,11 @@ def save(df, source_name):
         f.write(source_name)
     print(f"[SUKSES] {source_name}: {len(df)} bars, last={last}")
 
-
-def get_dukascopy():
-    print(f"[1/4] Dukascopy XAUUSD H1 from {DUKASCOPY_START_YEAR}...")
-    try:
-        import dukascopy_python
-        from dukascopy_python.instruments import INSTRUMENT_FX_METALS_XAUUSD
-    except ImportError as e:
-        raise RuntimeError(f"dukascopy-python import failed: {e}")
-        
-    start = datetime(DUKASCOPY_START_YEAR, 1, 1, tzinfo=timezone.utc)
-    end = datetime.now(timezone.utc)
-    
-    df = dukascopy_python.fetch(
-        instrument=INSTRUMENT_FX_METALS_XAUUSD,
-        interval=dukascopy_python.INTERVAL_HOUR_1,
-        offer_side=dukascopy_python.OFFER_SIDE_BID,
-        start=start, end=end,
-    )
-    if df is None or len(df) == 0:
-        raise RuntimeError("Dukascopy returned empty")
-        
-    df = df.reset_index()
-    df = df.rename(columns={'index':'timestamp','datetime':'timestamp',
-                            'time':'timestamp','tick_volume':'volume'})
-    if 'timestamp' not in df.columns:
-        raise RuntimeError(f"Dukascopy: no timestamp col. Got: {list(df.columns)}")
-    if 'volume' not in df.columns:
-        df['volume'] = 0
-        
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-    df = df[['timestamp','open','high','low','close','volume']]
-    save(df, f"Dukascopy XAUUSD H1 ({DUKASCOPY_START_YEAR}+)")
-
-
 def get_twelve_data():
     key = os.environ.get('TWELVEDATA_API_KEY')
     if not key:
         raise ValueError("no API key")
-    print("[2/4] Twelve Data...")
+    print("[1/3] Twelve Data...")
     url = (f'https://api.twelvedata.com/time_series'
            f'?symbol=XAU/USD&interval=1h&outputsize=5000&apikey={key}')
     r = requests.get(url, timeout=15).json()
@@ -87,7 +51,6 @@ def get_twelve_data():
         df['volume'] = 0
     df = df[['timestamp','open','high','low','close','volume']].iloc[::-1]
     save(df, "Twelve Data XAU/USD 1h")
-
 
 async def _fetch_deriv():
     url = 'wss://api.derivws.com/trading/v1/options/ws/public'
@@ -105,14 +68,12 @@ async def _fetch_deriv():
         df = df[['timestamp','open','high','low','close','volume']]
         save(df, "Deriv frxXAUUSD 1h")
 
-
 def get_deriv():
-    print("[3/4] Deriv API...")
+    print("[2/3] Deriv API...")
     asyncio.run(_fetch_deriv())
 
-
 def get_yahoo():
-    print("[4/4] Yahoo GC=F 1h...")
+    print("[3/3] Yahoo GC=F 1h...")
     df = yf.download('GC=F', period='2y', interval='1h', progress=False, auto_adjust=False)
     if df.empty:
         raise ValueError("empty")
@@ -128,10 +89,8 @@ def get_yahoo():
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     save(df, "Yahoo GC=F 1h")
 
-
 if __name__ == "__main__":
-    for name, fn in [("Dukascopy", get_dukascopy),
-                     ("TwelveData", get_twelve_data),
+    for name, fn in [("TwelveData", get_twelve_data),
                      ("Deriv", get_deriv),
                      ("Yahoo", get_yahoo)]:
         try:
