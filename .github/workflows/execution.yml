@@ -2,7 +2,7 @@ name: XAUUSD APEX V36
 
 on:
   schedule:
-    - cron: '5 * * * *'  # Berjalan otomatis setiap jam ke-5 (misal 01:05, 02:05)
+    - cron: '5 */4 * * *'      # tiap 4 jam (ubah ke '5 * * * *' kalau perlu hourly)
   workflow_dispatch:
     inputs:
       allow_synthetic:
@@ -12,9 +12,16 @@ on:
         default: 'false'
   push:
     branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
+
+concurrency:
+  group: v36-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   execute:
@@ -23,11 +30,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -36,6 +41,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Verify imports
+        run: python -c "import sklearn, scipy, yfinance, websockets, requests, pandas, numpy; print('imports OK')"
 
       - name: Download Multi-Source Data
         env:
@@ -48,78 +56,86 @@ jobs:
           import websockets
 
           MIN_REQUIRED_BARS = 2000
+          MAX_STALENESS    = pd.Timedelta(hours=6)
+          OUT_PATH         = 'data/xauusd_h1.csv'
 
           def format_df(df, source_name):
               if len(df) < MIN_REQUIRED_BARS:
-                  raise ValueError(f"Data dari {source_name} terlalu sedikit ({len(df)} baris).")
+                  raise ValueError(f"{source_name}: too few bars ({len(df)}).")
               df = df.sort_values('timestamp').reset_index(drop=True)
+              last = df['timestamp'].iloc[-1]
+              age = pd.Timestamp.now(tz='UTC') - last
+              if age > MAX_STALENESS:
+                  raise ValueError(f"{source_name}: stale last={last} age={age}.")
               os.makedirs('data', exist_ok=True)
-              df.to_csv('data/xauusd_m5.csv', index=False)
-              print(f"[SUKSES] Sumber data digunakan: {source_name} ({len(df)} baris)")
+              df.to_csv(OUT_PATH, index=False)
+              with open('data/source.txt', 'w') as f:
+                  f.write(source_name)
+              print(f"[SUKSES] {source_name}: {len(df)} bars, last={last}")
 
           def get_twelve_data():
               api_key = os.environ.get('TWELVEDATA_API_KEY')
-              if not api_key: raise ValueError("API Key Twelve Data kosong")
-              print("[1/3] Mencoba Twelve Data...")
-              url = f'https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=5000&apikey={api_key}'
+              if not api_key: raise ValueError("no API key")
+              print("[1/3] Twelve Data...")
+              url = (f'https://api.twelvedata.com/time_series'
+                     f'?symbol=XAU/USD&interval=1h&outputsize=5000&apikey={api_key}')
               r = requests.get(url, timeout=15).json()
-              if 'values' not in r: raise ValueError(f"Error Twelve Data: {r}")
+              if 'values' not in r: raise ValueError(str(r))
               df = pd.DataFrame(r['values'])
               df['timestamp'] = pd.to_datetime(df['datetime'], utc=True)
-              for col in ['open', 'high', 'low', 'close', 'volume']:
-                  df[col] = pd.to_numeric(df[col], errors='coerce')
-              df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].iloc[::-1]
-              format_df(df, "Twelve Data")
+              for c in ['open','high','low','close','volume']:
+                  df[c] = pd.to_numeric(df[c], errors='coerce')
+              df = df[['timestamp','open','high','low','close','volume']].iloc[::-1]
+              format_df(df, "Twelve Data XAU/USD 1h")
 
           async def fetch_deriv():
               url = 'wss://api.derivws.com/trading/v1/options/ws/public'
               async with websockets.connect(url) as ws:
-                  req = {'ticks_history': 'frxXAUUSD', 'style': 'candles', 'granularity': 3600, 'count': 5000, 'end': 'latest', 'req_id': 1}
-                  await ws.send(json.dumps(req))
+                  await ws.send(json.dumps({'ticks_history':'frxXAUUSD','style':'candles',
+                                            'granularity':3600,'count':5000,
+                                            'end':'latest','req_id':1}))
                   data = json.loads(await ws.recv())
-                  if 'candles' not in data: raise ValueError(f"Error Deriv: {data}")
+                  if 'candles' not in data: raise ValueError(str(data))
                   df = pd.DataFrame(data['candles'])
                   df['timestamp'] = pd.to_datetime(df['epoch'], unit='s', utc=True)
                   df['volume'] = 0
-                  df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                  format_df(df, "Deriv API")
+                  df = df[['timestamp','open','high','low','close','volume']]
+                  format_df(df, "Deriv frxXAUUSD 1h")
 
           def get_deriv_data():
-              print("[2/3] Mencoba Deriv API...")
+              print("[2/3] Deriv API...")
               asyncio.run(fetch_deriv())
 
           def get_yahoo_data():
-              print("[3/3] Mencoba Yahoo Finance...")
+              print("[3/3] Yahoo Finance GC=F 1h + spot offset...")
               df = yf.download('GC=F', period='2y', interval='1h', progress=False)
-              if df.empty: raise ValueError("Error Yahoo Finance: Data kosong")
-              if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+              if df.empty: raise ValueError("empty")
+              if isinstance(df.columns, pd.MultiIndex):
+                  df.columns = df.columns.get_level_values(0)
               df = df.reset_index()
               df.columns = [str(c).lower() for c in df.columns]
-              if 'datetime' in df.columns: df = df.rename(columns={'datetime': 'timestamp'})
-              elif 'date' in df.columns: df = df.rename(columns={'date': 'timestamp'})
-              df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+              if 'datetime' in df.columns: df = df.rename(columns={'datetime':'timestamp'})
+              elif 'date' in df.columns:  df = df.rename(columns={'date':'timestamp'})
+              df = df[['timestamp','open','high','low','close','volume']]
               df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-              
               try:
-                  print("   -> Menghitung Offset Harga (Futures vs Spot)...")
                   spot = yf.download('XAUUSD=X', period='1d', interval='1m', progress=False)
                   if not spot.empty:
-                      offset = spot['Close'].iloc[-1] - df['close'].iloc[-1]
-                      print(f"   -> Offset terdeteksi: {offset:.2f} USD")
-                      df['open'] += offset; df['high'] += offset; df['low'] += offset; df['close'] += offset
-              except Exception as e: print(f"   -> Offset gagal: {e}")
-              format_df(df, "Yahoo Finance (Offset Adjusted)")
-
-          try: get_twelve_data()
-          except Exception as e:
-              print(f"[-] Twelve Data gagal: {e}")
-              try: get_deriv_data()
+                      off = float(spot['Close'].iloc[-1]) - float(df['close'].iloc[-1])
+                      print(f"   offset={off:.2f} USD")
+                      for c in ['open','high','low','close']:
+                          df[c] = df[c] + off
               except Exception as e:
-                  print(f"[-] Deriv gagal: {e}")
-                  try: get_yahoo_data()
-                  except Exception as e:
-                      print(f"[-] Yahoo gagal: {e}")
-                      sys.exit("SEMUA SUMBER DATA GAGAL ATAU DATA TERLALU SEDIKIT.")
+                  print(f"   offset failed: {e}")
+              format_df(df, "Yahoo GC=F 1h (offset-adjusted)")
+
+          for fn in (get_twelve_data, get_deriv_data, get_yahoo_data):
+              try:
+                  fn(); break
+              except Exception as e:
+                  print(f"[-] {fn.__name__} failed: {e}")
+          else:
+              sys.exit("ALL DATA SOURCES FAILED")
           EOF
           python download_data.py
 
@@ -129,11 +145,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
         run: |
-          if [ "${ALLOW_SYNTHETIC}" = "true" ]; then
-            python xauusd_apex_v36.py --data data/xauusd_m5.csv --allow-synthetic
-          else
-            python xauusd_apex_v36.py --data data/xauusd_m5.csv
-          fi
+          ARGS="--data data/xauusd_h1.csv"
+          [ "${ALLOW_SYNTHETIC}" = "true" ] && ARGS="$ARGS --allow-synthetic"
+          python xauusd_apex_v36_fixed.py $ARGS
 
       - name: Upload report
         if: always()
@@ -141,4 +155,5 @@ jobs:
         with:
           name: quant-report-${{ github.run_id }}
           path: V36_QUANT_EXECUTION_REPORT.json
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 30
