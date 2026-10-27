@@ -89,7 +89,7 @@ jobs:
           echo "::error::Live execution mode is NOT yet wired to a broker adapter."
           exit 1
 
-      - name: Prepare market data (Auto-Download Real Data)
+           - name: Prepare market data (Auto-Download Real Data)
         run: |
           cat << 'EOF' > download_data.py
           import yfinance as yf
@@ -98,18 +98,34 @@ jobs:
 
           print("Mengunduh data historis XAUUSD dari Yahoo Finance...")
           data = yf.download('GC=F', period='60d', interval='5m')
-          
+
           if data.empty:
               raise ValueError('Gagal mengunduh data dari internet.')
-              
-          data = data.reset_index()
+
+          # 1. Ratakan kolom jika berlapis (MultiIndex)
           if isinstance(data.columns, pd.MultiIndex):
               data.columns = data.columns.get_level_values(0)
-              
-          data.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-          data['timestamp'] = pd.to_datetime(data['timestamp']).dt.tz_localize('UTC')
-          
+
+          # 2. Ubah nama kolom jadi huruf kecil semua
+          data.rename(columns=lambda x: x.lower(), inplace=True)
+
+          # 3. Ambil HANYA 5 kolom utama (buang Adj Close agar tidak error)
+          data = data[['open', 'high', 'low', 'close', 'volume']]
+
+          # 4. Pindahkan index waktu menjadi kolom 'timestamp'
+          data = data.reset_index()
+          data.rename(columns={'datetime': 'timestamp', 'date': 'timestamp'}, inplace=True)
+
+          # 5. Amankan format waktu (Timezone)
+          data['timestamp'] = pd.to_datetime(data['timestamp'])
+          if data['timestamp'].dt.tz is None:
+              data['timestamp'] = data['timestamp'].dt.tz_localize('UTC')
+          else:
+              data['timestamp'] = data['timestamp'].dt.tz_convert('UTC')
+
+          # 6. Susun urutan kolom dan simpan
           os.makedirs('data', exist_ok=True)
+          data = data[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
           data.to_csv('data/xauusd_m5.csv', index=False)
           print(f'BERHASIL: Data asli terunduh sebanyak {len(data)} baris.')
           EOF
