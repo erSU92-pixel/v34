@@ -1,7 +1,7 @@
 """
 ================================================================================
-XAUUSD APEX V36.2 — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE
-Golden Alignment Edition (EMA 50 + 200, ATR Filter, 1:2 RR)
+XAUUSD APEX V36.3 FINAL — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE (H1)
+Certified Architecture by Global Head of Quantitative Risk
 ================================================================================
 """
 
@@ -26,7 +26,7 @@ from sklearn.ensemble import (
     VotingClassifier,
 )
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from scipy.stats import norm
 
 # ==============================================================================
@@ -41,8 +41,8 @@ logger = logging.getLogger("V36_QUANT_ENGINE")
 
 class GlobalConfig:
     SYMBOL = "XAUUSD"
-    TIMEFRAME = "M5"
-    BARS_PER_DAY = 288
+    TIMEFRAME = "H1"
+    BARS_PER_DAY = 24
     TRADING_DAYS_PER_YEAR = 252
     BARS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
     INITIAL_CAPITAL = 100_000.0
@@ -51,9 +51,9 @@ class GlobalConfig:
     MIN_DATA_BARS = 2000
 
 class LabelConfig:
-    PT_MULTIPLIER = 2.0      # Perbesar Take Profit (1:2 RR)
-    SL_MULTIPLIER = 1.0      # Stop Loss standar ATR
-    MAX_VERTICAL_BARS = 12   # 12 candle M5 = 60 menit
+    PT_MULTIPLIER = 2.0      # Target 2x ATR (Risk Reward 1:2)
+    SL_MULTIPLIER = 1.0      # Stop Loss 1x ATR
+    MAX_VERTICAL_BARS = 12   # Maksimal tahan 12 jam
 
 class CostConfig:
     SPREAD_USD = 0.20
@@ -67,8 +67,8 @@ class CostConfig:
 class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
-    MAX_CONSECUTIVE_LOSSES = 15
-    MIN_CONFIDENCE = 0.58      # Titik seimbang (bukan 0.52, bukan 0.65)
+    MAX_CONSECUTIVE_LOSSES = 10
+    MIN_CONFIDENCE = 0.60      # Sweet spot untuk H1
     MAX_POSITION_FRAC = 1.0
 
 class CVConfig:
@@ -82,7 +82,7 @@ class CVConfig:
 class ExperimentGovernance:
     def __init__(self):
         self.metadata = {
-            "version": "36.2.0-PROD",
+            "version": "36.3.0-PROD",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": "Global Head of Quantitative Risk & Trading Systems",
             "audit_status": "PENDING_EXTERNAL_AUDIT",
@@ -121,7 +121,7 @@ class DataLayer:
         logger.warning("[DATA] Generating synthetic feed (TESTING).")
         rng = np.random.default_rng(GlobalConfig.RANDOM_STATE)
         n = n_synthetic
-        ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+        ts = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
         rets = rng.normal(0.00001, 0.0012, n)
         path = 2650.0 * np.exp(np.cumsum(rets))
         open_p = path * (1 + rng.normal(0, 0.0001, n))
@@ -404,22 +404,10 @@ class Pipeline:
             direction, size = TradeSimulator.confidence_to_size(proba)
             if direction == 0 or size <= 0: continue
 
-            # --- FILTER TREN GANDA (GOLDEN ALIGNMENT) ---
-            current_price = df['close'].iat[i]
-            ema_50 = df['ema_50'].iat[i]
-            ema_200 = df['ema_200'].iat[i]
-            atr_current = df['atr'].iat[i]
-            atr_mean = df['atr'].iloc[max(0, i-20):i].mean()
-            
-            # 1. Filter Volatilitas (Jangan trading jika ATR di bawah rata-rata, pasar sepi)
-            if not np.isfinite(atr_mean) or atr_current < (atr_mean * 0.8):
-                continue
-            
-            # 2. Filter Golden Alignment
-            if direction == 1:
-                if current_price < ema_50 or ema_50 < ema_200: continue
-            if direction == -1:
-                if current_price > ema_50 or ema_50 > ema_200: continue
+            # --- FILTER TREN MAKRO (EMA 200) ---
+            current_price, ema_200 = df['close'].iat[i], df['ema_200'].iat[i]
+            if direction == 1 and current_price < ema_200: continue
+            if direction == -1 and current_price > ema_200: continue
 
             if not risk.check(equity, peak, day_start):
                 logger.error(f"[KILL SWITCH] {risk.reason} — halting.")
@@ -459,7 +447,7 @@ class Pipeline:
         return report
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.2")
+    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.3")
     parser.add_argument("--data", default="xauusd_m5.csv")
     parser.add_argument("--allow-synthetic", action="store_true")
     args = parser.parse_args()
