@@ -1,134 +1,161 @@
+"""
+XAUUSD data fetcher — multi-source with Dukascopy primary.
+Order: Dukascopy (15y) -> Twelve Data (7mo) -> Deriv -> Yahoo (2y).
+"""
+
 import os
 import sys
+import json
+import asyncio
+import requests
 import pandas as pd
+import yfinance as yf
+import websockets
 from datetime import datetime, timezone
 
-# --- Konfigurasi -------------------------------------------------------------
-SYMBOL = "XAUUSD"
-TIMEFRAME = "h1"
-START_YEAR = 2010          # Dukascopy punya data XAUUSD dari ~2003; 2010 cukup aman
-MIN_REQUIRED_BARS = 5000   # H1 15 tahun > 50.000 bar
-OUT_PATH = "data/xauusd_h1.csv"
-SOURCE_PATH = "data/source.txt"
+MIN_REQUIRED_BARS = 5000
+MAX_STALENESS = pd.Timedelta(hours=6)
+OUT_PATH = 'data/xauusd_h1.csv'
+SOURCE_PATH = 'data/source.txt'
+DUKASCOPY_START_YEAR = 2012  # 12+ years H1, manageable download
 
-def fetch_dukascopy():
-    """Unduh data H1 XAUUSD dari Dukascopy menggunakan library Python."""
-    print(f"[DUKASCOPY] Mengunduh {SYMBOL} {TIMEFRAME} dari {START_YEAR}...")
-    try:
-        from dukascopy_downloader import Downloader
 
-        # Inisialisasi downloader; data disimpan sementara di folder 'duka_data'
-        dl = Downloader("duka_data")
-        dl.download(
-            instruments=[SYMBOL],
-            tf=TIMEFRAME,
-            start=f"{START_YEAR}-01-01",
-            sides="BID",          # BID sudah cukup untuk backtest OHLC
-        )
-
-        # Ekspor ke DataFrame
-        # Library menyimpan dalam format Parquet; kita baca lalu konversi
-        import glob
-        import pandas as pd
-
-        # Cari file Parquet yang dihasilkan
-        pattern = f"duka_data/{TIMEFRAME}/**/{SYMBOL}*.parquet"
-        files = glob.glob(pattern, recursive=True)
-        if not files:
-            # Fallback: cari file apa pun yang mengandung XAUUSD dan h1
-            pattern = f"duka_data/**/*{SYMBOL}*.parquet"
-            files = glob.glob(pattern, recursive=True)
-
-        if not files:
-            raise FileNotFoundError("File Parquet dari Dukascopy tidak ditemukan.")
-
-        # Gabungkan semua file jika ada beberapa
-        dfs = [pd.read_parquet(f) for f in files]
-        df = pd.concat(dfs, ignore_index=True)
-
-        # Normalisasi kolom
-        # Dukascopy biasanya menghasilkan kolom: timestamp, open, high, low, close, volume
-        # atau: time, open, high, low, close, volume
-        df.columns = [c.lower() for c in df.columns]
-        if "time" in df.columns and "timestamp" not in df.columns:
-            df = df.rename(columns={"time": "timestamp"})
-        if "tick_volume" in df.columns:
-            df = df.rename(columns={"tick_volume": "volume"})
-        if "volume" not in df.columns:
-            df["volume"] = 0
-
-        # Pastikan timestamp UTC
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df = df.sort_values("timestamp").reset_index(drop=True)
-
-        print(f"[DUKASCOPY] Berhasil: {len(df)} bar, {df['timestamp'].min()} s/d {df['timestamp'].max()}")
-        return df
-
-    except Exception as e:
-        print(f"[-] Dukascopy gagal: {e}")
-        return None
-
-def fetch_yahoo_fallback():
-    """Fallback: ambil 2 tahun terakhir dari Yahoo Finance (GC=F)."""
-    print("[YAHOO] Fallback: mengunduh GC=F 1h (2 tahun)...")
-    try:
-        import yfinance as yf
-
-        df = yf.download("GC=F", period="2y", interval="1h", progress=False)
-        if df.empty:
-            raise ValueError("Yahoo mengembalikan data kosong.")
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df.reset_index()
-        df.columns = [str(c).lower() for c in df.columns]
-        if "datetime" in df.columns:
-            df = df.rename(columns={"datetime": "timestamp"})
-        elif "date" in df.columns:
-            df = df.rename(columns={"date": "timestamp"})
-
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df.sort_values("timestamp").reset_index(drop=True)
-
-        print(f"[YAHOO] Berhasil: {len(df)} bar")
-        return df
-
-    except Exception as e:
-        print(f"[-] Yahoo gagal: {e}")
-        return None
-
-def save_data(df, source_name):
-    """Validasi dan simpan ke CSV."""
-    if df is None or len(df) < MIN_REQUIRED_BARS:
-        raise ValueError(f"{source_name}: data terlalu sedikit ({len(df) if df is not None else 0} bar).")
-
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-
-    os.makedirs("data", exist_ok=True)
+def save(df, source_name):
+    if len(df) < MIN_REQUIRED_BARS:
+        raise ValueError(f"{source_name}: too few bars ({len(df)}).")
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+    last = df['timestamp'].iloc[-1]
+    age = pd.Timestamp.now(tz='UTC') - last
+    if age > MAX_STALENESS:
+        raise ValueError(f"{source_name}: stale last={last} age={age}.")
+    os.makedirs('data', exist_ok=True)
     df.to_csv(OUT_PATH, index=False)
-    with open(SOURCE_PATH, "w") as f:
+    with open(SOURCE_PATH, 'w') as f:
         f.write(source_name)
+    print(f"[SUKSES] {source_name}: {len(df)} bars, last={last}")
 
-    print(f"[SIMPAN] {source_name} -> {OUT_PATH} ({len(df)} bar)")
 
-def main():
-    # 1. Coba Dukascopy (sumber utama, data panjang)
-    df = fetch_dukascopy()
-    source = "Dukascopy XAUUSD H1"
+# --- 1. DUKASCOPY ------------------------------------------------------------
+def get_dukascopy():
+    print(f"[1/4] Dukascopy XAUUSD H1 from {DUKASCOPY_START_YEAR}...")
+    try:
+        import dukascopy_python
+        from dukascopy_python.instruments import INSTRUMENT_FX_METALS_XAUUSD
+    except ImportError:
+        raise RuntimeError("dukascopy-python not installed")
 
-    # 2. Jika gagal, fallback ke Yahoo
-    if df is None:
-        df = fetch_yahoo_fallback()
-        source = "Yahoo GC=F H1 (fallback)"
+    start = datetime(DUKASCOPY_START_YEAR, 1, 1, tzinfo=timezone.utc)
+    end = datetime.now(timezone.utc)
 
-    # 3. Jika keduanya gagal, berhenti
-    if df is None:
-        sys.exit("SEMUA SUMBER DATA GAGAL.")
+    df = dukascopy_python.fetch(
+        instrument=INSTRUMENT_FX_METALS_XAUUSD,
+        interval=dukascopy_python.INTERVAL_HOUR_1,
+        offer_side=dukascopy_python.OFFER_SIDE_BID,
+        start=start,
+        end=end,
+    )
 
-    save_data(df, source)
+    if df is None or len(df) == 0:
+        raise RuntimeError("Dukascopy returned empty DataFrame")
 
+    df = df.reset_index()
+    # Normalize column names across dukascopy-python versions
+    rename_map = {
+        'index': 'timestamp', 'datetime': 'timestamp', 'time': 'timestamp',
+        'tick_volume': 'volume',
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    if 'timestamp' not in df.columns:
+        raise RuntimeError(f"Dukascopy: no timestamp col. Got: {list(df.columns)}")
+    if 'volume' not in df.columns:
+        df['volume'] = 0
+
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+    save(df, f"Dukascopy XAUUSD H1 ({DUKASCOPY_START_YEAR}+)")
+
+
+# --- 2. TWELVE DATA ----------------------------------------------------------
+def get_twelve_data():
+    key = os.environ.get('TWELVEDATA_API_KEY')
+    if not key:
+        raise ValueError("no API key")
+    print("[2/4] Twelve Data...")
+    url = (f'https://api.twelvedata.com/time_series'
+           f'?symbol=XAU/USD&interval=1h&outputsize=5000&apikey={key}')
+    r = requests.get(url, timeout=15).json()
+    if 'values' not in r:
+        raise ValueError(str(r)[:200])
+    df = pd.DataFrame(r['values'])
+    df['timestamp'] = pd.to_datetime(df['datetime'], utc=True)
+    for c in ['open', 'high', 'low', 'close']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    # FIX: volume column often absent in Twelve Data XAU/USD
+    if 'volume' in df.columns:
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+    else:
+        df['volume'] = 0
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].iloc[::-1]
+    save(df, "Twelve Data XAU/USD 1h")
+
+
+# --- 3. DERIV ----------------------------------------------------------------
+async def _fetch_deriv():
+    url = 'wss://api.derivws.com/trading/v1/options/ws/public'
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({
+            'ticks_history': 'frxXAUUSD', 'style': 'candles',
+            'granularity': 3600, 'count': 5000,
+            'end': 'latest', 'req_id': 1,
+        }))
+        data = json.loads(await ws.recv())
+        if 'candles' not in data:
+            raise ValueError(str(data)[:200])
+        df = pd.DataFrame(data['candles'])
+        df['timestamp'] = pd.to_datetime(df['epoch'], unit='s', utc=True)
+        df['volume'] = 0
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        save(df, "Deriv frxXAUUSD 1h")
+
+
+def get_deriv():
+    print("[3/4] Deriv API...")
+    asyncio.run(_fetch_deriv())
+
+
+# --- 4. YAHOO (last resort) --------------------------------------------------
+def get_yahoo():
+    print("[4/4] Yahoo GC=F 1h...")
+    df = yf.download('GC=F', period='2y', interval='1h',
+                     progress=False, auto_adjust=False)
+    if df.empty:
+        raise ValueError("empty")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    df.columns = [str(c).lower() for c in df.columns]
+    if 'datetime' in df.columns:
+        df = df.rename(columns={'datetime': 'timestamp'})
+    elif 'date' in df.columns:
+        df = df.rename(columns={'date': 'timestamp'})
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    save(df, "Yahoo GC=F 1h")
+
+
+# --- MAIN --------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    sources = [
+        ("Dukascopy", get_dukascopy),
+        ("TwelveData", get_twelve_data),
+        ("Deriv", get_deriv),
+        ("Yahoo", get_yahoo),
+    ]
+    for name, fn in sources:
+        try:
+            fn()
+            sys.exit(0)
+        except Exception as e:
+            print(f"[-] {name} failed: {e}")
+    sys.exit("ALL DATA SOURCES FAILED")
