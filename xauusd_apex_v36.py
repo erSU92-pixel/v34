@@ -95,8 +95,8 @@ class CostConfig:
 class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
-    MAX_CONSECUTIVE_LOSSES = 8
-    MIN_CONFIDENCE = 0.65
+    MAX_CONSECUTIVE_LOSSES = 15
+    MIN_CONFIDENCE = 0.60
     MAX_POSITION_FRAC = 1.0
 
 
@@ -773,6 +773,17 @@ class Pipeline:
 
             direction, size = TradeSimulator.confidence_to_size(proba)
             if direction == 0 or size <= 0:
+                continue
+                          # --- FILTER TREN MAKRO (EMA 200) ---
+            current_price = df['close'].iat[i]
+            ema_200 = df['ema_200'].iat[i]
+            
+            # Jangan Beli (Buy) kalau harga sedang di bawah EMA 200
+            if direction == 1 and current_price < ema_200:
+                continue
+                
+            # Jangan Jual (Sell) kalau harga sedang di atas EMA 200
+            if direction == -1 and current_price > ema_200:
                 continue
 
             if not risk.check(equity, peak, day_start_equity):
