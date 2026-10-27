@@ -1,17 +1,16 @@
-"""XAUUSD data fetcher: TwelveData -> Deriv -> Yahoo."""
-import os, sys, json, asyncio, requests
+"""XAUUSD data fetcher: TwelveData (Multi-Year) -> Deriv -> Yahoo."""
+import os, sys, json, time, asyncio, requests
 import pandas as pd
 import yfinance as yf
 import websockets
 from datetime import datetime, timezone
 
 MIN_REQUIRED_BARS = 2000
-MAX_STALENESS = pd.Timedelta(hours=12) # Diperlonggar untuk jaga-jaga weekend
+MAX_STALENESS = pd.Timedelta(hours=12)
 OUT_PATH = 'data/xauusd_h1.csv'
 SOURCE_PATH = 'data/source.txt'
 
 def save(df, source_name):
-    # FIX TIMEZONE: Potong data masa depan (Twelve Data kadang ngaco)
     now_utc = pd.Timestamp.now(tz='UTC')
     df = df[df['timestamp'] <= now_utc]
     
@@ -35,13 +34,45 @@ def get_twelve_data():
     key = os.environ.get('TWELVEDATA_API_KEY')
     if not key:
         raise ValueError("no API key")
-    print("[1/3] Twelve Data...")
-    url = (f'https://api.twelvedata.com/time_series'
-           f'?symbol=XAU/USD&interval=1h&outputsize=5000&apikey={key}')
-    r = requests.get(url, timeout=15).json()
-    if 'values' not in r:
-        raise ValueError(str(r)[:200])
-    df = pd.DataFrame(r['values'])
+    print("[1/3] Twelve Data (Multi-Year Pagination)...")
+    
+    all_dfs = []
+    start_year = 2015
+    current_year = datetime.now(timezone.utc).year
+    
+    for year in range(start_year, current_year + 1):
+        for half in [1, 2]:
+            start_month = 1 if half == 1 else 7
+            end_month = 6 if half == 1 else 12
+            end_day = 30 if end_month == 6 else 31
+            
+            start_date = f"{year}-{start_month:02d}-01"
+            end_date = f"{year}-{end_month:02d}-{end_day:02d}"
+            
+            if year == current_year and half == 2:
+                end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            
+            url = (f'https://api.twelvedata.com/time_series'
+                   f'?symbol=XAU/USD&interval=1h&outputsize=5000'
+                   f'&start_date={start_date}&end_date={end_date}&apikey={key}')
+            
+            try:
+                r = requests.get(url, timeout=15).json()
+                if 'values' not in r:
+                    print(f"[-] Skip {start_date} to {end_date}: {r.get('message', 'No data')}")
+                    continue
+                df = pd.DataFrame(r['values'])
+                all_dfs.append(df)
+                print(f"[+] Fetched {len(df)} bars for {start_date} to {end_date}")
+            except Exception as e:
+                print(f"[-] Failed chunk {start_date}: {e}")
+            
+            time.sleep(9) # Jeda 9 detik agar tidak kena limit API (8 req/menit)
+            
+    if not all_dfs:
+        raise ValueError("No data fetched from Twelve Data")
+        
+    df = pd.concat(all_dfs, ignore_index=True)
     df['timestamp'] = pd.to_datetime(df['datetime'], utc=True)
     for c in ['open','high','low','close']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -50,7 +81,7 @@ def get_twelve_data():
     else:
         df['volume'] = 0
     df = df[['timestamp','open','high','low','close','volume']].iloc[::-1]
-    save(df, "Twelve Data XAU/USD 1h")
+    save(df, "Twelve Data XAU/USD 1h (Multi-Year)")
 
 async def _fetch_deriv():
     url = 'wss://api.derivws.com/trading/v1/options/ws/public'
