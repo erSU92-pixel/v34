@@ -34,40 +34,108 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install yfinance
 
-      - name: Download Real Data
+      - name: Download Multi-Source Data
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
         run: |
-          python -c "
-          import yfinance as yf
+          cat << 'EOF' > download_data.py
+          import os, sys, json, asyncio, requests
           import pandas as pd
-          import os
-          print('Mengunduh data XAUUSD 2 Tahun (H1)...')
-          data = yf.download('GC=F', period='2y', interval='1h')
-          if data.empty: raise ValueError('Data kosong')
-          if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
-          
-          # Paksa semua nama kolom jadi huruf kecil
-          data.columns = [str(c).lower() for c in data.columns]
-          data = data.reset_index()
-          data.columns = [str(c).lower() for c in data.columns]
-          
-          # Deteksi otomatis nama kolom waktu
-          if 'datetime' in data.columns: data = data.rename(columns={'datetime': 'timestamp'})
-          elif 'date' in data.columns: data = data.rename(columns={'date': 'timestamp'})
-          elif 'index' in data.columns: data = data.rename(columns={'index': 'timestamp'})
-          
-          data = data[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-          data['timestamp'] = pd.to_datetime(data['timestamp'])
-          if data['timestamp'].dt.tz is None:
-              data['timestamp'] = data['timestamp'].dt.tz_localize('UTC')
-          else:
-              data['timestamp'] = data['timestamp'].dt.tz_convert('UTC')
+          import yfinance as yf
+          import websockets
+
+          def format_df(df, source_name):
+              df = df.sort_values('timestamp').reset_index(drop=True)
+              os.makedirs('data', exist_ok=True)
+              df.to_csv('data/xauusd_m5.csv', index=False)
+              print(f"[SUKSES] Sumber data digunakan: {source_name} ({len(df)} baris)")
+
+          def get_twelve_data():
+              api_key = os.environ.get('TWELVEDATA_API_KEY')
+              if not api_key: raise ValueError("API Key Twelve Data kosong")
+              print("[1/3] Mencoba Twelve Data...")
+              url = f'https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=5000&apikey={api_key}'
+              r = requests.get(url, timeout=15).json()
+              if 'values' not in r: raise ValueError(f"Error Twelve Data: {r}")
               
-          os.makedirs('data', exist_ok=True)
-          data.to_csv('data/xauusd_m5.csv', index=False)
-          print(f'BERHASIL: {len(data)} baris diunduh')
-          "
+              df = pd.DataFrame(r['values'])
+              df['timestamp'] = pd.to_datetime(df['datetime'], utc=True)
+              for col in ['open', 'high', 'low', 'close', 'volume']:
+                  df[col] = pd.to_numeric(df[col], errors='coerce')
+              df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].iloc[::-1]
+              format_df(df, "Twelve Data")
+              return True
+
+          async def fetch_deriv():
+              url = 'wss://api.derivws.com/trading/v1/options/ws/public'
+              async with websockets.connect(url) as ws:
+                  req = {'ticks_history': 'frxXAUUSD', 'style': 'candles', 'granularity': 300, 'count': 5000, 'end': 'latest', 'req_id': 1}
+                  await ws.send(json.dumps(req))
+                  data = json.loads(await ws.recv())
+                  if 'candles' not in data: raise ValueError(f"Error Deriv: {data}")
+                  
+                  df = pd.DataFrame(data['candles'])
+                  df['timestamp'] = pd.to_datetime(df['epoch'], unit='s', utc=True)
+                  df['volume'] = 0
+                  df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                  format_df(df, "Deriv API")
+
+          def get_deriv_data():
+              print("[2/3] Mencoba Deriv API...")
+              asyncio.run(fetch_deriv())
+              return True
+
+          def get_yahoo_data():
+              print("[3/3] Mencoba Yahoo Finance...")
+              df = yf.download('GC=F', period='60d', interval='5m', progress=False)
+              if df.empty: raise ValueError("Error Yahoo Finance: Data kosong")
+              if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+              
+              df = df.reset_index()
+              df.columns = [str(c).lower() for c in df.columns]
+              if 'datetime' in df.columns: df = df.rename(columns={'datetime': 'timestamp'})
+              elif 'date' in df.columns: df = df.rename(columns={'date': 'timestamp'})
+              
+              df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+              df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+              
+              # --- AUTO OFFSET: Menyesuaikan harga Futures ke Spot (MT5) ---
+              try:
+                  print("   -> Menghitung Offset Harga (Futures vs Spot)...")
+                  # Ambil harga spot terbaru dari Yahoo (XAUUSD=X) sebagai referensi
+                  spot = yf.download('XAUUSD=X', period='1d', interval='1m', progress=False)
+                  if not spot.empty:
+                      spot_price = spot['Close'].iloc[-1]
+                      futures_price = df['close'].iloc[-1]
+                      offset = spot_price - futures_price
+                      print(f"   -> Offset terdeteksi: {offset:.2f} USD")
+                      df['open'] += offset
+                      df['high'] += offset
+                      df['low'] += offset
+                      df['close'] += offset
+              except Exception as e:
+                  print(f"   -> Gagal menghitung offset (menggunakan harga asli): {e}")
+              
+              format_df(df, "Yahoo Finance (Offset Adjusted)")
+              return True
+
+          # --- EKSEKUSI BERLAPIS ---
+          try:
+              get_twelve_data()
+          except Exception as e:
+              print(f"[-] Twelve Data gagal: {e}")
+              try:
+                  get_deriv_data()
+              except Exception as e:
+                  print(f"[-] Deriv gagal: {e}")
+                  try:
+                      get_yahoo_data()
+                  except Exception as e:
+                      print(f"[-] Yahoo gagal: {e}")
+                      sys.exit("SEMUA SUMBER DATA GAGAL. PROSES DIBATALKAN.")
+          EOF
+          python download_data.py
 
       - name: Execute engine
         env:
