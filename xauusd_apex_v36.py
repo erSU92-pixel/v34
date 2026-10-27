@@ -1,25 +1,28 @@
 """
 ================================================================================
-XAUUSD APEX V36.4.1 — FIXED
+XAUUSD APEX V36.5 — FINAL
 Institutional Quant Risk & Execution Engine (LIVE SIGNAL)
 
-Fixes vs V36.4.0 (see inline "# FIX Fn" comments):
-  F1.  Runtime inference of bars/day & bars/year from actual bar spacing
-       (was hard-coded H1=24/day, wrong if data is M5).
-  F2.  compute_hurst: removed erroneous "* 2.0" scaling (slope IS H).
-  F3.  EWM warmup: added min_periods so EMA values are not under-warmed.
-  F4.  Live signal: predict on the TRUE last raw bar, not the 12-bar-stale
-       row that survived dropna(subset=['target']).
-  F5.  Telegram gate: respects EMA200 filter before sending; includes SL/TP.
-  F6.  Daily-loss rollover: reset day_start BEFORE skipping in-position bars.
-  F7.  DSR: log field renamed to probability, and 1-prob reported as p-value.
-  F8.  Cost stress test (2x) added to report & log.
-  F9.  Trade audit: per-trade fold, confidence, entry/exit, TP/SL stored.
-  F10. Diagnostics: label dist, argmax counts, max_p quantiles, fold metrics,
-       signal funnel, median bar spacing, data span.
-  F11. MIN_DATA_BARS validation enforced.
+Changelog vs V36.4:
+  F1.  Infer bars/day & bars/year from actual bar spacing.
+  F2.  compute_hurst: removed erroneous "* 2.0".
+  F3.  EWM warmup via min_periods.
+  F4.  Live signal: predict on true last raw bar (not the H-bar-stale row).
+  F5.  Telegram gate: honors EMA200 filter; adds SL/TP/ATR context.
+  F6.  Daily-loss rollover: reset day_start BEFORE in-position skip.
+  F7.  DSR reported as probability; p-value = 1 - prob.
+  F8.  Cost stress test (2x) in report & log.
+  F9.  Rich per-trade audit (fold, conf, entry/exit, TP/SL, ATR, cost).
+  F10. Diagnostics: label dist, argmax counts, max_p quantiles, funnel.
+  F11. MIN_DATA_BARS enforced before training.
+  F12. Staleness check: reject live signal if last bar too old (weekends).
+  F13. Data source propagated into report ("data/source.txt").
+  F14. Config validation at startup (fails fast on bad invariants).
+  F15. Deterministic global seeding (numpy + sklearn).
 ================================================================================
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -44,8 +47,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from scipy.stats import norm
 
+
 # ==============================================================================
-# 0. LOGGING & CONFIGURATION
+# 0. LOGGING & CONFIG
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -57,14 +61,17 @@ logger = logging.getLogger("V36_QUANT_ENGINE")
 
 class GlobalConfig:
     SYMBOL = "XAUUSD"
-    TIMEFRAME = "AUTO"          # FIX F1: was "H1"; now inferred from data
-    BARS_PER_DAY = 24            # FIX F1: overridden at runtime
+    TIMEFRAME = "AUTO"              # F1: inferred from data
+    BARS_PER_DAY = 24               # F1: overwritten at runtime
     TRADING_DAYS_PER_YEAR = 252
-    BARS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR   # FIX F1: overridden
+    BARS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR   # F1
     INITIAL_CAPITAL = 100_000.0
     RANDOM_STATE = 42
-    N_STRATEGY_TRIALS = 10       # bump this if you tune threshold/params
+    N_STRATEGY_TRIALS = 10          # bump if you tune
     MIN_DATA_BARS = 2000
+
+    # F12: live-signal staleness guard
+    MAX_LIVE_STALENESS = pd.Timedelta(hours=4)
 
 
 class LabelConfig:
@@ -77,7 +84,7 @@ class CostConfig:
     SPREAD_USD = 0.20
     SLIPPAGE_USD = 0.10
     COMMISSION_USD = 0.00
-    STRESS_MULTIPLIER = 2.0      # FIX F8: 2x cost stress test
+    STRESS_MULTIPLIER = 2.0         # F8
 
     @classmethod
     def round_turn_cost_frac(cls, price: float) -> float:
@@ -89,7 +96,7 @@ class RiskConfig:
     MAX_DAILY_LOSS_KILL = 0.03
     MAX_CONSECUTIVE_LOSSES = 10
     MIN_CONFIDENCE = 0.60
-    MAX_POSITION_FRAC = 1.0      # consider lowering to 0.1-0.2 in production
+    MAX_POSITION_FRAC = 1.0
 
 
 class CVConfig:
@@ -98,13 +105,32 @@ class CVConfig:
     EMBARGO_BARS = 12
 
 
+def validate_config() -> None:
+    """F14: fail fast on invalid invariants before touching data."""
+    assert 0.5 <= RiskConfig.MIN_CONFIDENCE < 1.0, "MIN_CONFIDENCE must be [0.5, 1)."
+    assert 0.0 < RiskConfig.MAX_POSITION_FRAC <= 1.0
+    assert LabelConfig.PT_MULTIPLIER > 0 and LabelConfig.SL_MULTIPLIER > 0
+    assert LabelConfig.MAX_VERTICAL_BARS > 0
+    assert CVConfig.N_SPLITS >= 2 and 0.0 < CVConfig.MIN_TRAIN_FRAC < 1.0
+    assert GlobalConfig.MIN_DATA_BARS > 0
+    assert GlobalConfig.N_STRATEGY_TRIALS >= 1
+
+
+def seed_everything(seed: int) -> None:
+    """F15: deterministic runs."""
+    import random
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
 # ==============================================================================
 # 1. GOVERNANCE
 # ==============================================================================
 class ExperimentGovernance:
     def __init__(self):
         self.metadata = {
-            "version": "36.4.1-FIXED",
+            "version": "36.5.0-FINAL",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": "Global Head of Quantitative Risk & Trading Systems",
             "audit_status": "PENDING_EXTERNAL_AUDIT",
@@ -112,7 +138,8 @@ class ExperimentGovernance:
         self.audit_trail: List[Dict[str, Any]] = []
 
     def log(self, event: str, details: Dict[str, Any]) -> None:
-        entry = {"time": datetime.now(timezone.utc).isoformat(), "event": event, "details": details}
+        entry = {"time": datetime.now(timezone.utc).isoformat(),
+                 "event": event, "details": details}
         self.audit_trail.append(entry)
         logger.info(f"[GOVERNANCE] {event}: {details}")
 
@@ -125,13 +152,15 @@ governance = ExperimentGovernance()
 # ==============================================================================
 class DataLayer:
     @staticmethod
-    def load_or_raise(filepath: str, allow_synthetic: bool = False, n_synthetic: int = 3_000) -> pd.DataFrame:
-        governance.log("DATA_LOAD_ATTEMPT", {"source": filepath, "synthetic_ok": allow_synthetic})
+    def load_or_raise(filepath: str, allow_synthetic: bool = False,
+                      n_synthetic: int = 3_000) -> pd.DataFrame:
+        governance.log("DATA_LOAD_ATTEMPT",
+                       {"source": filepath, "synthetic_ok": allow_synthetic})
         if os.path.exists(filepath):
             try:
                 df = pd.read_csv(filepath)
-                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-                df = df.sort_values('timestamp').reset_index(drop=True)
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                df = df.sort_values("timestamp").reset_index(drop=True)
                 df = DataLayer.validate(df)
                 governance.log("DATA_LOAD_SUCCESS", {"rows": len(df)})
                 return df
@@ -153,36 +182,49 @@ class DataLayer:
         close_p = path
         high_p = np.maximum(open_p, close_p) * (1 + np.abs(rng.normal(0, 0.0003, n)))
         low_p = np.minimum(open_p, close_p) * (1 - np.abs(rng.normal(0, 0.0003, n)))
-        df = pd.DataFrame({"timestamp": ts, "open": open_p, "high": high_p,
-                           "low": low_p, "close": close_p,
-                           "volume": rng.integers(100, 5000, n)})
+        df = pd.DataFrame({
+            "timestamp": ts, "open": open_p, "high": high_p,
+            "low": low_p, "close": close_p,
+            "volume": rng.integers(100, 5000, n),
+        })
         return DataLayer.validate(df)
 
     @staticmethod
     def validate(df: pd.DataFrame) -> pd.DataFrame:
-        required = {'timestamp', 'open', 'high', 'low', 'close', 'volume'}
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
         if not required.issubset(df.columns):
             raise ValueError(f"Missing columns: {required - set(df.columns)}")
-        if df['timestamp'].isna().any():
+        if df["timestamp"].isna().any():
             raise ValueError("Null timestamps.")
-        df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
-        bad_high = (df['high'] < df[['open', 'close']].max(axis=1))
-        bad_low = (df['low'] > df[['open', 'close']].min(axis=1))
+        df = (df.drop_duplicates(subset=["timestamp"])
+                .sort_values("timestamp")
+                .reset_index(drop=True))
+        bad_high = df["high"] < df[["open", "close"]].max(axis=1)
+        bad_low = df["low"] > df[["open", "close"]].min(axis=1)
         if bad_high.any() or bad_low.any():
             raise ValueError("OHLC integrity violated.")
         return df
 
-    # FIX F1: infer bar spacing & annualization from the data itself.
     @staticmethod
     def infer_bars_per_day(df: pd.DataFrame) -> Tuple[int, pd.Timedelta]:
-        diffs = df['timestamp'].diff().dropna()
+        """F1: infer bar spacing from actual data."""
+        diffs = df["timestamp"].diff().dropna()
         if diffs.empty:
             return GlobalConfig.BARS_PER_DAY, pd.NaT
         median_dt = diffs.median()
         if pd.isna(median_dt) or median_dt <= pd.Timedelta(0):
             return GlobalConfig.BARS_PER_DAY, median_dt
-        bars_per_day = max(1, int(round(pd.Timedelta(days=1) / median_dt)))
-        return bars_per_day, median_dt
+        bpd = max(1, int(round(pd.Timedelta(days=1) / median_dt)))
+        return bpd, median_dt
+
+    @staticmethod
+    def read_source_tag(path: str = "data/source.txt") -> str:
+        """F13: which provider actually delivered the data."""
+        try:
+            with open(path) as f:
+                return f.read().strip() or "unknown"
+        except Exception:
+            return "unknown"
 
 
 # ==============================================================================
@@ -219,7 +261,7 @@ class FeatureEngineering:
             return np.nan
         try:
             slope = np.polyfit(np.log(lags[valid]), np.log(tau[valid]), 1)[0]
-            # FIX F2: slope already equals Hurst exponent; no "* 2.0".
+            # F2: slope IS Hurst exponent; drop "* 2.0".
             return float(np.clip(slope, 0.0, 1.0))
         except Exception:
             return np.nan
@@ -227,59 +269,73 @@ class FeatureEngineering:
     @classmethod
     def transform(cls, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        close, high, low = df['close'], df['high'], df['low']
+        close, high, low = df["close"], df["high"], df["low"]
+
         for lag in (1, 3, 5, 10):
-            df[f'return_{lag}'] = close.pct_change(lag)
+            df[f"return_{lag}"] = close.pct_change(lag)
 
-        # FIX F3: min_periods ensures EWM is fully warmed before use.
+        # F3: min_periods prevents under-warmed EMAs.
         for period in (9, 21, 50, 200):
-            df[f'ema_{period}'] = close.ewm(span=period, adjust=False, min_periods=period).mean()
+            df[f"ema_{period}"] = close.ewm(
+                span=period, adjust=False, min_periods=period
+            ).mean()
 
-        df['ema_spread_9_21'] = (df['ema_9'] - df['ema_21']) / close
-        df['ema_slope_50'] = df['ema_50'].diff(3) / close
+        df["ema_spread_9_21"] = (df["ema_9"] - df["ema_21"]) / close
+        df["ema_slope_50"] = df["ema_50"].diff(3) / close
 
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
-        df['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-12)))
+        df["rsi"] = 100 - (100 / (1 + gain / (loss + 1e-12)))
 
         tr = pd.concat(
-            [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+            [high - low,
+             (high - close.shift()).abs(),
+             (low - close.shift()).abs()],
             axis=1,
         ).max(axis=1)
-        df['atr'] = tr.rolling(14).mean()
-        df['volatility'] = close.pct_change().rolling(20).std()
+        df["atr"] = tr.rolling(14).mean()
+        df["volatility"] = close.pct_change().rolling(20).std()
 
         roll_mean = close.rolling(20).mean()
         roll_std = close.rolling(20).std() + 1e-12
-        df['zscore'] = (close - roll_mean) / roll_std
+        df["zscore"] = (close - roll_mean) / roll_std
 
         rets = close.pct_change()
-        df['entropy'] = rets.rolling(100).apply(lambda w: cls.compute_shannon_entropy(w), raw=True)
-        df['hurst'] = close.rolling(100).apply(lambda w: cls.compute_hurst(w), raw=True)
+        df["entropy"] = rets.rolling(100).apply(
+            lambda w: cls.compute_shannon_entropy(w), raw=True)
+        df["hurst"] = close.rolling(100).apply(
+            lambda w: cls.compute_hurst(w), raw=True)
+
         return df
 
 
 # ==============================================================================
-# 4. LABELING LAYER
+# 4. LABELING
 # ==============================================================================
 class LabelingLayer:
     @staticmethod
     def apply_triple_barrier(df: pd.DataFrame) -> pd.DataFrame:
-        close, high, low, atr = df['close'].values, df['high'].values, df['low'].values, df['atr'].values
+        close = df["close"].values
+        high = df["high"].values
+        low = df["low"].values
+        atr = df["atr"].values
         n = len(df)
+
         labels = np.full(n, np.nan, dtype=float)
         label_end = np.full(n, -1, dtype=int)
         horizon = LabelConfig.MAX_VERTICAL_BARS
-        pt_mult, sl_mult = LabelConfig.PT_MULTIPLIER, LabelConfig.SL_MULTIPLIER
+        pt_mult = LabelConfig.PT_MULTIPLIER
+        sl_mult = LabelConfig.SL_MULTIPLIER
 
         for i in range(n - horizon):
             if not np.isfinite(atr[i]) or atr[i] <= 0:
                 continue
             entry = close[i]
-            upper = close[i] + pt_mult * atr[i]
-            lower = close[i] - sl_mult * atr[i]
-            end_j, lab = min(i + horizon, n - 1), 0
+            upper = entry + pt_mult * atr[i]
+            lower = entry - sl_mult * atr[i]
+            end_j = min(i + horizon, n - 1)
+            lab = 0
             for j in range(i + 1, end_j + 1):
                 hit_up = high[j] >= upper
                 hit_dn = low[j] <= lower
@@ -295,8 +351,8 @@ class LabelingLayer:
             labels[i], label_end[i] = lab, end_j
 
         df = df.copy()
-        df['target'] = labels
-        df['label_end_idx'] = label_end
+        df["target"] = labels
+        df["label_end_idx"] = label_end
         return df
 
 
@@ -304,8 +360,10 @@ class LabelingLayer:
 # 5. PURGED WALK-FORWARD CV
 # ==============================================================================
 class PurgedWalkForwardCV:
-    def __init__(self, n_splits=CVConfig.N_SPLITS, min_train_frac=CVConfig.MIN_TRAIN_FRAC,
-                 horizon=LabelConfig.MAX_VERTICAL_BARS, embargo=CVConfig.EMBARGO_BARS):
+    def __init__(self, n_splits: int = CVConfig.N_SPLITS,
+                 min_train_frac: float = CVConfig.MIN_TRAIN_FRAC,
+                 horizon: int = LabelConfig.MAX_VERTICAL_BARS,
+                 embargo: int = CVConfig.EMBARGO_BARS):
         self.n_splits = n_splits
         self.min_train_frac = min_train_frac
         self.horizon = horizon
@@ -326,23 +384,31 @@ class PurgedWalkForwardCV:
 
 
 # ==============================================================================
-# 6. MODEL LAYER
+# 6. MODEL
 # ==============================================================================
 class ModelLayer:
     @staticmethod
     def build_ensemble() -> VotingClassifier:
         rs = GlobalConfig.RANDOM_STATE
-        rf = RandomForestClassifier(n_estimators=200, max_depth=6,
-                                    class_weight='balanced', random_state=rs, n_jobs=-1)
-        et = ExtraTreesClassifier(n_estimators=200, max_depth=6,
-                                  class_weight='balanced', random_state=rs, n_jobs=-1)
-        gb = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=rs)
-        return VotingClassifier(estimators=[('rf', rf), ('et', et), ('gb', gb)],
-                                voting='soft', n_jobs=-1)
+        rf = RandomForestClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
+            random_state=rs, n_jobs=-1,
+        )
+        et = ExtraTreesClassifier(
+            n_estimators=200, max_depth=6, class_weight="balanced",
+            random_state=rs, n_jobs=-1,
+        )
+        gb = GradientBoostingClassifier(
+            n_estimators=100, max_depth=4, random_state=rs,
+        )
+        return VotingClassifier(
+            estimators=[("rf", rf), ("et", et), ("gb", gb)],
+            voting="soft", n_jobs=-1,
+        )
 
 
 # ==============================================================================
-# 7. TRADE SIMULATION & RISK
+# 7. TRADE SIM & RISK
 # ==============================================================================
 class TradeSimulator:
     @staticmethod
@@ -350,20 +416,20 @@ class TradeSimulator:
         max_p = float(proba.max())
         if max_p < RiskConfig.MIN_CONFIDENCE:
             return 0, 0.0
-        cls = int(proba.argmax()) - 1   # 0->-1, 1->0, 2->+1
+        cls = int(proba.argmax()) - 1  # 0->-1, 1->0, 2->+1
         if cls == 0:
             return 0, 0.0
         size = (max_p - RiskConfig.MIN_CONFIDENCE) / (1.0 - RiskConfig.MIN_CONFIDENCE)
         return cls, float(np.clip(size, 0.0, RiskConfig.MAX_POSITION_FRAC))
 
-    # FIX F9: return (ret, exit_idx, tp, sl, exit_price) for audit trail.
     @staticmethod
     def simulate(df: pd.DataFrame, i: int, direction: int, size: float
                  ) -> Tuple[float, int, float, float, float]:
+        """F9: returns (ret, exit_idx, tp, sl, exit_price)."""
         if direction == 0 or size <= 0:
             return 0.0, i, np.nan, np.nan, np.nan
-        entry = df['close'].iat[i]
-        atr_i = df['atr'].iat[i]
+        entry = float(df["close"].iat[i])
+        atr_i = float(df["atr"].iat[i])
         if not np.isfinite(atr_i) or atr_i <= 0:
             return 0.0, i, np.nan, np.nan, np.nan
 
@@ -376,26 +442,28 @@ class TradeSimulator:
 
         end_max = min(i + LabelConfig.MAX_VERTICAL_BARS, len(df) - 1)
         for j in range(i + 1, end_max + 1):
-            h, l = df['high'].iat[j], df['low'].iat[j]
+            h, l = float(df["high"].iat[j]), float(df["low"].iat[j])
             hit_tp = h >= tp if direction > 0 else l <= tp
             hit_sl = l <= sl if direction > 0 else h >= sl
-
             if hit_tp and hit_sl:
-                return (size * (-LabelConfig.SL_MULTIPLIER * atr_i / entry), j, tp, sl, sl)
+                return (size * (-LabelConfig.SL_MULTIPLIER * atr_i / entry),
+                        j, tp, sl, sl)
             if hit_tp:
-                return (size * (LabelConfig.PT_MULTIPLIER * atr_i / entry), j, tp, sl, tp)
+                return (size * (LabelConfig.PT_MULTIPLIER * atr_i / entry),
+                        j, tp, sl, tp)
             if hit_sl:
-                return (size * (-LabelConfig.SL_MULTIPLIER * atr_i / entry), j, tp, sl, sl)
+                return (size * (-LabelConfig.SL_MULTIPLIER * atr_i / entry),
+                        j, tp, sl, sl)
 
-        end_close = df['close'].iat[end_max]
+        end_close = float(df["close"].iat[end_max])
         ret = (end_close - entry) / entry if direction > 0 else (entry - end_close) / entry
-        return (size * ret, end_max, tp, sl, end_close)
+        return size * ret, end_max, tp, sl, end_close
 
 
 class RiskEngine:
     def __init__(self):
         self.tripped = False
-        self.reason = None
+        self.reason: Optional[str] = None
         self.consecutive_losses = 0
 
     def check(self, equity: float, peak: float, day_start: float) -> bool:
@@ -423,21 +491,35 @@ class PerformanceEngine:
             return {
                 "n_trades": 0, "CAGR": 0.0, "Max_Drawdown": 0.0,
                 "Sharpe_Annualized": 0.0, "Sortino_Annualized": 0.0,
-                "Terminal_Equity": GlobalConfig.INITIAL_CAPITAL, "SR_per_trade": 0.0,
+                "Terminal_Equity": GlobalConfig.INITIAL_CAPITAL,
+                "SR_per_trade": 0.0, "WinRate": 0.0,
+                "ProfitFactor": 0.0, "Avg_Return": 0.0,
             }
+
         equity = GlobalConfig.INITIAL_CAPITAL * np.cumprod(1 + trade_returns)
         peak = np.maximum.accumulate(equity)
         max_dd = float(((equity - peak) / peak).min())
-        years = max(n_test_bars / GlobalConfig.BARS_PER_YEAR, 1e-9)   # FIX F1: uses inferred value
+        years = max(n_test_bars / GlobalConfig.BARS_PER_YEAR, 1e-9)  # F1
         cagr = float((equity[-1] / GlobalConfig.INITIAL_CAPITAL) ** (1 / years) - 1)
+
         mean_r = float(trade_returns.mean())
         std_r = float(trade_returns.std(ddof=1)) if trade_returns.size > 1 else 0.0
         sr_per_trade = mean_r / std_r if std_r > 0 else 0.0
         trades_per_year = trade_returns.size / years
         sr_annual = sr_per_trade * np.sqrt(trades_per_year)
+
         downside = trade_returns[trade_returns < 0]
         dstd = float(downside.std(ddof=1)) if downside.size > 1 else 1e-12
         sortino_per = mean_r / dstd if dstd > 0 else 0.0
+
+        wins = trade_returns[trade_returns > 0]
+        losses = trade_returns[trade_returns < 0]
+        win_rate = float(wins.size / trade_returns.size)
+        profit_factor = (
+            float(wins.sum() / abs(losses.sum()))
+            if losses.size > 0 and losses.sum() != 0 else float("inf")
+        )
+
         return {
             "n_trades": int(trade_returns.size),
             "CAGR": cagr,
@@ -446,36 +528,44 @@ class PerformanceEngine:
             "Sortino_Annualized": float(sortino_per * np.sqrt(trades_per_year)),
             "Terminal_Equity": float(equity[-1]),
             "SR_per_trade": float(sr_per_trade),
+            "WinRate": win_rate,
+            "ProfitFactor": profit_factor,
+            "Avg_Return": mean_r,
         }
 
     @staticmethod
     def deflated_sharpe(sr: float, n_trials: int, T: int,
                         skew: float = 0.0, kurt: float = 3.0) -> float:
-        """Returns P(SR > expected_max under null).  Low value = no skill."""
+        """Returns P(SR > E[max(SR)] under null). Low = no skill."""
         if T < 2 or n_trials < 2:
             return 0.0
         logN = np.log(n_trials)
         if logN <= 0:
             return 0.0
-        expected_max = np.sqrt(2 * logN) - (np.log(logN) + np.log(4 * np.pi)) / (2 * np.sqrt(2 * logN))
+        expected_max = (np.sqrt(2 * logN)
+                        - (np.log(logN) + np.log(4 * np.pi))
+                        / (2 * np.sqrt(2 * logN)))
         var_sr = (1 - skew * sr + ((kurt - 1) / 4.0) * sr ** 2) / (T - 1)
         if var_sr <= 0:
             return 0.0
         return float(norm.cdf((sr - expected_max) / np.sqrt(var_sr)))
 
     @staticmethod
-    def monte_carlo(trade_returns: np.ndarray, simulations: int = 1000, seed: int = 42) -> Dict[str, float]:
+    def monte_carlo(trade_returns: np.ndarray, simulations: int = 1000,
+                    seed: int = 42) -> Dict[str, float]:
         n = trade_returns.size
         if n == 0:
-            return {"MC_P5": GlobalConfig.INITIAL_CAPITAL,
-                    "MC_Median": GlobalConfig.INITIAL_CAPITAL,
-                    "MC_P95": GlobalConfig.INITIAL_CAPITAL,
-                    "P_Ruin_50": 0.0}
+            return {
+                "MC_P5": GlobalConfig.INITIAL_CAPITAL,
+                "MC_Median": GlobalConfig.INITIAL_CAPITAL,
+                "MC_P95": GlobalConfig.INITIAL_CAPITAL,
+                "P_Ruin_50": 0.0,
+            }
         rng = np.random.default_rng(seed)
         block = min(5, n)
         terminals = np.empty(simulations)
         for s in range(simulations):
-            sim = []
+            sim: List[float] = []
             while len(sim) < n:
                 start = int(rng.integers(0, n))
                 sim.extend(trade_returns[(start + k) % n] for k in range(block))
@@ -489,10 +579,11 @@ class PerformanceEngine:
 
 
 # ==============================================================================
-# 9. API CLIENTS
+# 9. TELEGRAM
 # ==============================================================================
 class TelegramClient:
-    def __init__(self, token: str, chat_id: str, timeout: int = 10, max_retries: int = 4):
+    def __init__(self, token: str, chat_id: str, timeout: int = 10,
+                 max_retries: int = 4):
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
         self.chat_id = chat_id
         self.timeout = timeout
@@ -514,69 +605,64 @@ class TelegramClient:
                     continue
                 r.raise_for_status()
             except requests.RequestException as e:
-                logger.warning(f"[TELEGRAM] {attempt + 1} failed: {e}")
+                logger.warning(f"[TELEGRAM] attempt {attempt + 1} failed: {e}")
                 time.sleep(min(2 ** attempt, 30))
         raise RuntimeError("Telegram send failed after retries")
 
 
 # ==============================================================================
-# 10. PIPELINE ORCHESTRATOR
+# 10. PIPELINE
 # ==============================================================================
 class Pipeline:
     @staticmethod
     def run(data_path: str, allow_synthetic: bool = False) -> Dict[str, Any]:
+        validate_config()                                    # F14
+        seed_everything(GlobalConfig.RANDOM_STATE)           # F15
         governance.log("PIPELINE_START", {})
 
-        # ---------------------------------------------------------------------
-        # 10.1 Load + validate
-        # ---------------------------------------------------------------------
+        # ---- Load & validate ------------------------------------------------
         raw = DataLayer.load_or_raise(data_path, allow_synthetic=allow_synthetic)
 
-        # FIX F11: enforce MIN_DATA_BARS before doing anything else.
-        if len(raw) < GlobalConfig.MIN_DATA_BARS:
+        if len(raw) < GlobalConfig.MIN_DATA_BARS:            # F11
             raise ValueError(
                 f"Data too short: {len(raw)} < {GlobalConfig.MIN_DATA_BARS} bars."
             )
 
-        # FIX F1: infer bar spacing from data and log it.
-        bars_per_day, median_dt = DataLayer.infer_bars_per_day(raw)
+        bars_per_day, median_dt = DataLayer.infer_bars_per_day(raw)  # F1
         GlobalConfig.BARS_PER_DAY = bars_per_day
         GlobalConfig.BARS_PER_YEAR = bars_per_day * GlobalConfig.TRADING_DAYS_PER_YEAR
-        span = raw['timestamp'].iloc[-1] - raw['timestamp'].iloc[0]
+        span = raw["timestamp"].iloc[-1] - raw["timestamp"].iloc[0]
+        source_tag = DataLayer.read_source_tag()             # F13
         logger.info(
-            f"[DATA] rows={len(raw)} | median_dt={median_dt} | "
-            f"bars/day={bars_per_day} | bars/year={GlobalConfig.BARS_PER_YEAR} | span={span}"
+            f"[DATA] rows={len(raw)} | source={source_tag} | "
+            f"median_dt={median_dt} | bars/day={bars_per_day} | "
+            f"bars/year={GlobalConfig.BARS_PER_YEAR} | span={span}"
         )
 
-        # ---------------------------------------------------------------------
-        # 10.2 Features (df_full keeps ALL rows incl. last H bars)
-        # ---------------------------------------------------------------------
+        # ---- Features (keep ALL rows for live) ------------------------------
         df_full = FeatureEngineering.transform(raw)
 
-        # ---------------------------------------------------------------------
-        # 10.3 Labels + drop NaN for TRAINING only
-        # ---------------------------------------------------------------------
+        # ---- Labels (drop NaN only for training) ---------------------------
         df = LabelingLayer.apply_triple_barrier(df_full)
         feature_cols = [
             c for c in df.columns
-            if c not in {'timestamp', 'open', 'high', 'low', 'close',
-                         'volume', 'target', 'label_end_idx'}
+            if c not in {"timestamp", "open", "high", "low", "close",
+                         "volume", "target", "label_end_idx"}
         ]
-        df = df.dropna(subset=feature_cols + ['target']).reset_index(drop=True)
+        df = df.dropna(subset=feature_cols + ["target"]).reset_index(drop=True)
 
         X = df[feature_cols].values
-        y_mapped = (df['target'].values + 1).astype(int)
+        y_mapped = (df["target"].values + 1).astype(int)
         n = len(df)
 
-        # FIX F10: label distribution diagnostic.
-        label_dist = pd.Series(y_mapped).value_counts(normalize=True).sort_index().round(3).to_dict()
-        logger.info(f"[DIAG] label distribution (0=down,1=neutral,2=up): {label_dist}")
+        label_dist = (pd.Series(y_mapped)
+                      .value_counts(normalize=True)
+                      .sort_index().round(3).to_dict())
+        logger.info(f"[DIAG] label distribution: {label_dist}")
 
-        # ---------------------------------------------------------------------
-        # 10.4 Purged walk-forward CV
-        # ---------------------------------------------------------------------
+        # ---- Purged walk-forward CV ----------------------------------------
         cv = PurgedWalkForwardCV()
-        splits = list(cv.split(n))               # FIX F9: materialize for fold_of
+        splits = list(cv.split(n))
         fold_of = np.full(n, -1, dtype=int)
         for fold, (_tr, te) in enumerate(splits):
             fold_of[te] = fold
@@ -604,9 +690,10 @@ class Pipeline:
                 "balanced_accuracy": float(balanced_accuracy_score(y_mapped[te], preds)),
             }
             fold_metrics.append(fm)
-            # FIX F10: per-fold metrics logged.
-            logger.info(f"[DIAG] Fold {fm['fold']}: acc={fm['accuracy']:.3f} "
-                        f"bal_acc={fm['balanced_accuracy']:.3f}")
+            logger.info(
+                f"[DIAG] Fold {fm['fold']}: acc={fm['accuracy']:.3f} "
+                f"bal_acc={fm['balanced_accuracy']:.3f}"
+            )
 
             oof_idx.extend(te.tolist())
             oof_proba.extend(proba)
@@ -618,17 +705,14 @@ class Pipeline:
         oof_idx = [oof_idx[k] for k in order]
         oof_proba = [oof_proba[k] for k in order]
 
-        # FIX F10: signal-funnel diagnostics.
-        oof_proba_arr = np.asarray(oof_proba)
-        argmax_counts = np.bincount(oof_proba_arr.argmax(axis=1), minlength=3).tolist()
-        max_p = oof_proba_arr.max(axis=1)
+        proba_arr = np.asarray(oof_proba)
+        argmax_counts = np.bincount(proba_arr.argmax(axis=1), minlength=3).tolist()
+        max_p = proba_arr.max(axis=1)
         max_p_q = np.quantile(max_p, [0.5, 0.75, 0.90, 0.95]).round(4).tolist()
         logger.info(f"[DIAG] argmax counts [down,neutral,up]={argmax_counts}")
         logger.info(f"[DIAG] max_p quantiles [p50,p75,p90,p95]={max_p_q}")
 
-        # ---------------------------------------------------------------------
-        # 10.5 Backtest on OOF predictions
-        # ---------------------------------------------------------------------
+        # ---- Backtest on OOF ------------------------------------------------
         risk = RiskEngine()
         equity = GlobalConfig.INITIAL_CAPITAL
         peak = GlobalConfig.INITIAL_CAPITAL
@@ -636,14 +720,11 @@ class Pipeline:
         current_day = None
         trades: List[Dict[str, Any]] = []
         in_pos_until = -1
-
-        n_below_conf = 0
-        n_ema_filtered = 0
-        n_risk_blocked = 0
+        n_below_conf = n_ema_filtered = n_risk_blocked = 0
 
         for i, proba in zip(oof_idx, oof_proba):
-            # FIX F6: day rollover MUST happen before the in-position skip.
-            bar_day = df['timestamp'].iat[i].date()
+            # F6: rollover must precede in-position skip
+            bar_day = df["timestamp"].iat[i].date()
             if current_day != bar_day:
                 current_day = bar_day
                 day_start = equity
@@ -656,13 +737,12 @@ class Pipeline:
                 n_below_conf += 1
                 continue
 
-            # Macro trend filter
-            current_price = df['close'].iat[i]
-            ema_200 = df['ema_200'].iat[i]
-            if direction == 1 and current_price < ema_200:
+            price = float(df["close"].iat[i])
+            ema_200 = float(df["ema_200"].iat[i])
+            if direction == 1 and price < ema_200:
                 n_ema_filtered += 1
                 continue
-            if direction == -1 and current_price > ema_200:
+            if direction == -1 and price > ema_200:
                 n_ema_filtered += 1
                 continue
 
@@ -671,15 +751,16 @@ class Pipeline:
                 n_risk_blocked += 1
                 break
 
-            gross_ret, exit_j, tp, sl, exit_price = TradeSimulator.simulate(df, i, direction, size)
-            cost_ret = size * CostConfig.round_turn_cost_frac(df['close'].iat[i])
+            gross_ret, exit_j, tp, sl, exit_price = TradeSimulator.simulate(
+                df, i, direction, size
+            )
+            cost_ret = size * CostConfig.round_turn_cost_frac(price)
             net_ret = gross_ret - cost_ret
 
             equity *= (1 + net_ret)
             peak = max(peak, equity)
             risk.record(net_ret)
 
-            # FIX F9: richer audit trail.
             trades.append({
                 "entry_idx": int(i),
                 "exit_idx": int(exit_j),
@@ -687,11 +768,11 @@ class Pipeline:
                 "direction": int(direction),
                 "size": float(size),
                 "confidence": float(proba.max()),
-                "entry_price": float(df['close'].iat[i]),
+                "entry_price": price,
                 "tp": float(tp),
                 "sl": float(sl),
                 "exit_price": float(exit_price),
-                "atr": float(df['atr'].iat[i]),
+                "atr": float(df["atr"].iat[i]),
                 "gross_return": float(gross_ret),
                 "cost_return": float(cost_ret),
                 "net_return": float(net_ret),
@@ -699,35 +780,36 @@ class Pipeline:
             })
             in_pos_until = exit_j
 
-        # FIX F10: signal funnel.
         logger.info(
-            f"[DIAG] signal funnel: oof_bars={len(oof_idx)}, "
-            f"below_conf={n_below_conf}, ema_filtered={n_ema_filtered}, "
-            f"risk_blocked={n_risk_blocked}, traded={len(trades)}"
+            f"[DIAG] funnel: oof_bars={len(oof_idx)}, below_conf={n_below_conf}, "
+            f"ema_filtered={n_ema_filtered}, risk_blocked={n_risk_blocked}, "
+            f"traded={len(trades)}"
         )
 
-        trade_returns = np.array([t["net_return"] for t in trades]) if trades else np.array([])
+        trade_returns = (np.array([t["net_return"] for t in trades])
+                         if trades else np.array([]))
         n_test_bars = len(oof_idx)
 
         metrics = PerformanceEngine.trade_metrics(trade_returns, n_test_bars)
         dsr_prob = PerformanceEngine.deflated_sharpe(
             metrics["SR_per_trade"], GlobalConfig.N_STRATEGY_TRIALS,
-            max(len(trade_returns), 2)
+            max(len(trade_returns), 2),
         )
         mc = PerformanceEngine.monte_carlo(trade_returns)
 
-        # FIX F8: cost stress test at 2x.
         stress_metrics: Dict[str, Any] = {}
         if trades:
-            stress_rets = np.array(
-                [t["gross_return"] - CostConfig.STRESS_MULTIPLIER * t["cost_return"]
-                 for t in trades]
-            )
+            stress_rets = np.array([
+                t["gross_return"] - CostConfig.STRESS_MULTIPLIER * t["cost_return"]
+                for t in trades
+            ])
             stress_metrics = PerformanceEngine.trade_metrics(stress_rets, n_test_bars)
 
-        report = {
+        report: Dict[str, Any] = {
             "metadata": governance.metadata,
             "data": {
+                "path": data_path,
+                "source": source_tag,                       # F13
                 "rows": int(len(raw)),
                 "median_dt": str(median_dt),
                 "bars_per_day": int(bars_per_day),
@@ -737,10 +819,10 @@ class Pipeline:
             "label_distribution": label_dist,
             "fold_metrics": fold_metrics,
             "performance": metrics,
-            "deflated_sharpe_probability": dsr_prob,
-            "deflated_sharpe_p_value": 1.0 - dsr_prob,
+            "deflated_sharpe_probability": dsr_prob,        # F7
+            "deflated_sharpe_p_value": 1.0 - dsr_prob,      # F7
             "monte_carlo": mc,
-            "cost_stress_2x": stress_metrics,
+            "cost_stress_2x": stress_metrics,               # F8
             "kill_switch_tripped": risk.tripped,
             "kill_switch_reason": risk.reason,
             "n_trades": len(trades),
@@ -754,78 +836,128 @@ class Pipeline:
             "audit_trail": governance.audit_trail,
         }
 
+        # ---- Live signal (with F4 + F12) -----------------------------------
+        live_signal_info: Dict[str, Any] = {}
+        try:
+            live_signal_info = Pipeline._live_signal(
+                df=df, df_full=df_full, feature_cols=feature_cols,
+                X=X, y_mapped=y_mapped,
+            )
+            report["live_signal"] = live_signal_info
+        except Exception as e:
+            logger.exception(f"[LIVE] failed: {e}")
+            report["live_signal"] = {"error": str(e)}
+
+        # ---- Persist --------------------------------------------------------
         with open("V36_QUANT_EXECUTION_REPORT.json", "w") as f:
             json.dump(report, f, indent=2, default=str)
 
-        # FIX F7: DSR is a probability, not a p-value. Log both.
         logger.info("=" * 64)
         logger.info(
-            f"Trades: {len(trades)} | Net CAGR: {metrics['CAGR'] * 100:.2f}% | "
+            f"Trades: {len(trades)} | CAGR: {metrics['CAGR'] * 100:.2f}% | "
             f"Max DD: {metrics['Max_Drawdown'] * 100:.2f}%"
         )
         logger.info(
-            f"Sharpe (ann): {metrics['Sharpe_Annualized']:.2f} | "
-            f"DSR prob: {dsr_prob:.4f} (p_value={1.0 - dsr_prob:.4f}) | "
+            f"Sharpe(ann): {metrics['Sharpe_Annualized']:.2f} | "
+            f"WinRate: {metrics['WinRate'] * 100:.1f}% | "
+            f"PF: {metrics['ProfitFactor']:.2f}"
+        )
+        logger.info(
+            f"DSR prob: {dsr_prob:.4f} (p_value={1 - dsr_prob:.4f}) | "
             f"MC P5: {mc['MC_P5']:.0f}"
         )
         if stress_metrics:
             logger.info(
-                f"[STRESS 2x COST] Trades: {stress_metrics['n_trades']} | "
-                f"Net CAGR: {stress_metrics['CAGR'] * 100:.2f}% | "
-                f"Sharpe (ann): {stress_metrics['Sharpe_Annualized']:.2f}"
+                f"[STRESS 2x] Trades: {stress_metrics['n_trades']} | "
+                f"CAGR: {stress_metrics['CAGR'] * 100:.2f}% | "
+                f"Sharpe: {stress_metrics['Sharpe_Annualized']:.2f}"
             )
         logger.info("=" * 64)
 
-        # ---------------------------------------------------------------------
-        # 10.6 LIVE SIGNAL — predict on the TRUE last bar
-        # ---------------------------------------------------------------------
-        logger.info("[LIVE SIGNAL] Memprediksi candle terakhir untuk sinyal live...")
+        return report
 
-        # FIX F4: use df_full (all rows) not df (last H rows dropped by label dropna).
+    # ------------------------------------------------------------------
+    # LIVE SIGNAL (extracted for clarity + testability)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _live_signal(df: pd.DataFrame, df_full: pd.DataFrame,
+                     feature_cols: List[str], X: np.ndarray,
+                     y_mapped: np.ndarray) -> Dict[str, Any]:
+        logger.info("[LIVE] Predicting on true last raw bar...")
+
+        # F4: use df_full (all rows), NOT df (which dropped the last H bars).
         last_row = df_full.iloc[[-1]]
         if last_row[feature_cols].isna().any().any():
-            logger.warning("[LIVE] Last raw row has NaN features; skipping live prediction.")
-            return report
+            logger.warning("[LIVE] last raw row has NaN features; abort.")
+            return {"status": "skipped", "reason": "nan_features"}
+
+        last_ts = last_row["timestamp"].iat[0]
+        age = pd.Timestamp.now(tz="UTC") - last_ts
+        # F12: reject stale (e.g. weekend / holiday).
+        if age > GlobalConfig.MAX_LIVE_STALENESS:
+            logger.warning(
+                f"[LIVE] stale: last={last_ts} age={age} > "
+                f"{GlobalConfig.MAX_LIVE_STALENESS}; abort."
+            )
+            return {
+                "status": "skipped", "reason": "stale",
+                "last_ts": str(last_ts), "age": str(age),
+            }
 
         scaler_full = StandardScaler().fit(X)
         model_full = ModelLayer.build_ensemble()
         model_full.fit(scaler_full.transform(X), y_mapped)
 
         latest_features = last_row[feature_cols].values
-        latest_proba = model_full.predict_proba(scaler_full.transform(latest_features))[0]
+        latest_proba = model_full.predict_proba(
+            scaler_full.transform(latest_features)
+        )[0]
 
         raw_direction, _ = TradeSimulator.confidence_to_size(latest_proba)
-        current_price = float(last_row['close'].iat[0])
-        ema_200 = float(last_row['ema_200'].iat[0])
-        atr_last = float(last_row['atr'].iat[0])
-        latest_ts = last_row['timestamp'].iat[0]
-        confidence_pct = float(latest_proba.max()) * 100.0
+        price = float(last_row["close"].iat[0])
+        ema_200 = float(last_row["ema_200"].iat[0])
+        atr_last = float(last_row["atr"].iat[0])
+        conf_pct = float(latest_proba.max()) * 100.0
 
-        # FIX F5: apply EMA200 filter BEFORE deciding whether to notify.
+        # F5: EMA200 filter BEFORE deciding to notify.
         direction = raw_direction
-        if direction == 1 and current_price <= ema_200:
+        if direction == 1 and price <= ema_200:
             direction = 0
-        if direction == -1 and current_price >= ema_200:
+        if direction == -1 and price >= ema_200:
             direction = 0
 
+        sl = tp = None
         if direction == 1:
+            sl = price - LabelConfig.SL_MULTIPLIER * atr_last
+            tp = price + LabelConfig.PT_MULTIPLIER * atr_last
             signal_text = "🟢 BUY (LONG)"
-            sl = current_price - LabelConfig.SL_MULTIPLIER * atr_last
-            tp = current_price + LabelConfig.PT_MULTIPLIER * atr_last
         elif direction == -1:
+            sl = price + LabelConfig.SL_MULTIPLIER * atr_last
+            tp = price - LabelConfig.PT_MULTIPLIER * atr_last
             signal_text = "🔴 SELL (SHORT)"
-            sl = current_price + LabelConfig.SL_MULTIPLIER * atr_last
-            tp = current_price - LabelConfig.PT_MULTIPLIER * atr_last
         else:
-            signal_text = "⏸️ NEUTRAL (Tidak Ada Sinyal)"
-            sl = tp = None
+            signal_text = "⏸️ NEUTRAL"
 
         logger.info(
-            f"[LIVE] ts={latest_ts} close={current_price:.2f} ema200={ema_200:.2f} "
+            f"[LIVE] ts={last_ts} close={price:.2f} ema200={ema_200:.2f} "
             f"raw_dir={raw_direction} final_dir={direction} "
-            f"conf={confidence_pct:.1f}% atr={atr_last:.2f}"
+            f"conf={conf_pct:.1f}% atr={atr_last:.2f} age={age}"
         )
 
+        result = {
+            "status": "ok",
+            "signal": signal_text,
+            "direction": int(direction),
+            "confidence_pct": conf_pct,
+            "price": price,
+            "ema_200": ema_200,
+            "atr": atr_last,
+            "sl": sl, "tp": tp,
+            "last_ts": str(last_ts),
+            "age_seconds": float(age.total_seconds()),
+        }
+
+        # F5: only send if truly actionable.
         tg_token = os.getenv("TELEGRAM_TOKEN")
         tg_chat = os.getenv("TELEGRAM_CHAT_ID")
         if tg_token and tg_chat and direction != 0:
@@ -833,31 +965,38 @@ class Pipeline:
                 msg = (
                     f"<b>🚨 XAUUSD LIVE SIGNAL</b>\n\n"
                     f"Sinyal: <b>{signal_text}</b>\n"
-                    f"Entry: {current_price:.2f}\n"
+                    f"Entry: {price:.2f}\n"
                     f"SL: {sl:.2f}\n"
                     f"TP: {tp:.2f}\n"
-                    f"Keyakinan AI: {confidence_pct:.1f}%\n"
+                    f"Confidence: {conf_pct:.1f}%\n"
                     f"ATR: {atr_last:.2f}\n"
                     f"EMA200: {ema_200:.2f}\n"
-                    f"Waktu: {latest_ts.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-                    f"<i>Gunakan Money Management (Max 1-2% Risk).</i>"
+                    f"Bar: {last_ts.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                    f"<i>Max 1-2% risk per trade.</i>"
                 )
                 TelegramClient(tg_token, tg_chat).send(msg)
-                logger.info(f"[TELEGRAM] Sinyal {signal_text} berhasil dikirim!")
+                result["telegram_sent"] = True
+                logger.info("[TELEGRAM] sent.")
             except Exception as e:
-                logger.error(f"[TELEGRAM] Gagal mengirim sinyal: {e}")
+                result["telegram_sent"] = False
+                result["telegram_error"] = str(e)
+                logger.error(f"[TELEGRAM] send failed: {e}")
         else:
-            logger.info("[TELEGRAM] No actionable signal (neutral/filtered) — not sent.")
+            result["telegram_sent"] = False
+            if direction == 0:
+                logger.info("[TELEGRAM] neutral/filtered — not sent.")
+            else:
+                logger.info("[TELEGRAM] missing credentials — not sent.")
 
-        return report
+        return result
 
 
 # ==============================================================================
 # 11. ENTRYPOINT
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.4.1 (fixed)")
-    parser.add_argument("--data", default="data/xauusd_m5.csv")
+    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.5 (final)")
+    parser.add_argument("--data", default="data/xauusd_h1.csv")
     parser.add_argument("--allow-synthetic", action="store_true")
     args = parser.parse_args()
     Pipeline.run(args.data, allow_synthetic=args.allow_synthetic)
