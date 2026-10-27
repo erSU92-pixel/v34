@@ -76,7 +76,7 @@ class GlobalConfig:
 
 
 class LabelConfig:
-    PT_MULTIPLIER = 2.0
+    PT_MULTIPLIER = 1.5
     SL_MULTIPLIER = 1.0
     MAX_VERTICAL_BARS = 12
 
@@ -96,7 +96,7 @@ class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
     MAX_CONSECUTIVE_LOSSES = 8
-    MIN_CONFIDENCE = 0.40
+    MIN_CONFIDENCE = 0.65
     MAX_POSITION_FRAC = 1.0
 
 
