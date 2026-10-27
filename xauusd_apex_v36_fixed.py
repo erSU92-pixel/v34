@@ -88,7 +88,8 @@ class CostConfig:
 class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
-    MAX_CONSECUTIVE_LOSSES = 10
+    MAX_CONSECUTIVE_LOSSES = 20
+    ENABLE_CONSECUTIVE_KILL = False   # off untuk backtest, nyalakan untuk live
     MIN_CONFIDENCE = 0.60
     MAX_POSITION_FRAC = 1.0
 
@@ -484,14 +485,15 @@ class RiskEngine:
         self.reason: Optional[str] = None
         self.consecutive_losses = 0
 
-    def check(self, equity: float, peak: float, day_start: float) -> bool:
+     def check(self, equity: float, peak: float, day_start: float) -> bool:
         if self.tripped:
             return False
         if peak > 0 and (equity / peak - 1) <= -RiskConfig.MAX_DRAWDOWN_KILL:
             self.tripped, self.reason = True, "MAX_DRAWDOWN_KILL"
         elif day_start > 0 and (equity / day_start - 1) <= -RiskConfig.MAX_DAILY_LOSS_KILL:
             self.tripped, self.reason = True, "MAX_DAILY_LOSS_KILL"
-        elif self.consecutive_losses >= RiskConfig.MAX_CONSECUTIVE_LOSSES:
+        elif (RiskConfig.ENABLE_CONSECUTIVE_KILL
+              and self.consecutive_losses >= RiskConfig.MAX_CONSECUTIVE_LOSSES):
             self.tripped, self.reason = True, "MAX_CONSECUTIVE_LOSSES"
         return not self.tripped
 
