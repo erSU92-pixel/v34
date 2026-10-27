@@ -5,7 +5,7 @@ import yfinance as yf
 import websockets
 from datetime import datetime, timezone
 
-MIN_REQUIRED_BARS = 5000
+MIN_REQUIRED_BARS = 2000
 MAX_STALENESS = pd.Timedelta(hours=6)
 OUT_PATH = 'data/xauusd_h1.csv'
 SOURCE_PATH = 'data/source.txt'
@@ -13,13 +13,20 @@ DUKASCOPY_START_YEAR = 2012
 
 
 def save(df, source_name):
+    # Potong data masa depan (Fix Twelve Data timezone issue)
+    now_utc = pd.Timestamp.now(tz='UTC')
+    df = df[df['timestamp'] <= now_utc]
+    
     if len(df) < MIN_REQUIRED_BARS:
         raise ValueError(f"{source_name}: too few bars ({len(df)}).")
+        
     df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
     last = df['timestamp'].iloc[-1]
-    age = pd.Timestamp.now(tz='UTC') - last
+    age = now_utc - last
+    
     if age > MAX_STALENESS:
         raise ValueError(f"{source_name}: stale last={last} age={age}.")
+        
     os.makedirs('data', exist_ok=True)
     df.to_csv(OUT_PATH, index=False)
     with open(SOURCE_PATH, 'w') as f:
@@ -32,10 +39,12 @@ def get_dukascopy():
     try:
         import dukascopy_python
         from dukascopy_python.instruments import INSTRUMENT_FX_METALS_XAUUSD
-    except ImportError:
-        raise RuntimeError("dukascopy-python not installed")
+    except ImportError as e:
+        raise RuntimeError(f"dukascopy-python import failed: {e}")
+        
     start = datetime(DUKASCOPY_START_YEAR, 1, 1, tzinfo=timezone.utc)
     end = datetime.now(timezone.utc)
+    
     df = dukascopy_python.fetch(
         instrument=INSTRUMENT_FX_METALS_XAUUSD,
         interval=dukascopy_python.INTERVAL_HOUR_1,
@@ -44,6 +53,7 @@ def get_dukascopy():
     )
     if df is None or len(df) == 0:
         raise RuntimeError("Dukascopy returned empty")
+        
     df = df.reset_index()
     df = df.rename(columns={'index':'timestamp','datetime':'timestamp',
                             'time':'timestamp','tick_volume':'volume'})
@@ -51,6 +61,7 @@ def get_dukascopy():
         raise RuntimeError(f"Dukascopy: no timestamp col. Got: {list(df.columns)}")
     if 'volume' not in df.columns:
         df['volume'] = 0
+        
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df = df[['timestamp','open','high','low','close','volume']]
     save(df, f"Dukascopy XAUUSD H1 ({DUKASCOPY_START_YEAR}+)")
