@@ -45,7 +45,12 @@ jobs:
           import yfinance as yf
           import websockets
 
+          MIN_REQUIRED_BARS = 2000  # Minimal data untuk bisa dihitung secara statistik
+
           def format_df(df, source_name):
+              if len(df) < MIN_REQUIRED_BARS:
+                  raise ValueError(f"Data dari {source_name} terlalu sedikit ({len(df)} baris). Cari sumber lain.")
+              
               df = df.sort_values('timestamp').reset_index(drop=True)
               os.makedirs('data', exist_ok=True)
               df.to_csv('data/xauusd_m5.csv', index=False)
@@ -70,6 +75,7 @@ jobs:
           async def fetch_deriv():
               url = 'wss://api.derivws.com/trading/v1/options/ws/public'
               async with websockets.connect(url) as ws:
+                  # Deriv maksimal 5000 candle per request
                   req = {'ticks_history': 'frxXAUUSD', 'style': 'candles', 'granularity': 300, 'count': 5000, 'end': 'latest', 'req_id': 1}
                   await ws.send(json.dumps(req))
                   data = json.loads(await ws.recv())
@@ -100,10 +106,9 @@ jobs:
               df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
               df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
               
-              # --- AUTO OFFSET: Menyesuaikan harga Futures ke Spot (MT5) ---
+              # --- AUTO OFFSET ---
               try:
                   print("   -> Menghitung Offset Harga (Futures vs Spot)...")
-                  # Ambil harga spot terbaru dari Yahoo (XAUUSD=X) sebagai referensi
                   spot = yf.download('XAUUSD=X', period='1d', interval='1m', progress=False)
                   if not spot.empty:
                       spot_price = spot['Close'].iloc[-1]
@@ -115,7 +120,7 @@ jobs:
                       df['low'] += offset
                       df['close'] += offset
               except Exception as e:
-                  print(f"   -> Gagal menghitung offset (menggunakan harga asli): {e}")
+                  print(f"   -> Gagal menghitung offset: {e}")
               
               format_df(df, "Yahoo Finance (Offset Adjusted)")
               return True
@@ -133,7 +138,7 @@ jobs:
                       get_yahoo_data()
                   except Exception as e:
                       print(f"[-] Yahoo gagal: {e}")
-                      sys.exit("SEMUA SUMBER DATA GAGAL. PROSES DIBATALKAN.")
+                      sys.exit("SEMUA SUMBER DATA GAGAL ATAU DATA TERLALU SEDIKIT. PROSES DIBATALKAN.")
           EOF
           python download_data.py
 
