@@ -45,7 +45,7 @@ jobs:
           import yfinance as yf
           import websockets
 
-          MIN_REQUIRED_BARS = 2000  # Tolak data jika kurang dari 2000 baris
+          MIN_REQUIRED_BARS = 2000
 
           def format_df(df, source_name):
               if len(df) < MIN_REQUIRED_BARS:
