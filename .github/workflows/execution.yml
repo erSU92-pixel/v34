@@ -93,12 +93,32 @@ jobs:
         run: |
           echo "::warning::Shadow mode — no capital at risk."
 
-      - name: Prepare market data
-        env:
-          DATA_URL: ${{ secrets.DATA_URL }}
-          DATA_URL_HEADER_NAME: ${{ secrets.DATA_URL_HEADER_NAME }}
-          DATA_URL_HEADER_VALUE: ${{ secrets.DATA_URL_HEADER_VALUE }}
-          ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
+            - name: Prepare market data (Auto-Download Real Data)
+        run: |
+          pip install yfinance
+          python -c "
+          import yfinance as yf
+          import pandas as pd
+          import os
+          
+          print('Mengunduh data historis XAUUSD dari Yahoo Finance...')
+          # Mengunduh data Gold Futures 60 hari terakhir (timeframe 5 menit)
+          data = yf.download('GC=F', period='60d', interval='5m')
+          
+          if data.empty:
+              raise ValueError('Gagal mengunduh data dari internet.')
+              
+          data = data.reset_index()
+          if isinstance(data.columns, pd.MultiIndex):
+              data.columns = data.columns.get_level_values(0)
+              
+          data.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+          data['timestamp'] = pd.to_datetime(data['timestamp']).dt.tz_localize('UTC')
+          
+          os.makedirs('data', exist_ok=True)
+          data.to_csv('data/xauusd_m5.csv', index=False)
+          print(f'BERHASIL: Data asli terunduh sebanyak {len(data)} baris.')
+          "
         run: |
           mkdir -p data
           if [ -n "${DATA_URL:-}" ]; then
