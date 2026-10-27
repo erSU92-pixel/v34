@@ -1,8 +1,10 @@
 name: XAUUSD APEX V36 — Quant Execution Engine
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'
+  # Jadwal otomatis kita matikan dulu agar tidak menumpuk di antrean
+  # schedule:
+  #   - cron: '*/15 * * * *'
+  
   workflow_dispatch:
     inputs:
       allow_synthetic:
@@ -22,9 +24,7 @@ on:
       - 'requirements.txt'
       - '.github/workflows/execution.yml'
 
-concurrency:
-  group: xauusd-apex-execution
-  cancel-in-progress: false
+# Kunci antrean (concurrency) kita HAPUS agar bisa langsung jalan
 
 permissions:
   contents: read
@@ -78,6 +78,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install yfinance  # Tambahan untuk unduh data asli
 
       - name: Static syntax check
         run: python -m py_compile xauusd_apex_v36.py
@@ -88,21 +89,14 @@ jobs:
           echo "::error::Live execution mode is NOT yet wired to a broker adapter."
           exit 1
 
-      - name: Governance gate — shadow mode warning
-        if: github.event.inputs.execution_mode == 'shadow'
+      - name: Prepare market data (Auto-Download Real Data)
         run: |
-          echo "::warning::Shadow mode — no capital at risk."
-
-            - name: Prepare market data (Auto-Download Real Data)
-        run: |
-          pip install yfinance
-          python -c "
+          cat << 'EOF' > download_data.py
           import yfinance as yf
           import pandas as pd
           import os
-          
-          print('Mengunduh data historis XAUUSD dari Yahoo Finance...')
-          # Mengunduh data Gold Futures 60 hari terakhir (timeframe 5 menit)
+
+          print("Mengunduh data historis XAUUSD dari Yahoo Finance...")
           data = yf.download('GC=F', period='60d', interval='5m')
           
           if data.empty:
@@ -118,30 +112,8 @@ jobs:
           os.makedirs('data', exist_ok=True)
           data.to_csv('data/xauusd_m5.csv', index=False)
           print(f'BERHASIL: Data asli terunduh sebanyak {len(data)} baris.')
-          "
-        run: |
-          mkdir -p data
-          if [ -n "${DATA_URL:-}" ]; then
-            echo "::group::Fetching market data"
-            HEADER_ARGS=()
-            if [ -n "${DATA_URL_HEADER_NAME:-}" ] && [ -n "${DATA_URL_HEADER_VALUE:-}" ]; then
-              HEADER_ARGS=(-H "${DATA_URL_HEADER_NAME}: ${DATA_URL_HEADER_VALUE}")
-            fi
-            curl -fsSL --retry 3 --retry-delay 5 --max-time 180 \
-              "${HEADER_ARGS[@]}" \
-              -o data/xauusd_m5.csv "$DATA_URL" || echo "::warning::Data fetch failed."
-            echo "::endgroup::"
-          fi
-
-          if [ -f data/xauusd_m5.csv ]; then
-            ROWS=$(wc -l < data/xauusd_m5.csv)
-            echo "Data ready: ${ROWS} lines"
-          elif [ "${ALLOW_SYNTHETIC}" = "true" ]; then
-            echo "::warning::No data file. Synthetic mode explicitly enabled."
-          else
-            echo "::error::No market data and allow_synthetic=false."
-            exit 1
-          fi
+          EOF
+          python download_data.py
 
       - name: Execute engine
         id: engine
