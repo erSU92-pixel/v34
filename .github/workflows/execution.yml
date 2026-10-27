@@ -1,41 +1,18 @@
-name: XAUUSD APEX V36 — Quant Execution Engine
+name: XAUUSD APEX V36
 
 on:
-  # Jadwal otomatis kita matikan dulu agar tidak menumpuk di antrean
-  # schedule:
-  #   - cron: '*/15 * * * *'
-  
   workflow_dispatch:
     inputs:
       allow_synthetic:
-        description: 'Gunakan data sintetis (TESTING ONLY)'
+        description: 'Gunakan data sintetis?'
         type: choice
         options: ['false', 'true']
         default: 'false'
-      execution_mode:
-        description: 'Mode eksekusi'
-        type: choice
-        options: ['research', 'shadow', 'live']
-        default: 'research'
   push:
     branches: [main, master]
-    paths:
-      - 'xauusd_apex_v36.py'
-      - 'requirements.txt'
-      - '.github/workflows/execution.yml'
-
-# Kunci antrean (concurrency) kita HAPUS agar bisa langsung jalan
 
 permissions:
   contents: read
-
-defaults:
-  run:
-    shell: bash
-
-env:
-  PYTHON_VERSION: '3.11'
-  PYTHONUNBUFFERED: '1'
 
 jobs:
   execute:
@@ -46,113 +23,58 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Pre-flight file check
-        run: |
-          MISSING=0
-          if [ ! -f xauusd_apex_v36.py ]; then
-            echo "::error::xauusd_apex_v36.py NOT FOUND in repo root."
-            MISSING=1
-          fi
-          if [ ! -f requirements.txt ]; then
-            echo "::error::requirements.txt NOT FOUND in repo root."
-            MISSING=1
-          fi
-          if [ "$MISSING" -eq 1 ]; then
-            echo "::error::Push file yang hilang ke root repo, lalu re-run workflow."
-            ls -la
-            exit 1
-          fi
-          echo "All required files present."
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: '**/requirements.txt'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install yfinance  # Tambahan untuk unduh data asli
+          pip install yfinance
 
-      - name: Static syntax check
-        run: python -m py_compile xauusd_apex_v36.py
-
-      - name: Governance gate — block live mode
-        if: github.event.inputs.execution_mode == 'live'
+      - name: Download Real Data
         run: |
-          echo "::error::Live execution mode is NOT yet wired to a broker adapter."
-          exit 1
-
-           - name: Prepare market data (Auto-Download Real Data)
-        run: |
-          cat << 'EOF' > download_data.py
+          python -c "
           import yfinance as yf
           import pandas as pd
           import os
-
-          print("Mengunduh data historis XAUUSD dari Yahoo Finance...")
+          print('Mengunduh data XAUUSD...')
           data = yf.download('GC=F', period='60d', interval='5m')
-
-          if data.empty:
-              raise ValueError('Gagal mengunduh data dari internet.')
-
-          # 1. Ratakan kolom jika berlapis (MultiIndex)
-          if isinstance(data.columns, pd.MultiIndex):
-              data.columns = data.columns.get_level_values(0)
-
-          # 2. Ubah nama kolom jadi huruf kecil semua
+          if data.empty: raise ValueError('Data kosong')
+          if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
           data.rename(columns=lambda x: x.lower(), inplace=True)
-
-          # 3. Ambil HANYA 5 kolom utama (buang Adj Close agar tidak error)
           data = data[['open', 'high', 'low', 'close', 'volume']]
-
-          # 4. Pindahkan index waktu menjadi kolom 'timestamp'
           data = data.reset_index()
           data.rename(columns={'datetime': 'timestamp', 'date': 'timestamp'}, inplace=True)
-
-          # 5. Amankan format waktu (Timezone)
           data['timestamp'] = pd.to_datetime(data['timestamp'])
           if data['timestamp'].dt.tz is None:
               data['timestamp'] = data['timestamp'].dt.tz_localize('UTC')
           else:
               data['timestamp'] = data['timestamp'].dt.tz_convert('UTC')
-
-          # 6. Susun urutan kolom dan simpan
           os.makedirs('data', exist_ok=True)
           data = data[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
           data.to_csv('data/xauusd_m5.csv', index=False)
-          print(f'BERHASIL: Data asli terunduh sebanyak {len(data)} baris.')
-          EOF
-          python download_data.py
+          print(f'BERHASIL: {len(data)} baris diunduh')
+          "
 
       - name: Execute engine
-        id: engine
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GITHUB_GIST_ID: ${{ secrets.GIST_ID }}
           ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
-          EXECUTION_MODE: ${{ github.event.inputs.execution_mode || 'research' }}
         run: |
-          echo "Execution mode: ${EXECUTION_MODE}"
           if [ "${ALLOW_SYNTHETIC}" = "true" ]; then
             python xauusd_apex_v36.py --data data/xauusd_m5.csv --allow-synthetic
           else
             python xauusd_apex_v36.py --data data/xauusd_m5.csv
           fi
 
-      - name: Upload execution report
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: quant-report-${{ github.run_id }}
           path: V36_QUANT_EXECUTION_REPORT.json
-          retention-days: 90
           if-no-files-found: warn
