@@ -43,7 +43,7 @@ jobs:
           import pandas as pd
           import os
           print('Mengunduh data XAUUSD...')
-          data = yf.download('GC=F', period='60d', interval='5m')
+          data = yf.download('GC=F', period='2y', interval='1h')
           if data.empty: raise ValueError('Data kosong')
           if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
           
