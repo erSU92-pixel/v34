@@ -37,7 +37,6 @@ jobs:
           pip install yfinance
 
       - name: Download Real Data
-              - name: Download Real Data
         run: |
           python -c "
           import yfinance as yf
