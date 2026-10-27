@@ -1,24 +1,20 @@
 """
 ================================================================================
-XAUUSD APEX V36.5 — FINAL
-Institutional Quant Risk & Execution Engine (LIVE SIGNAL)
+XAUUSD APEX V36.6 — FINAL
+Institutional Quant Risk & Execution Engine (LIVE SIGNAL + ABLATION)
 
-Changelog vs V36.4:
-  F1.  Infer bars/day & bars/year from actual bar spacing.
-  F2.  compute_hurst: removed erroneous "* 2.0".
-  F3.  EWM warmup via min_periods.
-  F4.  Live signal: predict on true last raw bar (not the H-bar-stale row).
-  F5.  Telegram gate: honors EMA200 filter; adds SL/TP/ATR context.
-  F6.  Daily-loss rollover: reset day_start BEFORE in-position skip.
-  F7.  DSR reported as probability; p-value = 1 - prob.
-  F8.  Cost stress test (2x) in report & log.
-  F9.  Rich per-trade audit (fold, conf, entry/exit, TP/SL, ATR, cost).
-  F10. Diagnostics: label dist, argmax counts, max_p quantiles, funnel.
-  F11. MIN_DATA_BARS enforced before training.
-  F12. Staleness check: reject live signal if last bar too old (weekends).
-  F13. Data source propagated into report ("data/source.txt").
-  F14. Config validation at startup (fails fast on bad invariants).
-  F15. Deterministic global seeding (numpy + sklearn).
+Changelog vs V36.5:
+  M1.  Triple barrier: ambiguous (TP+SL same bar) → NaN, dropped from training.
+  M2.  GB → HistGradientBoostingClassifier(class_weight='balanced').
+  M4.  bars_per_year inferred from actual span (not 24*252 heuristic).
+  M5.  Warn if trade count < 100 (DSR/MC unreliable).
+  M6.  Diagnostic: position of MIN_CONFIDENCE within max_p distribution.
+  M7.  Ablation framework (--ablation):
+         none              → model + EMA filter (baseline)
+         random            → model trained, predictions shuffled in time
+                             (same confidence distribution, timing destroyed)
+         no_filter         → model, no EMA filter
+         random_no_filter  → shuffled predictions, no filter
 ================================================================================
 """
 
@@ -40,7 +36,7 @@ import pandas as pd
 from sklearn.ensemble import (
     RandomForestClassifier,
     ExtraTreesClassifier,
-    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
     VotingClassifier,
 )
 from sklearn.preprocessing import StandardScaler
@@ -61,16 +57,14 @@ logger = logging.getLogger("V36_QUANT_ENGINE")
 
 class GlobalConfig:
     SYMBOL = "XAUUSD"
-    TIMEFRAME = "AUTO"              # F1: inferred from data
-    BARS_PER_DAY = 24               # F1: overwritten at runtime
+    TIMEFRAME = "AUTO"
+    BARS_PER_DAY = 24
     TRADING_DAYS_PER_YEAR = 252
-    BARS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR   # F1
+    BARS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
     INITIAL_CAPITAL = 100_000.0
     RANDOM_STATE = 42
-    N_STRATEGY_TRIALS = 10          # bump if you tune
+    N_STRATEGY_TRIALS = 10
     MIN_DATA_BARS = 2000
-
-    # F12: live-signal staleness guard
     MAX_LIVE_STALENESS = pd.Timedelta(hours=4)
 
 
@@ -84,7 +78,7 @@ class CostConfig:
     SPREAD_USD = 0.20
     SLIPPAGE_USD = 0.10
     COMMISSION_USD = 0.00
-    STRESS_MULTIPLIER = 2.0         # F8
+    STRESS_MULTIPLIER = 2.0
 
     @classmethod
     def round_turn_cost_frac(cls, price: float) -> float:
@@ -105,19 +99,37 @@ class CVConfig:
     EMBARGO_BARS = 12
 
 
+class AblationConfig:
+    MODE = "none"
+    RANDOM_SEED_OFFSET = 999
+    VALID = ("none", "random", "no_filter", "random_no_filter")
+
+    @classmethod
+    def use_random(cls) -> bool:
+        return cls.MODE in ("random", "random_no_filter")
+
+    @classmethod
+    def use_ema_filter(cls) -> bool:
+        return cls.MODE not in ("no_filter", "random_no_filter")
+
+    @classmethod
+    def validate(cls) -> None:
+        if cls.MODE not in cls.VALID:
+            raise ValueError(f"Invalid ablation mode: {cls.MODE}. Valid: {cls.VALID}")
+
+
 def validate_config() -> None:
-    """F14: fail fast on invalid invariants before touching data."""
-    assert 0.5 <= RiskConfig.MIN_CONFIDENCE < 1.0, "MIN_CONFIDENCE must be [0.5, 1)."
+    assert 0.5 <= RiskConfig.MIN_CONFIDENCE < 1.0
     assert 0.0 < RiskConfig.MAX_POSITION_FRAC <= 1.0
     assert LabelConfig.PT_MULTIPLIER > 0 and LabelConfig.SL_MULTIPLIER > 0
     assert LabelConfig.MAX_VERTICAL_BARS > 0
     assert CVConfig.N_SPLITS >= 2 and 0.0 < CVConfig.MIN_TRAIN_FRAC < 1.0
     assert GlobalConfig.MIN_DATA_BARS > 0
     assert GlobalConfig.N_STRATEGY_TRIALS >= 1
+    AblationConfig.validate()
 
 
 def seed_everything(seed: int) -> None:
-    """F15: deterministic runs."""
     import random
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
@@ -130,7 +142,7 @@ def seed_everything(seed: int) -> None:
 class ExperimentGovernance:
     def __init__(self):
         self.metadata = {
-            "version": "36.5.0-FINAL",
+            "version": "36.6.0-FINAL",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": "Global Head of Quantitative Risk & Trading Systems",
             "audit_status": "PENDING_EXTERNAL_AUDIT",
@@ -207,7 +219,6 @@ class DataLayer:
 
     @staticmethod
     def infer_bars_per_day(df: pd.DataFrame) -> Tuple[int, pd.Timedelta]:
-        """F1: infer bar spacing from actual data."""
         diffs = df["timestamp"].diff().dropna()
         if diffs.empty:
             return GlobalConfig.BARS_PER_DAY, pd.NaT
@@ -218,8 +229,17 @@ class DataLayer:
         return bpd, median_dt
 
     @staticmethod
+    def infer_bars_per_year(df: pd.DataFrame) -> int:
+        if len(df) < 2:
+            return GlobalConfig.BARS_PER_YEAR
+        span_sec = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds()
+        if span_sec <= 0:
+            return GlobalConfig.BARS_PER_YEAR
+        span_years = span_sec / (365.25 * 86400)
+        return max(1, int(round(len(df) / span_years)))
+
+    @staticmethod
     def read_source_tag(path: str = "data/source.txt") -> str:
-        """F13: which provider actually delivered the data."""
         try:
             with open(path) as f:
                 return f.read().strip() or "unknown"
@@ -261,7 +281,6 @@ class FeatureEngineering:
             return np.nan
         try:
             slope = np.polyfit(np.log(lags[valid]), np.log(tau[valid]), 1)[0]
-            # F2: slope IS Hurst exponent; drop "* 2.0".
             return float(np.clip(slope, 0.0, 1.0))
         except Exception:
             return np.nan
@@ -274,7 +293,6 @@ class FeatureEngineering:
         for lag in (1, 3, 5, 10):
             df[f"return_{lag}"] = close.pct_change(lag)
 
-        # F3: min_periods prevents under-warmed EMAs.
         for period in (9, 21, 50, 200):
             df[f"ema_{period}"] = close.ewm(
                 span=period, adjust=False, min_periods=period
@@ -340,7 +358,7 @@ class LabelingLayer:
                 hit_up = high[j] >= upper
                 hit_dn = low[j] <= lower
                 if hit_up and hit_dn:
-                    lab, end_j = -1, j
+                    lab, end_j = np.nan, j
                     break
                 if hit_up:
                     lab, end_j = 1, j
@@ -398,8 +416,9 @@ class ModelLayer:
             n_estimators=200, max_depth=6, class_weight="balanced",
             random_state=rs, n_jobs=-1,
         )
-        gb = GradientBoostingClassifier(
-            n_estimators=100, max_depth=4, random_state=rs,
+        gb = HistGradientBoostingClassifier(
+            max_iter=100, max_depth=4, class_weight="balanced",
+            random_state=rs,
         )
         return VotingClassifier(
             estimators=[("rf", rf), ("et", et), ("gb", gb)],
@@ -416,7 +435,7 @@ class TradeSimulator:
         max_p = float(proba.max())
         if max_p < RiskConfig.MIN_CONFIDENCE:
             return 0, 0.0
-        cls = int(proba.argmax()) - 1  # 0->-1, 1->0, 2->+1
+        cls = int(proba.argmax()) - 1
         if cls == 0:
             return 0, 0.0
         size = (max_p - RiskConfig.MIN_CONFIDENCE) / (1.0 - RiskConfig.MIN_CONFIDENCE)
@@ -425,7 +444,6 @@ class TradeSimulator:
     @staticmethod
     def simulate(df: pd.DataFrame, i: int, direction: int, size: float
                  ) -> Tuple[float, int, float, float, float]:
-        """F9: returns (ret, exit_idx, tp, sl, exit_price)."""
         if direction == 0 or size <= 0:
             return 0.0, i, np.nan, np.nan, np.nan
         entry = float(df["close"].iat[i])
@@ -499,7 +517,7 @@ class PerformanceEngine:
         equity = GlobalConfig.INITIAL_CAPITAL * np.cumprod(1 + trade_returns)
         peak = np.maximum.accumulate(equity)
         max_dd = float(((equity - peak) / peak).min())
-        years = max(n_test_bars / GlobalConfig.BARS_PER_YEAR, 1e-9)  # F1
+        years = max(n_test_bars / GlobalConfig.BARS_PER_YEAR, 1e-9)
         cagr = float((equity[-1] / GlobalConfig.INITIAL_CAPITAL) ** (1 / years) - 1)
 
         mean_r = float(trade_returns.mean())
@@ -536,7 +554,6 @@ class PerformanceEngine:
     @staticmethod
     def deflated_sharpe(sr: float, n_trials: int, T: int,
                         skew: float = 0.0, kurt: float = 3.0) -> float:
-        """Returns P(SR > E[max(SR)] under null). Low = no skill."""
         if T < 2 or n_trials < 2:
             return 0.0
         logN = np.log(n_trials)
@@ -615,41 +632,54 @@ class TelegramClient:
 # ==============================================================================
 class Pipeline:
     @staticmethod
-    def run(data_path: str, allow_synthetic: bool = False) -> Dict[str, Any]:
-        validate_config()                                    # F14
-        seed_everything(GlobalConfig.RANDOM_STATE)           # F15
-        governance.log("PIPELINE_START", {})
+    def run(data_path: str, allow_synthetic: bool = False,
+            ablation: str = "none") -> Dict[str, Any]:
+        AblationConfig.MODE = ablation
+        validate_config()
+        seed_everything(GlobalConfig.RANDOM_STATE)
+        governance.log("PIPELINE_START", {"ablation": AblationConfig.MODE})
+        logger.info(f"[ABLATION] mode={AblationConfig.MODE} "
+                    f"(use_random={AblationConfig.use_random()}, "
+                    f"use_ema_filter={AblationConfig.use_ema_filter()})")
 
         # ---- Load & validate ------------------------------------------------
         raw = DataLayer.load_or_raise(data_path, allow_synthetic=allow_synthetic)
 
-        if len(raw) < GlobalConfig.MIN_DATA_BARS:            # F11
+        if len(raw) < GlobalConfig.MIN_DATA_BARS:
             raise ValueError(
                 f"Data too short: {len(raw)} < {GlobalConfig.MIN_DATA_BARS} bars."
             )
 
-        bars_per_day, median_dt = DataLayer.infer_bars_per_day(raw)  # F1
+        bars_per_day, median_dt = DataLayer.infer_bars_per_day(raw)
+        bars_per_year = DataLayer.infer_bars_per_year(raw)
         GlobalConfig.BARS_PER_DAY = bars_per_day
-        GlobalConfig.BARS_PER_YEAR = bars_per_day * GlobalConfig.TRADING_DAYS_PER_YEAR
+        GlobalConfig.BARS_PER_YEAR = bars_per_year
         span = raw["timestamp"].iloc[-1] - raw["timestamp"].iloc[0]
-        source_tag = DataLayer.read_source_tag()             # F13
+        source_tag = DataLayer.read_source_tag()
         logger.info(
             f"[DATA] rows={len(raw)} | source={source_tag} | "
             f"median_dt={median_dt} | bars/day={bars_per_day} | "
-            f"bars/year={GlobalConfig.BARS_PER_YEAR} | span={span}"
+            f"bars/year={bars_per_year} (span={span})"
         )
 
-        # ---- Features (keep ALL rows for live) ------------------------------
+        # ---- Features (all rows) -------------------------------------------
         df_full = FeatureEngineering.transform(raw)
 
-        # ---- Labels (drop NaN only for training) ---------------------------
+        # ---- Labels --------------------------------------------------------
         df = LabelingLayer.apply_triple_barrier(df_full)
         feature_cols = [
             c for c in df.columns
             if c not in {"timestamp", "open", "high", "low", "close",
                          "volume", "target", "label_end_idx"}
         ]
+        n_with_features = df_full.dropna(subset=feature_cols).shape[0]
         df = df.dropna(subset=feature_cols + ["target"]).reset_index(drop=True)
+        logger.info(
+            f"[DIAG] rows_with_features={n_with_features}, "
+            f"labeled_trainable={len(df)}, "
+            f"dropped={n_with_features - len(df)} "
+            f"(ambiguous+unlabeled)"
+        )
 
         X = df[feature_cols].values
         y_mapped = (df["target"].values + 1).astype(int)
@@ -660,7 +690,7 @@ class Pipeline:
                       .sort_index().round(3).to_dict())
         logger.info(f"[DIAG] label distribution: {label_dist}")
 
-        # ---- Purged walk-forward CV ----------------------------------------
+        # ---- CV ------------------------------------------------------------
         cv = PurgedWalkForwardCV()
         splits = list(cv.split(n))
         fold_of = np.full(n, -1, dtype=int)
@@ -695,6 +725,14 @@ class Pipeline:
                 f"bal_acc={fm['balanced_accuracy']:.3f}"
             )
 
+            # M7: shuffle predictions in time (same confidence, no timing skill)
+            if AblationConfig.use_random():
+                shuffle_rng = np.random.default_rng(
+                    GlobalConfig.RANDOM_STATE + AblationConfig.RANDOM_SEED_OFFSET + fold
+                )
+                proba = proba[shuffle_rng.permutation(len(proba))]
+                logger.info(f"[ABLATION] Fold {fold + 1}: predictions shuffled.")
+
             oof_idx.extend(te.tolist())
             oof_proba.extend(proba)
 
@@ -705,6 +743,7 @@ class Pipeline:
         oof_idx = [oof_idx[k] for k in order]
         oof_proba = [oof_proba[k] for k in order]
 
+        # ---- Prob diagnostics ----------------------------------------------
         proba_arr = np.asarray(oof_proba)
         argmax_counts = np.bincount(proba_arr.argmax(axis=1), minlength=3).tolist()
         max_p = proba_arr.max(axis=1)
@@ -712,7 +751,18 @@ class Pipeline:
         logger.info(f"[DIAG] argmax counts [down,neutral,up]={argmax_counts}")
         logger.info(f"[DIAG] max_p quantiles [p50,p75,p90,p95]={max_p_q}")
 
-        # ---- Backtest on OOF ------------------------------------------------
+        threshold_pct = float(np.mean(max_p < RiskConfig.MIN_CONFIDENCE)) * 100
+        logger.info(
+            f"[DIAG] MIN_CONFIDENCE={RiskConfig.MIN_CONFIDENCE:.2f} "
+            f"rejects p{threshold_pct:.0f} of max_p distribution"
+        )
+        if threshold_pct > 85:
+            logger.warning(
+                f"[WARN] Threshold rejects {threshold_pct:.0f}% of bars. "
+                f"Probabilities poorly calibrated — consider calibration before tuning."
+            )
+
+        # ---- Backtest ------------------------------------------------------
         risk = RiskEngine()
         equity = GlobalConfig.INITIAL_CAPITAL
         peak = GlobalConfig.INITIAL_CAPITAL
@@ -723,7 +773,6 @@ class Pipeline:
         n_below_conf = n_ema_filtered = n_risk_blocked = 0
 
         for i, proba in zip(oof_idx, oof_proba):
-            # F6: rollover must precede in-position skip
             bar_day = df["timestamp"].iat[i].date()
             if current_day != bar_day:
                 current_day = bar_day
@@ -739,12 +788,14 @@ class Pipeline:
 
             price = float(df["close"].iat[i])
             ema_200 = float(df["ema_200"].iat[i])
-            if direction == 1 and price < ema_200:
-                n_ema_filtered += 1
-                continue
-            if direction == -1 and price > ema_200:
-                n_ema_filtered += 1
-                continue
+
+            if AblationConfig.use_ema_filter():
+                if direction == 1 and price < ema_200:
+                    n_ema_filtered += 1
+                    continue
+                if direction == -1 and price > ema_200:
+                    n_ema_filtered += 1
+                    continue
 
             if not risk.check(equity, peak, day_start):
                 logger.error(f"[KILL SWITCH] {risk.reason} — halting.")
@@ -786,6 +837,12 @@ class Pipeline:
             f"traded={len(trades)}"
         )
 
+        if 0 < len(trades) < 100:
+            logger.warning(
+                f"[WARN] Only {len(trades)} trades. DSR / Monte Carlo "
+                f"unreliable below ~100 trades."
+            )
+
         trade_returns = (np.array([t["net_return"] for t in trades])
                          if trades else np.array([]))
         n_test_bars = len(oof_idx)
@@ -807,22 +864,27 @@ class Pipeline:
 
         report: Dict[str, Any] = {
             "metadata": governance.metadata,
+            "ablation": {
+                "mode": AblationConfig.MODE,
+                "use_random": AblationConfig.use_random(),
+                "use_ema_filter": AblationConfig.use_ema_filter(),
+            },
             "data": {
                 "path": data_path,
-                "source": source_tag,                       # F13
+                "source": source_tag,
                 "rows": int(len(raw)),
                 "median_dt": str(median_dt),
                 "bars_per_day": int(bars_per_day),
-                "bars_per_year": int(GlobalConfig.BARS_PER_YEAR),
+                "bars_per_year": int(bars_per_year),
                 "span": str(span),
             },
             "label_distribution": label_dist,
             "fold_metrics": fold_metrics,
             "performance": metrics,
-            "deflated_sharpe_probability": dsr_prob,        # F7
-            "deflated_sharpe_p_value": 1.0 - dsr_prob,      # F7
+            "deflated_sharpe_probability": dsr_prob,
+            "deflated_sharpe_p_value": 1.0 - dsr_prob,
             "monte_carlo": mc,
-            "cost_stress_2x": stress_metrics,               # F8
+            "cost_stress_2x": stress_metrics,
             "kill_switch_tripped": risk.tripped,
             "kill_switch_reason": risk.reason,
             "n_trades": len(trades),
@@ -833,28 +895,43 @@ class Pipeline:
                 "risk_blocked": n_risk_blocked,
                 "traded": len(trades),
             },
+            "threshold_diagnostic": {
+                "min_confidence": RiskConfig.MIN_CONFIDENCE,
+                "pct_rejected": threshold_pct,
+                "max_p_quantiles": dict(zip(["p50", "p75", "p90", "p95"], max_p_q)),
+            },
             "audit_trail": governance.audit_trail,
         }
 
-        # ---- Live signal (with F4 + F12) -----------------------------------
-        live_signal_info: Dict[str, Any] = {}
-        try:
-            live_signal_info = Pipeline._live_signal(
-                df=df, df_full=df_full, feature_cols=feature_cols,
-                X=X, y_mapped=y_mapped,
-            )
-            report["live_signal"] = live_signal_info
-        except Exception as e:
-            logger.exception(f"[LIVE] failed: {e}")
-            report["live_signal"] = {"error": str(e)}
+        # ---- Live signal ---------------------------------------------------
+        if AblationConfig.use_random():
+            logger.info("[LIVE] Skipped in ablation mode (shuffled predictions).")
+            report["live_signal"] = {"status": "skipped",
+                                     "reason": "ablation_random"}
+        else:
+            try:
+                live_signal_info = Pipeline._live_signal(
+                    df=df, df_full=df_full, feature_cols=feature_cols,
+                    X=X, y_mapped=y_mapped,
+                )
+                report["live_signal"] = live_signal_info
+            except Exception as e:
+                logger.exception(f"[LIVE] failed: {e}")
+                report["live_signal"] = {"error": str(e)}
 
-        # ---- Persist --------------------------------------------------------
+        # ---- Persist -------------------------------------------------------
+        out_name = f"V36_QUANT_EXECUTION_REPORT_{AblationConfig.MODE}.json"
+        with open(out_name, "w") as f:
+            json.dump(report, f, indent=2, default=str)
         with open("V36_QUANT_EXECUTION_REPORT.json", "w") as f:
             json.dump(report, f, indent=2, default=str)
+        logger.info(f"[REPORT] written: {out_name}")
 
+        # ---- Summary -------------------------------------------------------
         logger.info("=" * 64)
         logger.info(
-            f"Trades: {len(trades)} | CAGR: {metrics['CAGR'] * 100:.2f}% | "
+            f"[{AblationConfig.MODE.upper()}] Trades: {len(trades)} | "
+            f"CAGR: {metrics['CAGR'] * 100:.2f}% | "
             f"Max DD: {metrics['Max_Drawdown'] * 100:.2f}%"
         )
         logger.info(
@@ -877,15 +954,12 @@ class Pipeline:
         return report
 
     # ------------------------------------------------------------------
-    # LIVE SIGNAL (extracted for clarity + testability)
-    # ------------------------------------------------------------------
     @staticmethod
     def _live_signal(df: pd.DataFrame, df_full: pd.DataFrame,
                      feature_cols: List[str], X: np.ndarray,
                      y_mapped: np.ndarray) -> Dict[str, Any]:
         logger.info("[LIVE] Predicting on true last raw bar...")
 
-        # F4: use df_full (all rows), NOT df (which dropped the last H bars).
         last_row = df_full.iloc[[-1]]
         if last_row[feature_cols].isna().any().any():
             logger.warning("[LIVE] last raw row has NaN features; abort.")
@@ -893,12 +967,8 @@ class Pipeline:
 
         last_ts = last_row["timestamp"].iat[0]
         age = pd.Timestamp.now(tz="UTC") - last_ts
-        # F12: reject stale (e.g. weekend / holiday).
         if age > GlobalConfig.MAX_LIVE_STALENESS:
-            logger.warning(
-                f"[LIVE] stale: last={last_ts} age={age} > "
-                f"{GlobalConfig.MAX_LIVE_STALENESS}; abort."
-            )
+            logger.warning(f"[LIVE] stale: last={last_ts} age={age}; abort.")
             return {
                 "status": "skipped", "reason": "stale",
                 "last_ts": str(last_ts), "age": str(age),
@@ -919,7 +989,6 @@ class Pipeline:
         atr_last = float(last_row["atr"].iat[0])
         conf_pct = float(latest_proba.max()) * 100.0
 
-        # F5: EMA200 filter BEFORE deciding to notify.
         direction = raw_direction
         if direction == 1 and price <= ema_200:
             direction = 0
@@ -944,7 +1013,7 @@ class Pipeline:
             f"conf={conf_pct:.1f}% atr={atr_last:.2f} age={age}"
         )
 
-        result = {
+        result: Dict[str, Any] = {
             "status": "ok",
             "signal": signal_text,
             "direction": int(direction),
@@ -957,7 +1026,6 @@ class Pipeline:
             "age_seconds": float(age.total_seconds()),
         }
 
-        # F5: only send if truly actionable.
         tg_token = os.getenv("TELEGRAM_TOKEN")
         tg_chat = os.getenv("TELEGRAM_CHAT_ID")
         if tg_token and tg_chat and direction != 0:
@@ -995,8 +1063,18 @@ class Pipeline:
 # 11. ENTRYPOINT
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.5 (final)")
+    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.6 (final)")
     parser.add_argument("--data", default="data/xauusd_h1.csv")
     parser.add_argument("--allow-synthetic", action="store_true")
+    parser.add_argument(
+        "--ablation",
+        choices=list(AblationConfig.VALID),
+        default="none",
+        help="Ablation mode for controlled experiments.",
+    )
     args = parser.parse_args()
-    Pipeline.run(args.data, allow_synthetic=args.allow_synthetic)
+    Pipeline.run(
+        args.data,
+        allow_synthetic=args.allow_synthetic,
+        ablation=args.ablation,
+    )
