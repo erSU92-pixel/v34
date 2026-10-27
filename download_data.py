@@ -6,14 +6,18 @@ import websockets
 from datetime import datetime, timezone
 
 MIN_REQUIRED_BARS = 2000
-MAX_STALENESS = pd.Timedelta(days=7) # Longgar karena data HF mungkin telat beberapa hari
+MAX_STALENESS = pd.Timedelta(days=7)
 OUT_PATH = 'data/xauusd_h1.csv'
 SOURCE_PATH = 'data/source.txt'
 
-# URL Dataset 20 Tahun (2004 - 2025) dari Hugging Face
+# Dataset 20 Tahun
 HF_URL = "https://huggingface.co/datasets/ZombitX64/xauusd-gold-price-historical-data-2004-2025/resolve/main/XAU_1h_data.csv"
 
 def save(df, source_name):
+    # FIX BUG: Potong data masa depan agar age tidak minus
+    now_utc = pd.Timestamp.now(tz='UTC')
+    df = df[df['timestamp'] <= now_utc]
+    
     if len(df) < MIN_REQUIRED_BARS:
         raise ValueError(f"{source_name}: too few bars ({len(df)}).")
     df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
@@ -27,19 +31,12 @@ def get_huggingface():
     print("[1/3] Hugging Face (20 Years Historical)...")
     try:
         df = pd.read_csv(HF_URL)
-        # Normalisasi nama kolom agar sesuai dengan engine
         df.columns = [c.lower() for c in df.columns]
-        
-        # Deteksi nama kolom timestamp
         ts_col = 'timestamp' if 'timestamp' in df.columns else ('datetime' if 'datetime' in df.columns else 'date')
         df = df.rename(columns={ts_col: 'timestamp'})
-        
         df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-        
-        # Deteksi volume
         if 'volume' not in df.columns:
             df['volume'] = 0
-            
         df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
         save(df, "HuggingFace XAUUSD 1h (2004-2025)")
     except Exception as e:
