@@ -1,0 +1,239 @@
+# =============================================================================
+# XAUUSD APEX V36 — GitHub Actions Execution Workflow
+# Global Head of Quantitative Risk & Trading Systems
+# =============================================================================
+# PENTING: GitHub Actions BUKAN pengganti VPS untuk eksekusi M5 yang sensitif
+# terhadap latency. Cron GitHub bersifat best-effort dengan delay 5–15 menit.
+# Gunakan workflow ini untuk:
+#   (a) Riset / backtest otomatis berkala
+#   (b) Paper-trading / shadow mode
+#   (c) Notifikasi performa harian
+# Untuk eksekusi live, deploy ke VPS dengan scheduler deterministik (systemd /
+# cron OS / Airflow). Lihat DEPLOYMENT_CHECKLIST G6.
+# =============================================================================
+
+name: XAUUSD APEX V36 — Quant Execution Engine
+
+on:
+  # Jadwal utama. Sesuaikan frekuensi dengan biaya & beban.
+  # */15 = setiap 15 menit (aman untuk free tier; jangan pakai */5)
+  schedule:
+    - cron: '*/15 * * * *'
+
+  # Trigger manual dari tab Actions
+  workflow_dispatch:
+    inputs:
+      allow_synthetic:
+        description: 'Gunakan data sintetis (TESTING ONLY)'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      execution_mode:
+        description: 'Mode eksekusi'
+        type: choice
+        options: ['research', 'shadow', 'live']
+        default: 'research'
+
+  # CI pada perubahan kode (smoke test sintetis)
+  push:
+    branches: [main, master]
+    paths:
+      - 'xauusd_apex_v36.py'
+      - 'requirements.txt'
+      - '.github/workflows/execution.yml'
+
+# Serialisasi mutlak: satu run saja dalam satu waktu untuk mencegah race
+# condition pada Gist state (audit finding #18).
+concurrency:
+  group: xauusd-apex-execution
+  cancel-in-progress: false
+
+# Least-privilege: workflow tidak butuh write ke repo
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  execute:
+    name: V36 Quant Engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 25   # prevents runaway jobs; M5 run tipikal < 5 menit
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. SETUP
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Static syntax check
+        run: python -m py_compile xauusd_apex_v36.py
+
+      # -----------------------------------------------------------------------
+      # 2. GOVERNANCE GATE — blokir live mode jika execution layer belum ada
+      # -----------------------------------------------------------------------
+      - name: Governance gate — block live mode
+        if: github.event.inputs.execution_mode == 'live'
+        run: |
+          echo "::error::Live execution mode is NOT yet wired to a broker adapter."
+          echo "::error::Deployment Checklist G4 (broker API + client_order_id) belum selesai."
+          echo "::error::Lihat DEPLOYMENT_CHECKLIST.md sebelum mengaktifkan live mode."
+          exit 1
+
+      - name: Governance gate — require external audit
+        if: github.event.inputs.execution_mode == 'shadow'
+        run: |
+          echo "::warning::Shadow mode — no capital at risk."
+          echo "::warning::Pastikan audit_status sudah PENDING_EXTERNAL_AUDIT (bukan CERTIFIED)."
+
+      # -----------------------------------------------------------------------
+      # 3. DATA PREPARATION — fail-closed
+      # -----------------------------------------------------------------------
+      - name: Prepare market data
+        env:
+          DATA_URL: ${{ secrets.DATA_URL }}
+          DATA_URL_HEADER_NAME: ${{ secrets.DATA_URL_HEADER_NAME }}
+          DATA_URL_HEADER_VALUE: ${{ secrets.DATA_URL_HEADER_VALUE }}
+          ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
+        run: |
+          mkdir -p data
+
+          # (a) Fetch dari DATA_URL jika dikonfigurasi
+          if [ -n "${DATA_URL:-}" ]; then
+            echo "::group::Fetching market data"
+            HEADER_ARGS=()
+            if [ -n "${DATA_URL_HEADER_NAME:-}" ] && [ -n "${DATA_URL_HEADER_VALUE:-}" ]; then
+              HEADER_ARGS=(-H "${DATA_URL_HEADER_NAME}: ${DATA_URL_HEADER_VALUE}")
+            fi
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 180 \
+              "${HEADER_ARGS[@]}" \
+              -o data/xauusd_m5.csv "$DATA_URL" || {
+                echo "::warning::Data fetch failed."
+              }
+            echo "::endgroup::"
+          fi
+
+          # (b) Cek keberadaan data
+          if [ -f data/xauusd_m5.csv ]; then
+            ROWS=$(wc -l < data/xauusd_m5.csv)
+            echo "Data ready: ${ROWS} lines"
+            # Validasi minimal bar
+            if [ "$ROWS" -lt 1500 ]; then
+              echo "::warning::Data has only ${ROWS} rows (< MIN_DATA_BARS=1500). Metrics are non-inferential."
+            fi
+          elif [ "${ALLOW_SYNTHETIC}" = "true" ]; then
+            echo "::warning::No data file. Synthetic mode explicitly enabled."
+          else
+            echo "::error::No market data and allow_synthetic=false."
+            echo "::error::Set DATA_URL secret OR commit data/xauusd_m5.csv OR use workflow_dispatch with allow_synthetic=true."
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 4. EXECUTE ENGINE
+      # -----------------------------------------------------------------------
+      - name: Execute engine
+        id: engine
+        env:
+          # Secrets — set via Settings → Secrets and variables → Actions
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GITHUB_GIST_ID: ${{ secrets.GIST_ID }}
+          # Inputs
+          ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
+          EXECUTION_MODE: ${{ github.event.inputs.execution_mode || 'research' }}
+        run: |
+          echo "Execution mode: ${EXECUTION_MODE}"
+          if [ "${ALLOW_SYNTHETIC}" = "true" ]; then
+            python xauusd_apex_v36.py --data data/xauusd_m5.csv --allow-synthetic
+          else
+            python xauusd_apex_v36.py --data data/xauusd_m5.csv
+          fi
+
+      # -----------------------------------------------------------------------
+      # 5. ARTIFACTS
+      # -----------------------------------------------------------------------
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-report-${{ github.run_id }}
+          path: V36_QUANT_EXECUTION_REPORT.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: |
+            *.log
+            data/*.csv
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # -----------------------------------------------------------------------
+      # 6. FAILURE NOTIFICATION
+      # -----------------------------------------------------------------------
+      - name: Notify failure via Telegram
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram not configured, skipping failure notification."
+            exit 0
+          fi
+          MSG="XAUUSD V36 FAILED%0ARepo: ${{ github.repository }}%0ARun: ${RUN_URL}"
+          curl -fsSL --max-time 15 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"${MSG}\"}" \
+            || echo "Telegram notify failed (non-fatal)."
+
+      # -----------------------------------------------------------------------
+      # 7. RUN SUMMARY
+      # -----------------------------------------------------------------------
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo "## XAUUSD V36 Execution Summary"
+            echo ""
+            echo "- **Run ID**: ${{ github.run_id }}"
+            echo "- **Mode**: ${{ github.event.inputs.execution_mode || 'research (scheduled)' }}"
+            echo "- **Synthetic**: ${{ github.event.inputs.allow_synthetic || 'false' }}"
+            echo "- **Status**: ${{ job.status }}"
+            if [ -f V36_QUANT_EXECUTION_REPORT.json ]; then
+              echo ""
+              echo "### Report excerpt"
+              echo '```json'
+              python -c "import json; d=json.load(open('V36_QUANT_EXECUTION_REPORT.json')); print(json.dumps({k:d[k] for k in ('performance','deflated_sharpe_probability','monte_carlo','kill_switch_tripped','n_trades') if k in d}, indent=2))"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
