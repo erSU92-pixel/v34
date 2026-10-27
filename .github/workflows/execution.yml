@@ -1,6 +1,8 @@
 name: XAUUSD APEX V36
 
 on:
+  schedule:
+    - cron: '5 * * * *'  # Berjalan otomatis setiap jam ke-5 (misal 01:05, 02:05)
   workflow_dispatch:
     inputs:
       allow_synthetic:
@@ -123,6 +125,8 @@ jobs:
 
       - name: Execute engine
         env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
         run: |
           if [ "${ALLOW_SYNTHETIC}" = "true" ]; then
