@@ -2,7 +2,7 @@ name: XAUUSD APEX V36
 
 on:
   schedule:
-    - cron: '5 */4 * * *'      # tiap 4 jam; ubah ke '5 * * * *' bila perlu hourly
+    - cron: '5 */4 * * *'
   workflow_dispatch:
     inputs:
       allow_synthetic:
@@ -10,6 +10,11 @@ on:
         type: choice
         options: ['false', 'true']
         default: 'false'
+      ablation:
+        description: 'Ablation mode'
+        type: choice
+        options: ['none', 'random', 'no_filter', 'random_no_filter']
+        default: 'none'
   push:
     branches: [main, master]
     paths-ignore:
@@ -152,8 +157,9 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
+          ABLATION: ${{ github.event.inputs.ablation || 'none' }}
         run: |
-          ARGS="--data data/xauusd_h1.csv"
+          ARGS="--data data/xauusd_h1.csv --ablation ${ABLATION}"
           [ "${ALLOW_SYNTHETIC}" = "true" ] && ARGS="$ARGS --allow-synthetic"
           python xauusd_apex_v36_fixed.py $ARGS
 
@@ -161,7 +167,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: quant-report-${{ github.run_id }}
-          path: V36_QUANT_EXECUTION_REPORT.json
+          name: quant-report-${{ github.run_id }}-${{ github.event.inputs.ablation || 'none' }}
+          path: |
+            V36_QUANT_EXECUTION_REPORT.json
+            V36_QUANT_EXECUTION_REPORT_*.json
           if-no-files-found: error
           retention-days: 30
