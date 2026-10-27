@@ -58,7 +58,7 @@ jobs:
               import dukascopy_python
               print("dukascopy-python OK")
           except ImportError as e:
-              print(f"dukascopy-python MISSING: {e}")
+              print(f"dukascopy MISSING: {e}")
           PYEOF
 
       - name: Download data
