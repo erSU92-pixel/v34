@@ -169,25 +169,25 @@ class DataLayer:
                 f"only for research/testing. Production must fail closed."
             )
 
-                logger.warning("[DATA] Generating synthetic XAUUSD feed (TESTING ONLY).")
+        logger.warning("[DATA] Generating synthetic XAUUSD feed (TESTING ONLY).")
         rng = np.random.default_rng(GlobalConfig.RANDOM_STATE)
         n = n_synthetic
         ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
         rets = rng.normal(0.00001, 0.0012, n)
         path = 2650.0 * np.exp(np.cumsum(rets))
-        
+
         # --- PERBAIKAN: Generate Open & Close dulu, lalu paksa High & Low agar valid ---
         open_prices = path * (1 + rng.normal(0, 0.0001, n))
         close_prices = path
-        
+
         # Pastikan High selalu >= max(open, close)
         max_oc = np.maximum(open_prices, close_prices)
         high_prices = max_oc * (1 + np.abs(rng.normal(0, 0.0003, n)))
-        
+
         # Pastikan Low selalu <= min(open, close)
         min_oc = np.minimum(open_prices, close_prices)
         low_prices = min_oc * (1 - np.abs(rng.normal(0, 0.0003, n)))
-        
+
         df = pd.DataFrame({
             "timestamp": ts,
             "open": open_prices,
