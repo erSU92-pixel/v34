@@ -49,7 +49,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      # --- Pre-flight: pastikan file wajib ada sebelum setup-python ---
       - name: Pre-flight file check
         run: |
           MISSING=0
@@ -63,7 +62,6 @@ jobs:
           fi
           if [ "$MISSING" -eq 1 ]; then
             echo "::error::Push file yang hilang ke root repo, lalu re-run workflow."
-            echo "Repo contents:"
             ls -la
             exit 1
           fi
@@ -73,7 +71,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          # '**/requirements.txt' tidak hard-fail saat file belum ada
           cache: 'pip'
           cache-dependency-path: '**/requirements.txt'
 
@@ -85,21 +82,17 @@ jobs:
       - name: Static syntax check
         run: python -m py_compile xauusd_apex_v36.py
 
-      # --- Governance gate ---
       - name: Governance gate — block live mode
         if: github.event.inputs.execution_mode == 'live'
         run: |
           echo "::error::Live execution mode is NOT yet wired to a broker adapter."
-          echo "::error::Deployment Checklist G4 (broker API + client_order_id) belum selesai."
           exit 1
 
       - name: Governance gate — shadow mode warning
         if: github.event.inputs.execution_mode == 'shadow'
         run: |
           echo "::warning::Shadow mode — no capital at risk."
-          echo "::warning::Pastikan audit_status = PENDING_EXTERNAL_AUDIT."
 
-      # --- Data preparation ---
       - name: Prepare market data
         env:
           DATA_URL: ${{ secrets.DATA_URL }}
@@ -108,7 +101,6 @@ jobs:
           ALLOW_SYNTHETIC: ${{ github.event.inputs.allow_synthetic || 'false' }}
         run: |
           mkdir -p data
-
           if [ -n "${DATA_URL:-}" ]; then
             echo "::group::Fetching market data"
             HEADER_ARGS=()
@@ -117,27 +109,20 @@ jobs:
             fi
             curl -fsSL --retry 3 --retry-delay 5 --max-time 180 \
               "${HEADER_ARGS[@]}" \
-              -o data/xauusd_m5.csv "$DATA_URL" || {
-                echo "::warning::Data fetch failed."
-              }
+              -o data/xauusd_m5.csv "$DATA_URL" || echo "::warning::Data fetch failed."
             echo "::endgroup::"
           fi
 
           if [ -f data/xauusd_m5.csv ]; then
             ROWS=$(wc -l < data/xauusd_m5.csv)
             echo "Data ready: ${ROWS} lines"
-            if [ "$ROWS" -lt 1500 ]; then
-              echo "::warning::Data has only ${ROWS} rows (< MIN_DATA_BARS=1500)."
-            fi
           elif [ "${ALLOW_SYNTHETIC}" = "true" ]; then
             echo "::warning::No data file. Synthetic mode explicitly enabled."
           else
             echo "::error::No market data and allow_synthetic=false."
-            echo "::error::Set DATA_URL secret OR use workflow_dispatch with allow_synthetic=true."
             exit 1
           fi
 
-      # --- Execute ---
       - name: Execute engine
         id: engine
         env:
@@ -155,7 +140,6 @@ jobs:
             python xauusd_apex_v36.py --data data/xauusd_m5.csv
           fi
 
-      # --- Artifacts ---
       - name: Upload execution report
         if: always()
         uses: actions/upload-artifact@v4
@@ -164,53 +148,3 @@ jobs:
           path: V36_QUANT_EXECUTION_REPORT.json
           retention-days: 90
           if-no-files-found: warn
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-${{ github.run_id }}
-          path: |
-            *.log
-            data/*.csv
-          retention-days: 7
-          if-no-files-found: ignore
-
-      # --- Failure notify ---
-      - name: Notify failure via Telegram
-        if: failure()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "Telegram not configured, skipping."
-            exit 0
-          fi
-          MSG="XAUUSD V36 FAILED%0ARepo: ${{ github.repository }}%0ARun: ${RUN_URL}"
-          curl -fsSL --max-time 15 -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"${MSG}\"}" \
-            || echo "Telegram notify failed (non-fatal)."
-
-      # --- Summary ---
-      - name: Run summary
-        if: always()
-        run: |
-          {
-            echo "## XAUUSD V36 Execution Summary"
-            echo ""
-            echo "- **Run ID**: ${{ github.run_id }}"
-            echo "- **Mode**: ${{ github.event.inputs.execution_mode || 'research (scheduled)' }}"
-            echo "- **Synthetic**: ${{ github.event.inputs.allow_synthetic || 'false' }}"
-            echo "- **Status**: ${{ job.status }}"
-            if [ -f V36_QUANT_EXECUTION_REPORT.json ]; then
-              echo ""
-              echo "### Report excerpt"
-              echo '```json'
-              python -c "import json; d=json.load(open('V36_QUANT_EXECUTION_REPORT.json')); print(json.dumps({k:d[k] for k in ('performance','deflated_sharpe_probability','monte_carlo','kill_switch_tripped','n_trades') if k in d}, indent=2))"
-              echo '```'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
