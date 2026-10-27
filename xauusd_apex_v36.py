@@ -65,8 +65,8 @@ logger = logging.getLogger("V36_QUANT_ENGINE")
 
 class GlobalConfig:
     SYMBOL = "XAUUSD"
-    TIMEFRAME = "M5"
-    BARS_PER_DAY = 288
+    TIMEFRAME = "H1"
+    BARS_PER_DAY = 24
     TRADING_DAYS_PER_YEAR = 252
     BARS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
     INITIAL_CAPITAL = 100_000.0
