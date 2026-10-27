@@ -37,6 +37,7 @@ jobs:
           pip install yfinance
 
       - name: Download Real Data
+              - name: Download Real Data
         run: |
           python -c "
           import yfinance as yf
@@ -46,17 +47,26 @@ jobs:
           data = yf.download('GC=F', period='60d', interval='5m')
           if data.empty: raise ValueError('Data kosong')
           if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
-          data.rename(columns=lambda x: x.lower(), inplace=True)
-          data = data[['open', 'high', 'low', 'close', 'volume']]
+          
+          # Paksa semua nama kolom jadi huruf kecil
+          data.columns = [str(c).lower() for c in data.columns]
           data = data.reset_index()
-          data.rename(columns={'datetime': 'timestamp', 'date': 'timestamp'}, inplace=True)
+          data.columns = [str(c).lower() for c in data.columns]
+          
+          # Deteksi otomatis nama kolom waktu (Datetime, Date, atau Index)
+          if 'datetime' in data.columns: data = data.rename(columns={'datetime': 'timestamp'})
+          elif 'date' in data.columns: data = data.rename(columns={'date': 'timestamp'})
+          elif 'index' in data.columns: data = data.rename(columns={'index': 'timestamp'})
+          
+          # Ambil kolom yang dibutuhkan
+          data = data[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
           data['timestamp'] = pd.to_datetime(data['timestamp'])
           if data['timestamp'].dt.tz is None:
               data['timestamp'] = data['timestamp'].dt.tz_localize('UTC')
           else:
               data['timestamp'] = data['timestamp'].dt.tz_convert('UTC')
+              
           os.makedirs('data', exist_ok=True)
-          data = data[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
           data.to_csv('data/xauusd_m5.csv', index=False)
           print(f'BERHASIL: {len(data)} baris diunduh')
           "
