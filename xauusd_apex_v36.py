@@ -3,29 +3,24 @@
 XAUUSD APEX V36.0 — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE
 Global Head of Quantitative Risk & Trading Systems Certified Architecture
 ================================================================================
-Fixes vs V35.8 (audit ref: Forensic Report, 34 findings):
-  [F1]  Purged Walk-Forward CV replaces anti-causal K-Fold
-  [F2]  Barrier-consistent trade simulation replaces 1-bar return proxy
-  [F3]  Triple Barrier uses high/low (wick-aware, pessimistic tie-break)
-  [F4]  Per-trade cost application (not smeared across all bars)
-  [F5]  Consistent annualization: BARS_PER_YEAR = 288 * 252
-  [F6]  DSR unit-corrected: per-trade SR, T = n_trades, correct E[max SR]
-  [F7]  Correct Shannon entropy (NaN-safe) & robust Hurst (clipped, -inf-safe)
-  [F8]  Confidence-based position sizing via predict_proba
-  [F9]  Kill switch: max DD, daily loss, consecutive losses
-  [F10] Fail-closed data loading (no silent synthetic fallback in production)
-  [F11] Fault-tolerant Gist / Telegram wrappers: timeout, retry, 429/5xx, ETag
-  [F12] Idempotent order placement (SHA-256 idempotency key + state log)
-  [F13] class_weight='balanced'; balanced_accuracy metric
-  [F14] Explicit raises instead of assert (safe under python -O)
+Fixes vs V35.8:
+  [F1]  Purged Walk-Forward CV (Zero Look-Ahead Bias)
+  [F2]  Barrier-consistent trade simulation
+  [F3]  Triple Barrier wick-aware (high/low) & pessimistic tie-break
+  [F4]  Per-trade cost application (No Sharpe inflation)
+  [F5]  Consistent annualization (288 * 252)
+  [F6]  DSR unit-corrected (Bailey & López de Prado)
+  [F7]  NaN-safe & -inf-safe Shannon Entropy & Hurst
+  [F8]  Confidence-based sizing via predict_proba
+  [F9]  Kill switch: Max DD, Daily Loss, Consecutive Losses
+  [F10] Fail-closed data loading + mathematically correct synthetic OHLC
+  [F11] Fault-tolerant Gist/Telegram (timeout, retry, 429/5xx, ETag)
+  [F12] Idempotent order placement (SHA-256)
+  [F13] class_weight='balanced' for imbalanced labels
+  [F14] Explicit raises instead of assert
   [F15] OHLC integrity validation
-  [F16] Monte Carlo block bootstrap (preserves autocorrelation)
-  [F17] audit_status = PENDING_EXTERNAL_AUDIT (no self-certification)
-
-Requirements: numpy, pandas, scikit-learn, scipy, requests
-Usage:
-    python xauusd_apex_v36.py --data xauusd_m5.csv
-    python xauusd_apex_v36.py --data xauusd_m5.csv --allow-synthetic   # TESTING ONLY
+  [F16] Monte Carlo block bootstrap
+  [F17] audit_status = PENDING_EXTERNAL_AUDIT
 ================================================================================
 """
 
@@ -138,7 +133,7 @@ governance = ExperimentGovernance()
 
 
 # ==============================================================================
-# 2. DATA LAYER — FAIL CLOSED
+# 2. DATA LAYER
 # ==============================================================================
 class DataLayer:
     @staticmethod
@@ -165,8 +160,7 @@ class DataLayer:
 
         if not allow_synthetic:
             raise FileNotFoundError(
-                f"Data file '{filepath}' not found. Set allow_synthetic=True "
-                f"only for research/testing. Production must fail closed."
+                f"Data file '{filepath}' not found. Set allow_synthetic=True only for research."
             )
 
         logger.warning("[DATA] Generating synthetic XAUUSD feed (TESTING ONLY).")
@@ -175,19 +169,16 @@ class DataLayer:
         ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
         rets = rng.normal(0.00001, 0.0012, n)
         path = 2650.0 * np.exp(np.cumsum(rets))
-
-        # --- PERBAIKAN: Generate Open & Close dulu, lalu paksa High & Low agar valid ---
+        
         open_prices = path * (1 + rng.normal(0, 0.0001, n))
         close_prices = path
-
-        # Pastikan High selalu >= max(open, close)
+        
         max_oc = np.maximum(open_prices, close_prices)
         high_prices = max_oc * (1 + np.abs(rng.normal(0, 0.0003, n)))
-
-        # Pastikan Low selalu <= min(open, close)
+        
         min_oc = np.minimum(open_prices, close_prices)
         low_prices = min_oc * (1 - np.abs(rng.normal(0, 0.0003, n)))
-
+        
         df = pd.DataFrame({
             "timestamp": ts,
             "open": open_prices,
@@ -224,7 +215,7 @@ class DataLayer:
 
 
 # ==============================================================================
-# 3. FEATURE ENGINEERING — CORRECTED ENTROPY & HURST
+# 3. FEATURE ENGINEERING
 # ==============================================================================
 class FeatureEngineering:
     @staticmethod
@@ -290,13 +281,13 @@ class FeatureEngineering:
         roll_std = close.rolling(20).std() + 1e-12
         df['zscore'] = (close - roll_mean) / roll_std
 
-        logger.info("[FEATURES] Computing rolling entropy & Hurst (bottleneck).")
+        logger.info("[FEATURES] Computing rolling entropy & Hurst.")
         rets = close.pct_change()
         df['entropy'] = rets.rolling(100).apply(
-            lambda w: cls.compute_shannon_entropy(w.values), raw=True
+            lambda w: cls.compute_shannon_entropy(w), raw=True
         )
         df['hurst'] = close.rolling(100).apply(
-            lambda w: cls.compute_hurst(w.values), raw=True
+            lambda w: cls.compute_hurst(w), raw=True
         )
 
         governance.log("FEATURE_ENGINEERING", {"features": len(df.columns)})
@@ -304,7 +295,7 @@ class FeatureEngineering:
 
 
 # ==============================================================================
-# 4. LABELING LAYER — WICK-AWARE, PESSIMISTIC TIE-BREAK
+# 4. LABELING LAYER
 # ==============================================================================
 class LabelingLayer:
     @staticmethod
@@ -354,7 +345,7 @@ class LabelingLayer:
 
 
 # ==============================================================================
-# 5. PURGED WALK-FORWARD CV (EXPANDING WINDOW)
+# 5. PURGED WALK-FORWARD CV
 # ==============================================================================
 class PurgedWalkForwardCV:
     def __init__(self, n_splits=CVConfig.N_SPLITS,
@@ -409,7 +400,7 @@ class ModelLayer:
 
 
 # ==============================================================================
-# 7. TRADE SIMULATION — BARRIER-CONSISTENT PnL
+# 7. TRADE SIMULATION
 # ==============================================================================
 class TradeSimulator:
     @staticmethod
@@ -463,7 +454,7 @@ class TradeSimulator:
 
 
 # ==============================================================================
-# 8. RISK ENGINE — KILL SWITCH
+# 8. RISK ENGINE
 # ==============================================================================
 class RiskEngine:
     def __init__(self, cfg: RiskConfig = RiskConfig()):
@@ -488,7 +479,7 @@ class RiskEngine:
 
 
 # ==============================================================================
-# 9. PERFORMANCE METRICS — TRADE-LEVEL, UNIT-CORRECT
+# 9. PERFORMANCE METRICS
 # ==============================================================================
 class PerformanceEngine:
     @staticmethod
@@ -535,7 +526,6 @@ class PerformanceEngine:
         sr_per_period: float, n_trials: int, T: int,
         skew: float = 0.0, kurt: float = 3.0,
     ) -> float:
-        """Bailey & López de Prado (2014). sr_per_period is PER-TRADE, T = n_trades."""
         if T < 2 or n_trials < 2:
             return 0.0
         logN = np.log(n_trials)
@@ -584,7 +574,7 @@ class PerformanceEngine:
 
 
 # ==============================================================================
-# 10. API CLIENTS — FAULT-TOLERANT
+# 10. API CLIENTS
 # ==============================================================================
 class GistStateManager:
     API = "https://api.github.com/gists/{gid}"
@@ -673,8 +663,6 @@ class TelegramClient:
 
 
 class OrderGuard:
-    """Idempotent order dispatcher. Prevents duplicate submission on retry."""
-
     def __init__(self, gist: GistStateManager):
         self.gist = gist
 
@@ -708,8 +696,7 @@ class Pipeline:
         raw = DataLayer.load_or_raise(data_path, allow_synthetic=allow_synthetic)
         if len(raw) < GlobalConfig.MIN_DATA_BARS:
             logger.warning(
-                f"[PIPELINE] Only {len(raw)} bars — metrics below are NON-INFERENTIAL. "
-                f"Require >= {GlobalConfig.MIN_DATA_BARS}."
+                f"[PIPELINE] Only {len(raw)} bars — metrics below are NON-INFERENTIAL."
             )
 
         df = FeatureEngineering.transform(raw)
