@@ -3,25 +3,6 @@
 XAUUSD APEX V36.0 — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE
 Global Head of Quantitative Risk & Trading Systems Certified Architecture
 ================================================================================
-Fixes vs V35.8:
-  [F1]  Purged Walk-Forward CV (Zero Look-Ahead Bias)
-  [F2]  Barrier-consistent trade simulation
-  [F3]  Triple Barrier wick-aware (high/low) & pessimistic tie-break
-  [F4]  Per-trade cost application (No Sharpe inflation)
-  [F5]  Consistent annualization (288 * 252)
-  [F6]  DSR unit-corrected (Bailey & López de Prado)
-  [F7]  NaN-safe & -inf-safe Shannon Entropy & Hurst
-  [F8]  Confidence-based sizing via predict_proba
-  [F9]  Kill switch: Max DD, Daily Loss, Consecutive Losses
-  [F10] Fail-closed data loading + mathematically correct synthetic OHLC
-  [F11] Fault-tolerant Gist/Telegram (timeout, retry, 429/5xx, ETag)
-  [F12] Idempotent order placement (SHA-256)
-  [F13] class_weight='balanced' for imbalanced labels
-  [F14] Explicit raises instead of assert
-  [F15] OHLC integrity validation
-  [F16] Monte Carlo block bootstrap
-  [F17] audit_status = PENDING_EXTERNAL_AUDIT
-================================================================================
 """
 
 import os
@@ -774,7 +755,8 @@ class Pipeline:
             direction, size = TradeSimulator.confidence_to_size(proba)
             if direction == 0 or size <= 0:
                 continue
-                          # --- FILTER TREN MAKRO (EMA 200) ---
+
+            # --- FILTER TREN MAKRO (EMA 200) ---
             current_price = df['close'].iat[i]
             ema_200 = df['ema_200'].iat[i]
             
