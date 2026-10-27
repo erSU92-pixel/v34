@@ -1,7 +1,7 @@
 """
 ================================================================================
-XAUUSD APEX V36.3 FINAL — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE (H1)
-Certified Architecture by Global Head of Quantitative Risk
+XAUUSD APEX V36.4 — INSTITUTIONAL QUANT RISK & EXECUTION ENGINE (LIVE SIGNAL)
+Global Head of Quantitative Risk & Trading Systems Certified Architecture
 ================================================================================
 """
 
@@ -68,7 +68,7 @@ class RiskConfig:
     MAX_DRAWDOWN_KILL = 0.10
     MAX_DAILY_LOSS_KILL = 0.03
     MAX_CONSECUTIVE_LOSSES = 10
-    MIN_CONFIDENCE = 0.60      # Sweet spot untuk H1
+    MIN_CONFIDENCE = 0.60      # Sweet spot untuk H1 (Yakin 60%+)
     MAX_POSITION_FRAC = 1.0
 
 class CVConfig:
@@ -82,7 +82,7 @@ class CVConfig:
 class ExperimentGovernance:
     def __init__(self):
         self.metadata = {
-            "version": "36.3.0-PROD",
+            "version": "36.4.0-PROD",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": "Global Head of Quantitative Risk & Trading Systems",
             "audit_status": "PENDING_EXTERNAL_AUDIT",
@@ -350,7 +350,35 @@ class PerformanceEngine:
         return {"MC_P5": float(np.percentile(terminals, 5)), "MC_Median": float(np.median(terminals)), "MC_P95": float(np.percentile(terminals, 95)), "P_Ruin_50": float(np.mean(terminals < 0.5 * GlobalConfig.INITIAL_CAPITAL))}
 
 # ==============================================================================
-# 9. PIPELINE ORCHESTRATOR
+# 9. API CLIENTS
+# ==============================================================================
+class TelegramClient:
+    def __init__(self, token: str, chat_id: str, timeout: int = 10, max_retries: int = 4):
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.chat_id, self.timeout, self.max_retries = chat_id, timeout, max_retries
+
+    def send(self, text: str) -> Dict[str, Any]:
+        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+        for attempt in range(self.max_retries):
+            try:
+                r = requests.post(self.url, json=payload, timeout=self.timeout)
+                if r.status_code == 200 and r.json().get("ok"):
+                    return r.json()
+                if r.status_code == 429:
+                    wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+                    time.sleep(wait + 1)
+                    continue
+                if 500 <= r.status_code < 600:
+                    time.sleep(min(2 ** attempt, 30))
+                    continue
+                r.raise_for_status()
+            except requests.RequestException as e:
+                logger.warning(f"[TELEGRAM] {attempt + 1} failed: {e}")
+                time.sleep(min(2 ** attempt, 30))
+        raise RuntimeError("Telegram send failed after retries")
+
+# ==============================================================================
+# 10. PIPELINE ORCHESTRATOR
 # ==============================================================================
 class Pipeline:
     @staticmethod
@@ -444,10 +472,50 @@ class Pipeline:
         logger.info(f"Trades: {len(trades)} | Net CAGR: {metrics['CAGR'] * 100:.2f}% | Max DD: {metrics['Max_Drawdown'] * 100:.2f}%")
         logger.info(f"Sharpe (ann): {metrics['Sharpe_Annualized']:.2f} | DSR p: {dsr:.4f} | MC P5: {mc['MC_P5']:.0f}")
         logger.info("=" * 64)
+
+        # --- LIVE SIGNAL GENERATOR (KIRIM KE TELEGRAM) ---
+        logger.info("[LIVE SIGNAL] Memprediksi candle terakhir untuk sinyal live...")
+        scaler_full = StandardScaler().fit(X)
+        X_full_scaled = scaler_full.transform(X)
+        model_full = ModelLayer.build_ensemble()
+        model_full.fit(X_full_scaled, y_mapped)
+        
+        latest_features = X[-1].reshape(1, -1)
+        latest_proba = model_full.predict_proba(scaler_full.transform(latest_features))[0]
+        
+        direction, size = TradeSimulator.confidence_to_size(latest_proba)
+        current_price = df['close'].iat[-1]
+        ema_200 = df['ema_200'].iat[-1]
+        confidence_pct = max(latest_proba) * 100
+        
+        signal_text = "⏸️ NEUTRAL (Tidak Ada Sinyal)"
+        if direction == 1 and current_price > ema_200:
+            signal_text = "🟢 BUY (LONG)"
+        elif direction == -1 and current_price < ema_200:
+            signal_text = "🔴 SELL (SHORT)"
+            
+        tg_token = os.getenv("TELEGRAM_TOKEN")
+        tg_chat = os.getenv("TELEGRAM_CHAT_ID")
+        if tg_token and tg_chat and direction != 0:
+            try:
+                msg = (
+                    f"<b>🚨 XAUUSD LIVE SIGNAL (H1)</b>\n\n"
+                    f"Sinyal: <b>{signal_text}</b>\n"
+                    f"Harga: {current_price:.2f}\n"
+                    f"Keyakinan AI: {confidence_pct:.1f}%\n"
+                    f"Waktu: {df['timestamp'].iat[-1].strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                    f"<i>Gunakan Money Management (Max 1-2% Risk).</i>"
+                )
+                TelegramClient(tg_token, tg_chat).send(msg)
+                logger.info(f"[TELEGRAM] Sinyal {signal_text} berhasil dikirim!")
+            except Exception as e:
+                logger.error(f"[TELEGRAM] Gagal mengirim sinyal: {e}")
+        # ------------------------------------------------
+        
         return report
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.3")
+    parser = argparse.ArgumentParser(description="XAUUSD APEX V36.4")
     parser.add_argument("--data", default="xauusd_m5.csv")
     parser.add_argument("--allow-synthetic", action="store_true")
     args = parser.parse_args()
