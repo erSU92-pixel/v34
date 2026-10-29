@@ -38,14 +38,20 @@ jobs:
         run: |
           python main.py
 
-      - name: Commit and Push Updated Signal State
+      - name: Commit, Pull Rebase, and Push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git pull origin main --rebase || echo "No rebase needed"
+          
+          # 1. Add dan Commit lokal terlebih dahulu
           git add signal_state.json
           git commit -m "chore: update signal state [skip ci]" || echo "No changes to commit"
+          
+          # 2. Pull rebase untuk mengambil pembaruan remote tanpa konflik
+          git pull origin main --rebase || echo "Rebase skipped"
+          
+          # 3. Push hasil akhir ke GitHub
           git push origin main
