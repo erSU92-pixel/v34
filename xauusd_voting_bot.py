@@ -1,15 +1,13 @@
 """
-XAUUSD 10-PILLAR VOTING BOT v3.2 — FINAL ATTEMPT
+XAUUSD 10-PILLAR VOTING BOT v3.3 — FINAL FIX
 ================================================================
-Fixes dari v3.1:
-  1. COOLDOWN 24 bar antar trade (fix churn: 10 trade/4 hari → 1 trade/1 hari)
-  2. SL 1.5→2.0 ATR (filter noise)
-  3. TP 2.5→4.0 ATR (R:R 1.67→2.0, breakeven 37.5%→33.3%)
-  4. MAX_HOLD 12→16 bar (biar trade mature)
-  5. THRESHOLD 3.5→4.0 (filter noise)
-  6. Daily trend filter: hanya BUY di atas SMA200 daily, SELL di bawah
-  
-Jika v3.2 masih PF < 1.0 → XAU retail voting TIDAK PUNYA EDGE. STOP.
+Fix v3.3:
+  - FIX KeyError 'trend_daily' di merge_asof (rename kolom sebelum merge)
+  - Semua fix v3.2 (cooldown, daily filter, R:R 2:1) tetap aktif
+
+9 PILAR AKTIF (Pilar 9 Sentimen tidak tersedia):
+  Voter: P1, P2, P3, P4, P6, P7, P8, P10
+  Modifier: P5 (Hurst) → adaptive weights
 ================================================================
 """
 from __future__ import annotations
@@ -43,15 +41,15 @@ TF          = os.getenv("TF", "1h")
 OUTPUT_SIZE = int(os.getenv("OUTPUT_SIZE", "5000"))
 THRESHOLD   = float(os.getenv("THRESHOLD", "4.0"))
 
-CONTRACT_SIZE   = 100
-MIN_LOT         = 0.01
-MAX_LOT         = 5.0
-SPREAD_BUFFER   = 0.30
-SLIPPAGE_BUFFER = 0.15
-ATR_SL_MULT     = 2.0     # was 1.5
-ATR_TP_MULT     = 4.0     # was 2.5 (R:R 2:1, breakeven 33.3%)
-MAX_HOLDING_BARS = 16     # was 12
-COOLDOWN_BARS    = 24     # NEW: 1 hari di 1H
+CONTRACT_SIZE    = 100
+MIN_LOT          = 0.01
+MAX_LOT          = 5.0
+SPREAD_BUFFER    = 0.30
+SLIPPAGE_BUFFER  = 0.15
+ATR_SL_MULT      = 2.0
+ATR_TP_MULT      = 4.0
+MAX_HOLDING_BARS = 16
+COOLDOWN_BARS    = 24
 
 ACCOUNT_BALANCE   = float(os.getenv("ACCOUNT_BALANCE", "10000"))
 RISK_PCT          = float(os.getenv("RISK_PCT", "0.003"))
@@ -162,7 +160,6 @@ def fetch_dxy():
 
 
 def fetch_daily_trend():
-    """Fetch daily OHLCV untuk trend filter."""
     try:
         daily = fetch_td(SYMBOL, "1d", 500)
         now = pd.Timestamp.now(tz="UTC")
@@ -273,44 +270,55 @@ def add_indicators(df, dxy, fred, daily_trend):
     hour = df["datetime_utc"].dt.hour
     df["in_session"] = ((hour >= 7) & (hour < 16)).astype(int)
 
-    # DXY
+    # --- DXY merge ---
     df["dxy_momentum_20"] = 0.0
     if dxy is not None and len(dxy) > 20:
         try:
-            df = pd.merge_asof(df.sort_values("datetime"),
-                               dxy.sort_values("datetime"),
+            df = pd.merge_asof(df.sort_values("datetime").reset_index(drop=True),
+                               dxy.sort_values("datetime").reset_index(drop=True),
                                on="datetime", direction="backward")
             df["dxy_close"] = df["dxy_close"].ffill()
             df["dxy_momentum_20"] = df["dxy_close"].pct_change(20)
         except Exception as e:
             logger.warning("DXY merge failed: %s", e)
 
-    # FRED
+    # --- FRED merge ---
     df["real_yield_change_5d"] = 0.0
     if fred is not None and len(fred) > 10:
         try:
-            df = pd.merge_asof(df.sort_values("datetime"),
-                               fred.sort_values("datetime"),
+            fred_renamed = fred.rename(columns={"real_yield": "ry_merge"})
+            df = pd.merge_asof(df.sort_values("datetime").reset_index(drop=True),
+                               fred_renamed.sort_values("datetime").reset_index(drop=True),
                                on="datetime", direction="backward")
-            df["real_yield"] = df["real_yield"].ffill()
-            df["real_yield_change_5d"] = df["real_yield"].diff(5)
+            df["ry_merge"] = df["ry_merge"].ffill()
+            df["real_yield_change_5d"] = df["ry_merge"].diff(5)
+            df = df.drop(columns=["ry_merge"], errors="ignore")
         except Exception as e:
             logger.warning("FRED merge failed: %s", e)
 
-    # Daily trend filter (NEW)
+    # --- Daily trend merge (FIX v3.3: rename dulu) ---
     df["trend_daily"] = 0
     if daily_trend is not None and len(daily_trend) > 0:
         try:
-            df = pd.merge_asof(df.sort_values("datetime"),
-                               daily_trend.sort_values("datetime"),
+            daily_renamed = daily_trend.rename(columns={"trend_daily": "td_merge"})
+            df = pd.merge_asof(df.sort_values("datetime").reset_index(drop=True),
+                               daily_renamed.sort_values("datetime").reset_index(drop=True),
                                on="datetime", direction="backward")
-            df["trend_daily"] = df["trend_daily"].fillna(0).astype(int)
+            df["trend_daily"] = df["td_merge"].fillna(0).astype(int)
+            df = df.drop(columns=["td_merge"], errors="ignore")
         except Exception as e:
             logger.warning("Daily trend merge failed: %s", e)
+            df["trend_daily"] = 0
 
+    # --- Clean alt columns ---
     for c in ["dxy_momentum_20", "real_yield_change_5d"]:
-        if c in df.columns:
+        if c not in df.columns:
+            df[c] = 0.0
+        else:
             df[c] = df[c].fillna(0.0).replace([np.inf, -np.inf], 0.0)
+
+    if "trend_daily" not in df.columns:
+        df["trend_daily"] = 0
     df["trend_daily"] = df["trend_daily"].fillna(0).astype(int)
 
     return df
@@ -577,7 +585,7 @@ def check_trade_outcome(df, trade):
 # LIVE MODE
 # =============================================================================
 def run_live():
-    logger.info("═══ LIVE MODE | %s %s | THR=%.1f | R:R=%.1f | CD=%d bars ═══",
+    logger.info("═══ LIVE MODE | %s %s | THR=%.1f | R:R=%.1f | CD=%d ═══",
                 SYMBOL, TF, THRESHOLD, ATR_TP_MULT/ATR_SL_MULT, COOLDOWN_BARS)
 
     s = load_state()
@@ -629,7 +637,6 @@ def run_live():
         else:
             logger.info("Trade active: %s @ %.2f", trade["direction_str"], trade["entry"])
     else:
-        # Cooldown check
         last_sig_bar = state.get("last_signal_bar")
         cur_bar_ts = str(df["datetime"].iloc[-1])
         if last_sig_bar:
@@ -656,11 +663,9 @@ def run_live():
 
         if dir_cur != 0 and dir_cur != dir_prev:
             row = df.iloc[-1]
-            # Daily trend filter
             trend_daily = int(row.get("trend_daily", 0))
             if trend_daily != 0 and dir_cur != trend_daily:
-                logger.info("Signal %+d rejected by daily trend filter (%+d)",
-                            dir_cur, trend_daily)
+                logger.info("Signal %+d rejected by daily trend (%+d)", dir_cur, trend_daily)
                 if NOTIFY_HOLD:
                     send_telegram(f"⏸️ Signal filtered by daily trend (dir={dir_cur}, trend={trend_daily})")
                 state["last_update"] = datetime.now(timezone.utc).isoformat()
@@ -708,7 +713,7 @@ def run_live():
 # BACKTEST MODE
 # =============================================================================
 def run_backtest():
-    logger.info("═══ BACKTEST v3.2 | %s %s | THR=%.1f | R:R=%.1f | CD=%d ═══",
+    logger.info("═══ BACKTEST v3.3 | %s %s | THR=%.1f | R:R=%.1f | CD=%d ═══",
                 SYMBOL, TF, THRESHOLD, ATR_TP_MULT/ATR_SL_MULT, COOLDOWN_BARS)
 
     try:
@@ -766,7 +771,6 @@ def run_backtest():
     last_trade_bar = -9999
 
     while i < len(df) - 1:
-        # Cooldown check
         if i - last_trade_bar < COOLDOWN_BARS:
             i += 1
             continue
@@ -784,7 +788,6 @@ def run_backtest():
             continue
 
         row = df.iloc[i]
-        # Daily trend filter
         trend_daily = int(row.get("trend_daily", 0))
         if trend_daily != 0 and direction != trend_daily:
             i += 1
@@ -856,7 +859,7 @@ def run_backtest():
     trades_str = "\n".join(f"  {t['date']} {t['dir']} {t['pnl']:+.2f}" for t in top_trades)
 
     send_telegram(
-        f"📊 <b>BACKTEST v3.2 — {BACKTEST_DAYS} hari</b>\n"
+        f"📊 <b>BACKTEST v3.3 — {BACKTEST_DAYS} hari</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Trades: {len(trades)} (TP={tp_ct} SL={sl_ct} TIME={to_ct})\n"
         f"Win rate: {wr:.1f}%\n"
@@ -871,7 +874,7 @@ def run_backtest():
 # =============================================================================
 def main():
     logger.info("═" * 60)
-    logger.info("XAUUSD VOTING BOT v3.2 | LIVE=%s | BT=%s | TF=%s",
+    logger.info("XAUUSD VOTING BOT v3.3 | LIVE=%s | BT=%s | TF=%s",
                 LIVE_MODE, BACKTEST_MODE, TF)
     logger.info("═" * 60)
 
