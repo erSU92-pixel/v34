@@ -1,4 +1,10 @@
 {
-    "last_signal": "BUY",
-    "last_candle_time": "2026-10-30 10:00:00"
+    "last_signal": "NEUTRAL",
+    "last_candle_time": "2026-10-30 10:15:00",
+    "generation": 2,
+    "pillar_weights": {
+        "momentum": 1.0,
+        "trend": 0.9635536027366374,
+        "volatility": 1.0
+    }
 }
