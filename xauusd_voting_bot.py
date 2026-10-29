@@ -1,22 +1,20 @@
 """
-XAUUSD 10-PILLAR VOTING BOT v3.0 — PRODUCTION READY
+XAUUSD 10-PILLAR VOTING BOT v3.1 — PRODUCTION READY
 ================================================================
-Voting ensemble dari 9 pilar aktif (Pilar 9 = Sentimen: tidak tersedia).
+Fixes dari v3.0 (berdasarkan log 2026-10-29 05:25):
+  1. FIX p7 (DXY)  : 0% active → pakai DXY momentum langsung, bukan corr filter
+  2. FIX p8 (SMC)  : 0% active → sweep 3-bar window, bukan 1-bar
+  3. FIX TP        : 0 TP hit → ATR_TP_MULT 4.0→2.5, SL 2.0→1.5
+  4. FIX MAX_HOLD  : 24→12 bar (realistic untuk 1H)
+  5. FIX in-progress bar: drop last bar jika masih forming (look-ahead safety)
+  6. FIX p6 macro  : threshold ±0.05→±0.02 (lebih responsif)
+  7. THRESHOLD default: 4.0→3.5 (8 voters, achievable)
+  8. Better backtest logging: per-trade detail
 
-Pilar voting (8):
-  1. Trend       : EMA 9/21/50 alignment
-  2. Momentum    : RSI 14 mean-reversion
-  3. ML Proxy    : Z-score + Stochastic combo
-  4. Volatility  : Donchian 20 breakout
-  6. Macro       : FRED real yield trend
-  7. Cross-Asset : DXY momentum + correlation
-  8. SMC         : Liquidity sweep detection
- 10. Seasonality : Session confirmation
-
-Pilar modifier (1):
-  5. Regime      : Hurst → adaptive weights
-
-Signal: BUY/SELL jika weighted sum |x| >= THRESHOLD
+9 PILAR AKTIF (Pilar 9 Sentimen tidak tersedia — butuh data berbayar):
+  Voter: P1(trend), P2(momentum), P3(ML proxy), P4(volatility),
+         P6(macro), P7(cross-asset), P8(SMC), P10(session)
+  Modifier: P5(Hurst) → adaptive weights
 ================================================================
 """
 from __future__ import annotations
@@ -48,20 +46,20 @@ GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 SYMBOL      = os.getenv("SYMBOL", "XAU/USD")
 TF          = os.getenv("TF", "1h")
 OUTPUT_SIZE = int(os.getenv("OUTPUT_SIZE", "5000"))
-THRESHOLD   = float(os.getenv("THRESHOLD", "4.0"))
+THRESHOLD   = float(os.getenv("THRESHOLD", "3.5"))
 
 CONTRACT_SIZE   = 100
 MIN_LOT         = 0.01
 MAX_LOT         = 5.0
 SPREAD_BUFFER   = 0.30
 SLIPPAGE_BUFFER = 0.15
-ATR_SL_MULT     = 2.0
-ATR_TP_MULT     = 4.0
-MAX_HOLDING_BARS = 24
+ATR_SL_MULT     = 1.5
+ATR_TP_MULT     = 2.5
+MAX_HOLDING_BARS = 12
 
-ACCOUNT_BALANCE  = float(os.getenv("ACCOUNT_BALANCE", "10000"))
-RISK_PCT         = float(os.getenv("RISK_PCT", "0.003"))
-MAX_DRAWDOWN_PCT = 0.20
+ACCOUNT_BALANCE   = float(os.getenv("ACCOUNT_BALANCE", "10000"))
+RISK_PCT          = float(os.getenv("RISK_PCT", "0.003"))
+MAX_DRAWDOWN_PCT  = 0.20
 MAX_CONSEC_LOSSES = 5
 
 LIVE_MODE     = os.getenv("LIVE_MODE", "1") == "1"
@@ -105,6 +103,10 @@ http = HTTP()
 # =============================================================================
 # DATA
 # =============================================================================
+def _interval_td():
+    return pd.Timedelta(hours=1) if TF == "1h" else pd.Timedelta(hours=4)
+
+
 def fetch_td(symbol, interval, outputsize):
     tf_map = {"1h": "1h", "4h": "4h", "1d": "1day"}
     url = "https://api.twelvedata.com/time_series"
@@ -120,6 +122,7 @@ def fetch_td(symbol, interval, outputsize):
     vals = d.get("values")
     if not vals:
         raise RuntimeError(f"TD empty [{symbol}]")
+
     df = pd.DataFrame(vals)
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.set_index("datetime").sort_index()
@@ -127,25 +130,42 @@ def fetch_td(symbol, interval, outputsize):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"])
-    now = pd.Timestamp.now(tz="UTC")
-    df = df[df.index <= now]
-    if len(df) < 10:
-        raise RuntimeError(f"TD [{symbol}] too few bars")
     return df.reset_index()
 
 
 def fetch_ohlcv():
     df = fetch_td(SYMBOL, TF, OUTPUT_SIZE)
-    logger.info("Fetched %d bars | %s → %s", len(df),
-                df["datetime"].iloc[0], df["datetime"].iloc[-1])
+
+    # FIX: drop in-progress bar (look-ahead safety)
+    now = pd.Timestamp.now(tz="UTC")
+    interval_td = _interval_td()
+    if len(df) > 0:
+        last_ts = df["datetime"].iloc[-1]
+        if last_ts + interval_td > now:
+            logger.info("Dropping in-progress bar: %s (still forming)", last_ts)
+            df = df.iloc[:-1].reset_index(drop=True)
+
+    # Reject future bars
+    df = df[df["datetime"] + interval_td <= now]
+    if len(df) < 250:
+        raise RuntimeError(f"Insufficient bars: {len(df)}")
+
+    logger.info("Fetched %d closed bars | %s → %s",
+                len(df), df["datetime"].iloc[0], df["datetime"].iloc[-1])
     return df
 
 
 def fetch_dxy():
     try:
         dxy = fetch_td("UUP", TF, OUTPUT_SIZE)
+        now = pd.Timestamp.now(tz="UTC")
+        interval_td = _interval_td()
+        if len(dxy) > 0:
+            last_ts = dxy["datetime"].iloc[-1]
+            if last_ts + interval_td > now:
+                dxy = dxy.iloc[:-1].reset_index(drop=True)
         out = dxy[["datetime", "close"]].rename(columns={"close": "dxy_close"})
-        logger.info("DXY proxy [UUP]: %d bars", len(out))
+        logger.info("DXY proxy [UUP]: %d closed bars", len(out))
         return out
     except Exception as e:
         logger.warning("DXY fetch failed: %s — proceeding without", e)
@@ -214,28 +234,23 @@ def _rolling_hurst(series):
 def add_indicators(df, dxy, fred):
     df = df.copy()
 
-    # EMAs
     for span in (9, 21, 50, 200):
         df[f"ema_{span}"] = df["close"].ewm(span=span, adjust=False).mean()
 
-    # Z-score
     roll_std = df["close"].rolling(20).std().replace(0, np.nan)
     df["zscore_20"] = (df["close"] - df["close"].rolling(20).mean()) / roll_std
 
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi_14"] = 100 - (100 / (1 + rs))
 
-    # Stochastic
     low_5 = df["low"].rolling(5).min()
     high_5 = df["high"].rolling(5).max()
     rng = (high_5 - low_5).replace(0, np.nan)
     df["stoch_k"] = 100 * (df["close"] - low_5) / rng
 
-    # ATR
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
@@ -243,22 +258,20 @@ def add_indicators(df, dxy, fred):
     ], axis=1).max(axis=1)
     df["atr_14"] = tr.rolling(14).mean().replace(0, np.nan).ffill()
 
-    # Donchian
     df["don_high"] = df["high"].rolling(20).max().shift(1)
     df["don_low"] = df["low"].rolling(20).min().shift(1)
 
-    # Hurst
     df["hurst_100"] = df["close"].rolling(100).apply(_rolling_hurst, raw=True)
 
-    # Session (UTC 7-16 = London/NY overlap)
     df["datetime_utc"] = pd.to_datetime(df["datetime"], utc=True)
     hour = df["datetime_utc"].dt.hour
     df["in_session"] = ((hour >= 7) & (hour < 16)).astype(int)
 
     # DXY merge
     df["dxy_momentum_20"] = 0.0
-    df["dxy_corr_20"] = 0.0
-    if dxy is not None and len(dxy) > 20:
+    df["dxy_momentum_25"] = 0.0
+    df["dxy_corr_50"] = 0.0
+    if dxy is not None and len(dxy) > 50:
         try:
             df = pd.merge_asof(df.sort_values("datetime"),
                                dxy.sort_values("datetime"),
@@ -266,8 +279,9 @@ def add_indicators(df, dxy, fred):
             df["dxy_close"] = df["dxy_close"].ffill()
             dxy_ret = df["dxy_close"].pct_change()
             xau_ret = df["close"].pct_change()
-            df["dxy_corr_20"] = xau_ret.rolling(20).corr(dxy_ret)
             df["dxy_momentum_20"] = df["dxy_close"].pct_change(20)
+            df["dxy_momentum_25"] = df["dxy_close"].pct_change(25)
+            df["dxy_corr_50"] = xau_ret.rolling(50).corr(dxy_ret)
         except Exception as e:
             logger.warning("DXY merge failed: %s", e)
 
@@ -283,8 +297,7 @@ def add_indicators(df, dxy, fred):
         except Exception as e:
             logger.warning("FRED merge failed: %s", e)
 
-    # Fill NaN in alt cols
-    for c in ["dxy_momentum_20", "dxy_corr_20", "real_yield_change_5d"]:
+    for c in ["dxy_momentum_20", "dxy_momentum_25", "dxy_corr_50", "real_yield_change_5d"]:
         if c in df.columns:
             df[c] = df[c].fillna(0.0).replace([np.inf, -np.inf], 0.0)
 
@@ -345,56 +358,61 @@ def p4_volatility(row) -> int:
 
 
 def p6_macro(row) -> int:
-    """Real yield trend: naik → bearish XAU, turun → bullish XAU."""
+    """FIX: threshold lebih sensitif (0.05→0.02) untuk daily-update data."""
     try:
         chg = row["real_yield_change_5d"]
-        if pd.isna(chg): return 0
-        if chg > 0.05: return -1  # rising real yield = bearish gold
-        if chg < -0.05: return 1  # falling real yield = bullish gold
+        if pd.isna(chg) or abs(chg) < 1e-6: return 0
+        if chg > 0.02: return -1   # rising real yield = bearish gold
+        if chg < -0.02: return 1    # falling real yield = bullish gold
     except Exception:
         return 0
     return 0
 
 
 def p7_cross_asset(row) -> int:
-    """DXY: momentum up + strong negative corr → bearish XAU."""
+    """
+    FIX: pakai DXY momentum langsung, BUKAN correlation filter.
+    Korelasi XAU-DXY biasanya negatif (established relationship).
+    DXY up → XAU down (weight of dollar).
+    """
     try:
         mom = row["dxy_momentum_20"]
-        corr = row["dxy_corr_20"]
-        if pd.isna(mom) or pd.isna(corr): return 0
-        if corr > -0.2: return 0  # correlation too weak to trust
-        if mom > 0.01: return -1  # DXY up = XAU down
-        if mom < -0.01: return 1   # DXY down = XAU up
+        if pd.isna(mom): return 0
+        if mom > 0.005: return -1   # DXY +0.5% in 20 bars → bearish XAU
+        if mom < -0.005: return 1    # DXY -0.5% → bullish XAU
     except Exception:
         return 0
     return 0
 
 
 def p8_smc(df: pd.DataFrame, i: int) -> int:
-    """Liquidity sweep: bar sebelumnya swept swing level, harga reject."""
+    """
+    FIX: Sweep detection pada 3-bar window (bukan 1-bar).
+    Sweep = harga tembus swing level tapi close balik → rejection.
+    """
     try:
         if i < 25: return 0
         window = df.iloc[max(0, i - 20):i]
         if len(window) < 20: return 0
-        recent_high = float(window["high"].max())
-        recent_low = float(window["low"].min())
+        swing_high = float(window["high"].max())
+        swing_low = float(window["low"].min())
 
-        prev = df.iloc[i - 1]
-        curr = df.iloc[i]
-
-        # Bearish sweep: prev broke above high, current closed below
-        if float(prev["high"]) > recent_high and float(curr["close"]) < recent_high:
-            return -1
-        # Bullish sweep: prev broke below low, current closed above
-        if float(prev["low"]) < recent_low and float(curr["close"]) > recent_low:
-            return 1
+        # FIX: cek 3 bar terakhir untuk sweep
+        for j in range(max(0, i - 2), i + 1):
+            bar = df.iloc[j]
+            h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
+            # Bearish sweep: wick tembus high, close balik di bawah
+            if h > swing_high and c < swing_high:
+                return -1
+            # Bullish sweep: wick tembus low, close balik di atas
+            if l < swing_low and c > swing_low:
+                return 1
     except Exception:
         return 0
     return 0
 
 
 def p10_session(row) -> int:
-    """In-session trend confirmation."""
     try:
         if not row.get("in_session", 0): return 0
         e9, e21 = row["ema_9"], row["ema_21"]
@@ -407,17 +425,16 @@ def p10_session(row) -> int:
 
 
 def get_regime_weights(row) -> Dict[str, float]:
-    """Pilar 5: adjust weights based on Hurst regime."""
     try:
         hurst = row.get("hurst_100", 0.5)
         if pd.isna(hurst): hurst = 0.5
     except Exception:
         hurst = 0.5
 
-    if hurst > 0.55:  # trending — momentum + trend matter more
+    if hurst > 0.55:  # trending
         return {"p1": 2.0, "p2": 1.0, "p3": 1.0, "p4": 1.5,
                 "p6": 1.0, "p7": 1.0, "p8": 1.5, "p10": 1.0}
-    elif hurst < 0.45:  # mean-reverting — RSI + SMC matter more
+    elif hurst < 0.45:  # mean-reverting
         return {"p1": 0.5, "p2": 2.0, "p3": 1.5, "p4": 0.5,
                 "p6": 1.0, "p7": 1.0, "p8": 1.5, "p10": 0.5}
     else:  # neutral
@@ -426,9 +443,7 @@ def get_regime_weights(row) -> Dict[str, float]:
 
 
 def compute_votes(df: pd.DataFrame, i: int) -> Tuple[Dict[str, int], float, Dict[str, float]]:
-    """Compute all pillar votes at bar i."""
     row = df.iloc[i]
-
     votes = {
         "p1": p1_trend(row),
         "p2": p2_momentum(row),
@@ -494,7 +509,7 @@ def send_telegram(msg: str) -> bool:
     return False
 
 # =============================================================================
-# STATE (Gist)
+# STATE
 # =============================================================================
 def load_state():
     url = f"https://api.github.com/gists/{GIST_ID}"
@@ -594,7 +609,6 @@ def run_live():
         send_telegram("🚨 <b>CIRCUIT BREAKER</b>\nBot halted.")
         return
 
-    # Fetch data
     try:
         df = fetch_ohlcv()
         dxy = fetch_dxy()
@@ -609,7 +623,6 @@ def run_live():
         logger.error("Insufficient data: %d", len(df))
         return
 
-    # Monitor existing trade
     trade = state.get("active_trade")
     if trade:
         outcome = check_trade_outcome(df, trade)
@@ -632,7 +645,6 @@ def run_live():
             state["active_trade"] = None
         else:
             logger.info("Trade active: %s @ %.2f", trade["direction_str"], trade["entry"])
-    # New signal check
     else:
         votes_cur, weighted_cur, _ = compute_votes(df, len(df) - 1)
         votes_prev, weighted_prev, _ = compute_votes(df, len(df) - 2)
@@ -642,7 +654,6 @@ def run_live():
 
         logger.info("Bar close | weighted=%.2f | votes=%s", weighted_cur, votes_cur)
 
-        # Idempotent: signal must differ from prev bar
         if dir_cur != 0 and dir_cur != dir_prev:
             row = df.iloc[-1]
             atr = float(row["atr_14"]) if not pd.isna(row["atr_14"]) else 10.0
@@ -661,7 +672,6 @@ def run_live():
                 }
                 emoji = "🟢" if dir_cur == 1 else "🔴"
                 rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-                # Which pillars voted
                 active_votes = [f"P{k[1:]}" for k, v in votes_cur.items() if v == dir_cur]
                 send_telegram(
                     f"{emoji} <b>{direction_str} {SYMBOL}</b> [{TF}]\n"
@@ -692,7 +702,7 @@ def run_live():
 # BACKTEST MODE
 # =============================================================================
 def run_backtest():
-    logger.info("═══ BACKTEST MODE | %s %s | THRESHOLD=%.1f | %d days ═══",
+    logger.info("═══ BACKTEST MODE | %s %s | THR=%.1f | %d days ═══",
                 SYMBOL, TF, THRESHOLD, BACKTEST_DAYS)
 
     try:
@@ -714,7 +724,7 @@ def run_backtest():
         logger.error("Insufficient bars after cutoff: %d", len(df))
         return
 
-    # Pre-compute all votes
+    # Pre-compute votes
     logger.info("Computing votes for all bars...")
     all_votes = []
     all_weighted = []
@@ -723,7 +733,7 @@ def run_backtest():
         all_votes.append(v)
         all_weighted.append(w)
 
-    # Count pillar activity
+    # Pillar activity
     pillar_counts = {k: {"BUY": 0, "SELL": 0, "NEUTRAL": 0}
                      for k in ["p1", "p2", "p3", "p4", "p6", "p7", "p8", "p10"]}
     for v in all_votes:
@@ -740,7 +750,14 @@ def run_backtest():
                     k, c["BUY"], c["SELL"], c["NEUTRAL"],
                     100 * (c["BUY"] + c["SELL"]) / max(total, 1))
 
-    # Simulate trades
+    # Count signal distribution
+    n_buy = sum(1 for w in all_weighted if w >= THRESHOLD)
+    n_sell = sum(1 for w in all_weighted if w <= -THRESHOLD)
+    logger.info("")
+    logger.info("Signal bars: BUY=%d SELL=%d HOLD=%d (of %d)",
+                n_buy, n_sell, len(all_weighted) - n_buy - n_sell, len(all_weighted))
+
+    # Simulate
     logger.info("")
     logger.info("Simulating trades...")
     trades = []
@@ -753,7 +770,6 @@ def run_backtest():
             i += 1
             continue
 
-        # Fresh signal check
         prev_weighted = all_weighted[i - 1]
         prev_dir = 1 if prev_weighted >= THRESHOLD else (-1 if prev_weighted <= -THRESHOLD else 0)
         if direction == prev_dir:
@@ -769,7 +785,6 @@ def run_backtest():
             i += 1
             continue
 
-        # Simulate forward
         exit_price = None
         exit_reason = None
         j = i + 1
@@ -795,7 +810,11 @@ def run_backtest():
             "entry": entry, "exit": exit_price,
             "reason": exit_reason, "pnl": pnl, "lot": lot,
             "weighted": weighted,
+            "votes": dict(all_votes[i]),
         })
+        logger.info("  %s %s entry=%.2f exit=%.2f %s pnl=$%+.2f w=%.1f",
+                    row["datetime"].date(), "BUY " if direction == 1 else "SELL",
+                    entry, exit_price, exit_reason, pnl, weighted)
         i = j + 1
 
     if not trades:
@@ -807,7 +826,7 @@ def run_backtest():
     losses = [t for t in trades if t["pnl"] < 0]
     gw = sum(t["pnl"] for t in wins)
     gl = abs(sum(t["pnl"] for t in losses))
-    pf = gw / gl if gl > 0 else float('inf')
+    pf = gw / gl if gl > 0 else float('inf') if gw > 0 else 0.0
     wr = 100 * len(wins) / len(trades)
     tp_ct = sum(1 for t in trades if t["reason"] == "TP")
     sl_ct = sum(1 for t in trades if t["reason"] == "SL")
@@ -823,7 +842,6 @@ def run_backtest():
                 total_pnl, ACCOUNT_BALANCE, balance)
     logger.info("Profit Factor: %.2f", pf)
 
-    # Send top 5 trades to Telegram
     top_trades = sorted(trades, key=lambda t: abs(t["pnl"]), reverse=True)[:5]
     trades_str = "\n".join(
         f"  {t['date']} {t['dir']} {t['pnl']:+.2f}"
@@ -831,7 +849,7 @@ def run_backtest():
     )
 
     send_telegram(
-        f"📊 <b>BACKTEST v3.0 — {BACKTEST_DAYS} hari</b>\n"
+        f"📊 <b>BACKTEST v3.1 — {BACKTEST_DAYS} hari</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Trades: {len(trades)} (TP={tp_ct} SL={sl_ct} TIME={to_ct})\n"
         f"Win rate: {wr:.1f}%\n"
@@ -846,7 +864,7 @@ def run_backtest():
 # =============================================================================
 def main():
     logger.info("═" * 60)
-    logger.info("XAUUSD VOTING BOT v3.0 | LIVE=%s | BT=%s | TF=%s",
+    logger.info("XAUUSD VOTING BOT v3.1 | LIVE=%s | BT=%s | TF=%s",
                 LIVE_MODE, BACKTEST_MODE, TF)
     logger.info("═" * 60)
 
