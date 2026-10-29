@@ -1,7 +1,7 @@
 """
-XAUUSD QUANT BOT v9.1 — ALL 4 PATHS, ALL FIXES
-v9.1 fixes: 1day interval, UUP proxy DXY, FRED via requests,
-            NaN-safe int casting, auto-fill alt features
+XAUUSD QUANT BOT v9.2 — ALL 4 PATHS + ALL FIXES
+v9.2: volume auto-detect, FRED merge_asof, complete ev_check dict,
+      3-tier adaptive primary relaxation, threshold cap, guard n_primary=0
 """
 from __future__ import annotations
 
@@ -73,11 +73,11 @@ PRIMARY_TF          = os.getenv("PRIMARY_TF", "4h")
 PRIMARY_OUTPUT_SIZE = int(os.getenv("PRIMARY_OUTPUT_SIZE", "3000"))
 MTF_OUTPUT_SIZE     = int(os.getenv("MTF_OUTPUT_SIZE", "500"))
 
-# Interval mapping — Twelve Data uses: 1min, 5min, 15min, 30min, 45min,
-# 1h, 2h, 4h, 8h, 1day, 1week, 1month
 INTERVAL_MAP = {
     "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1h", "4h": "4h", "1d": "1day", "1day": "1day",
+    "45m": "45min",
+    "1h": "1h", "2h": "2h", "4h": "4h", "8h": "8h",
+    "1d": "1day", "1day": "1day",
     "1w": "1week", "1M": "1month",
 }
 def td_interval(tf: str) -> str:
@@ -190,11 +190,10 @@ def fetch_td(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"])
 
-    # Reject future bars
     now = pd.Timestamp.now(tz="UTC")
     df = df[df.index <= now]
     if len(df) < 10:
-        raise RuntimeError(f"TD [{symbol} {interval}] too few bars after filter")
+        raise RuntimeError(f"TD [{symbol} {interval}] too few bars")
     return df.reset_index()
 
 
@@ -217,7 +216,6 @@ def fetch_multi_tf_ohlcv() -> Dict[str, pd.DataFrame]:
             except Exception as e:
                 logger.warning("MTF [%s] failed: %s", tf, e)
 
-    # Freshness
     now = pd.Timestamp.now(tz="UTC")
     age_min = (now - primary["datetime"].iloc[-1]).total_seconds() / 60
     max_age = {"1h": 120, "4h": 300, "1d": 1500}.get(PRIMARY_TF, 300)
@@ -228,10 +226,9 @@ def fetch_multi_tf_ohlcv() -> Dict[str, pd.DataFrame]:
 
 
 # =============================================================================
-# DATA FETCH: DXY (via UUP ETF proxy)
+# DATA FETCH: DXY proxy via UUP
 # =============================================================================
 def fetch_dxy() -> Optional[pd.DataFrame]:
-    """DXY proxy via UUP ETF — valid di Twelve Data gratis tier."""
     if not ENABLE_DXY:
         return None
     try:
@@ -263,7 +260,7 @@ def fetch_etf_flow() -> Optional[pd.DataFrame]:
 
 
 # =============================================================================
-# DATA FETCH: FRED (via public CSV endpoint, no extra library)
+# DATA FETCH: FRED via CSV (merge_asof untuk T10Y + CPI alignment)
 # =============================================================================
 def _fetch_fred_csv(series_id: str, start: str) -> Optional[pd.Series]:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
@@ -286,21 +283,36 @@ def _fetch_fred_csv(series_id: str, start: str) -> Optional[pd.Series]:
 
 
 def fetch_fred() -> Optional[pd.DataFrame]:
-    """Real yield = DGS10 - CPI_YoY. No API key required."""
+    """Real yield = DGS10 - CPI_YoY. Pakai merge_asof (fix 18 obs bug)."""
     if not ENABLE_FRED:
         return None
     try:
         t10y = _fetch_fred_csv("DGS10", FRED_START)
         cpi = _fetch_fred_csv("CPIAUCSL", FRED_START)
-        if t10y is None or cpi is None or len(t10y) < 10 or len(cpi) < 10:
+        if t10y is None or cpi is None:
             return None
-        cpi_yoy = cpi.pct_change(12) * 100
-        real_yield = (t10y - cpi_yoy).dropna()
-        if len(real_yield) < 10:
+        if len(t10y) < 30 or len(cpi) < 15:
+            logger.warning("FRED insufficient: t10y=%d cpi=%d", len(t10y), len(cpi))
             return None
-        ry = real_yield.reset_index()
-        ry.columns = ["datetime", "real_yield"]
-        ry["datetime"] = pd.to_datetime(ry["datetime"], utc=True)
+
+        cpi_yoy = cpi.pct_change(12).dropna() * 100
+        if len(cpi_yoy) < 5:
+            logger.warning("CPI YoY insufficient: %d", len(cpi_yoy))
+            return None
+
+        t10y_df = t10y.reset_index()
+        t10y_df.columns = ["datetime", "t10y"]
+        cpi_df = cpi_yoy.reset_index()
+        cpi_df.columns = ["datetime", "cpi_yoy"]
+        t10y_df = t10y_df.sort_values("datetime")
+        cpi_df = cpi_df.sort_values("datetime")
+
+        merged = pd.merge_asof(t10y_df, cpi_df, on="datetime", direction="backward")
+        merged["real_yield"] = merged["t10y"] - merged["cpi_yoy"]
+        ry = merged[["datetime", "real_yield"]].dropna()
+        if len(ry) < 30:
+            logger.warning("FRED real_yield insufficient: %d", len(ry))
+            return None
         logger.info("FRED real yield: %d obs | last %.2f",
                     len(ry), float(ry["real_yield"].iloc[-1]))
         return ry
@@ -344,21 +356,18 @@ def _rolling_entropy(series: np.ndarray, bins: int = 10) -> float:
 
 
 def _safe_int(s: pd.Series) -> pd.Series:
-    """astype(int) yang aman untuk NaN/inf."""
     return s.fillna(0).replace([np.inf, -np.inf], 0).astype(int)
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Pilar 1
     for span in (9, 21, 50, 200):
         df[f"ema_{span}"] = df["close"].ewm(span=span, adjust=False).mean()
     df["sma_200"] = df["close"].rolling(200).mean()
     roll_std = df["close"].rolling(20).std().replace(0, np.nan)
     df["zscore_20"] = (df["close"] - df["close"].rolling(20).mean()) / roll_std
 
-    # Pilar 2
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -371,7 +380,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["stoch_k"] = 100 * (df["close"] - low_5) / rng
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
 
-    # Pilar 4
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
@@ -385,17 +393,26 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     dc = (df["donchian_high_20"] - df["donchian_low_20"]).replace(0, np.nan)
     df["donchian_pos"] = (df["close"] - df["donchian_low_20"]) / dc
 
+    # === VOLUME DETECTION ===
+    has_volume = False
     if "volume" in df.columns:
+        v = df["volume"]
+        non_nan = v.notna().sum()
+        has_volume = (non_nan > len(v) * 0.5) and (v.std() > 0)
+
+    if has_volume:
         vmean = df["volume"].rolling(20).mean().replace(0, np.nan)
         df["volume_ratio"] = (df["volume"] / vmean).fillna(1.0)
+        df["_volume_available"] = 1
+        logger.info("Volume detected: std=%.2f — filter ACTIVE", float(v.std()))
     else:
         df["volume_ratio"] = 1.0
+        df["_volume_available"] = 0
+        logger.warning("Volume NOT available for %s — filter DISABLED", INSTRUMENT)
 
-    # Pilar 5
     df["hurst_100"] = df["close"].rolling(100).apply(_rolling_hurst, raw=True)
     df["entropy_50"] = df["close"].rolling(50).apply(_rolling_entropy, raw=True)
 
-    # Pilar 10
     df["datetime_utc"] = pd.to_datetime(df["datetime"], utc=True)
     df["hour"] = df["datetime_utc"].dt.hour
     df["in_session"] = (
@@ -407,10 +424,8 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_multi_tf_confluence(df: pd.DataFrame, mtf: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Path A: HTF trend alignment."""
     df = df.copy().sort_values("datetime").reset_index(drop=True)
 
-    # trend_primary dengan NaN-safe conversion
     diff = df["close"] - df["sma_200"]
     df["trend_primary"] = _safe_int(np.sign(diff).fillna(0))
 
@@ -447,10 +462,8 @@ def add_alt_data(
     etf: Optional[pd.DataFrame],
     fred: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
-    """Path B: DXY + ETF flow + FRED real yield, dengan NaN-safe merge."""
     df = df.copy().sort_values("datetime").reset_index(drop=True)
 
-    # --- DXY ---
     dxy_cols = ["dxy_close", "dxy_corr_20", "dxy_above_sma50", "dxy_momentum_20"]
     if dxy is not None and len(dxy) > 20:
         try:
@@ -473,7 +486,6 @@ def add_alt_data(
         for c in dxy_cols:
             df[c] = 0.0
 
-    # --- ETF ---
     etf_cols = ["etf_close", "etf_volume", "etf_flow_zscore", "etf_momentum_5d"]
     if etf is not None and len(etf) > 20:
         try:
@@ -494,7 +506,6 @@ def add_alt_data(
         for c in etf_cols:
             df[c] = 0.0
 
-    # --- FRED ---
     fred_cols = ["real_yield", "real_yield_change_5d", "real_yield_change_20d"]
     if fred is not None and len(fred) > 10:
         try:
@@ -512,15 +523,14 @@ def add_alt_data(
         for c in fred_cols:
             df[c] = 0.0
 
-    # NaN audit + fillna(0) — CRITICAL: mencegah training gagal
-    all_alt_cols = dxy_cols + etf_cols + fred_cols
-    for c in all_alt_cols:
+    all_alt = dxy_cols + etf_cols + fred_cols
+    for c in all_alt:
         if c not in df.columns:
             df[c] = 0.0
             continue
         nan_pct = df[c].isna().mean()
         if nan_pct > 0.5:
-            logger.warning("Feature %s has %.0f%% NaN — degraded", c, nan_pct * 100)
+            logger.warning("Feature %s %.0f%% NaN — degraded", c, nan_pct * 100)
         df[c] = df[c].fillna(0.0).replace([np.inf, -np.inf], 0.0)
 
     return df
@@ -539,41 +549,72 @@ FEATURE_COLS = [
 ]
 
 # =============================================================================
-# PRIMARY SIGNAL (PATH D)
+# PRIMARY SIGNAL — 3-TIER ADAPTIVE RELAXATION
 # =============================================================================
 def primary_signal(df: pd.DataFrame) -> pd.Series:
     rsi = df["rsi_14"].values
     trend_primary = df["trend_primary"].values
     htf_score = df["htf_score"].values
     vol_ratio = df["volume_ratio"].values
+    volume_available = bool(df["_volume_available"].iloc[-1]) if "_volume_available" in df else False
 
-    primary = np.zeros(len(df), dtype=int)
-    valid = np.isfinite(rsi) & np.isfinite(trend_primary)
+    valid = np.isfinite(rsi) & np.isfinite(trend_primary) & np.isfinite(htf_score)
 
-    if REFINED_PRIMARY:
+    tiers = [
+        ("STRICT",   RSI_EXTREME_LOW, RSI_EXTREME_HIGH, VOLUME_MULT, 1),
+        ("MODERATE", 42, 58, 0.9, 0),
+        ("RELAXED",  45, 55, 0.0, None),
+    ]
+
+    logger.info("═══ PRIMARY (%s) | volume_available=%s ═══",
+                "REFINED" if REFINED_PRIMARY else "BASIC", volume_available)
+
+    last_primary = None
+    for tier_name, rsi_lo, rsi_hi, vol_min, htf_min in tiers:
+        primary = np.zeros(len(df), dtype=int)
+
+        if volume_available and vol_min > 0:
+            vol_mask_long = vol_ratio > vol_min
+            vol_mask_short = vol_ratio > vol_min
+        else:
+            vol_mask_long = np.ones(len(df), dtype=bool)
+            vol_mask_short = np.ones(len(df), dtype=bool)
+
+        if htf_min is not None:
+            htf_long = htf_score >= htf_min
+            htf_short = htf_score <= -htf_min
+        else:
+            htf_long = np.ones(len(df), dtype=bool)
+            htf_short = np.ones(len(df), dtype=bool)
+
         long_cond = (
-            valid & (trend_primary == 1) & (rsi < RSI_EXTREME_LOW) &
-            (vol_ratio > VOLUME_MULT) & (htf_score >= 1)
+            valid & (trend_primary == 1) & (rsi < rsi_lo) &
+            vol_mask_long & htf_long
         )
         short_cond = (
-            valid & (trend_primary == -1) & (rsi > RSI_EXTREME_HIGH) &
-            (vol_ratio > VOLUME_MULT) & (htf_score <= -1)
+            valid & (trend_primary == -1) & (rsi > rsi_hi) &
+            vol_mask_short & htf_short
         )
-    else:
-        long_cond = valid & (trend_primary == 1) & (rsi < 40)
-        short_cond = valid & (trend_primary == -1) & (rsi > 60)
 
-    primary[long_cond] = 1
-    primary[short_cond] = -1
-    s = pd.Series(primary, index=df.index, name="primary")
+        primary[long_cond] = 1
+        primary[short_cond] = -1
+        n_long = int((primary == 1).sum())
+        n_short = int((primary == -1).sum())
+        n_total = n_long + n_short
+        last_primary = primary
 
-    n = len(s)
-    logger.info("═══ PRIMARY (%s) ═══", "REFINED" if REFINED_PRIMARY else "BASIC")
-    logger.info("Bars: %d | LONG: %d (%.1f%%) | SHORT: %d (%.1f%%) | NO: %.1f%%",
-                n, (s == 1).sum(), 100 * (s == 1).mean(),
-                (s == -1).sum(), 100 * (s == -1).mean(),
-                100 * (s == 0).mean())
-    return s
+        logger.info("Tier %-8s: LONG=%d SHORT=%d TOTAL=%d (need≥%d) | RSI %.0f/%.0f vol_min=%.1f htf_min=%s",
+                    tier_name, n_long, n_short, n_total, MIN_PRIMARY_BARS,
+                    rsi_lo, rsi_hi, vol_min, htf_min)
+
+        if n_total >= MIN_PRIMARY_BARS:
+            logger.info("✅ Tier %s selected: %d signals (%.1f%%)",
+                        tier_name, n_total, 100 * n_total / len(df))
+            return pd.Series(primary, index=df.index, name="primary")
+
+    logger.warning("⚠️ All tiers < %d signals — using last (%d)",
+                   MIN_PRIMARY_BARS, int((last_primary != 0).sum()))
+    return pd.Series(last_primary, index=df.index, name="primary")
 
 # =============================================================================
 # DIRECTIONAL BARRIER
@@ -621,15 +662,22 @@ def directional_barrier(df: pd.DataFrame, primary: pd.Series) -> pd.Series:
     return pd.Series(labels, index=df.index, name="label")
 
 # =============================================================================
-# EV CHECK (GATE 1)
+# EV CHECK (GATE 1) — always complete dict
 # =============================================================================
 def ev_check(df: pd.DataFrame, labels: pd.Series) -> Dict[str, float]:
+    result = {
+        "n_primary": 0, "win_rate": 0.0, "breakeven": 0.0,
+        "edge_pp": 0.0, "ev_gross": 0.0, "ev_net": -1.0,
+    }
     vol = df["atr_pct"].values
     vol = np.where((vol < 1e-5) | ~np.isfinite(vol), 0.003, vol)
     mask = ~np.isnan(labels.values)
     n_primary = int(mask.sum())
+
+    logger.info("═══ EV (GATE 1) ═══")
     if n_primary == 0:
-        return {"ev_net": -1.0, "n_primary": 0}
+        logger.critical("❌ GATE 1 FAILED: NO primary signals (0 bars)")
+        return result
 
     y = labels.values[mask]
     v = vol[mask]
@@ -639,7 +687,12 @@ def ev_check(df: pd.DataFrame, labels: pd.Series) -> Dict[str, float]:
     ev_gross = float(pnl.mean())
     ev_net = ev_gross - COST_BPS / 10000.0
 
-    logger.info("═══ EV (GATE 1) ═══")
+    result.update({
+        "n_primary": n_primary, "win_rate": win, "breakeven": breakeven,
+        "edge_pp": (win - breakeven) * 100,
+        "ev_gross": ev_gross, "ev_net": ev_net,
+    })
+
     logger.info("Primary: %d (%.1f%%) | Win: %.2f%% | BE: %.2f%% | Edge: %+.2f pp",
                 n_primary, 100 * n_primary / len(df),
                 win * 100, breakeven * 100, (win - breakeven) * 100)
@@ -649,12 +702,7 @@ def ev_check(df: pd.DataFrame, labels: pd.Series) -> Dict[str, float]:
         logger.critical("❌ GATE 1 FAILED")
     else:
         logger.info("✅ GATE 1 PASSED")
-
-    return {
-        "n_primary": n_primary, "win_rate": win, "breakeven": breakeven,
-        "edge_pp": (win - breakeven) * 100,
-        "ev_gross": ev_gross, "ev_net": ev_net,
-    }
+    return result
 
 # =============================================================================
 # PURGED CV
@@ -787,7 +835,6 @@ def train_meta_model(
     else:
         logger.info("✅ GATE 2 PASSED")
 
-    # Final fit
     sc_final = StandardScaler()
     X_all = sc_final.fit_transform(X)
     final_models = {}
@@ -842,7 +889,6 @@ def backtest(cv_preds, df: pd.DataFrame, labels: pd.Series) -> Dict[str, Any]:
     valid = ~np.isnan(labels.values)
     vol = df["atr_pct"].values
     vol = np.where((vol < 1e-5) | ~np.isfinite(vol), 0.003, vol)
-    y_true = np.concatenate([p[0] for p in cv_preds])
     y_pred = np.concatenate([p[1] for p in cv_preds])
     n = len(y_pred)
     v = vol[valid][-n:]
@@ -1010,7 +1056,7 @@ def send_tg(msg: str) -> bool:
 # MAIN
 # =============================================================================
 def main():
-    logger.info("═══ %s BOT v9.1 | TF=%s ═══", INSTRUMENT, PRIMARY_TF)
+    logger.info("═══ %s BOT v9.2 | TF=%s ═══", INSTRUMENT, PRIMARY_TF)
     logger.info("Paths: A(MultiTF=%s) B(FRED=%s ETF=%s DXY=%s) C(%s) D(Refined=%s)",
                 MULTI_TF, ENABLE_FRED, ENABLE_ETF_FLOW, ENABLE_DXY,
                 INSTRUMENT, REFINED_PRIMARY)
@@ -1041,7 +1087,6 @@ def main():
         send_tg("🚨 <b>CIRCUIT BREAKER</b>")
         return
 
-    # DATA
     try:
         mtf = fetch_multi_tf_ohlcv()
         primary_df = mtf[PRIMARY_TF].copy()
@@ -1053,17 +1098,23 @@ def main():
         send_tg(f"⚠️ Data error: {e}")
         return
 
-    # FEATURES
     df = add_features(primary_df)
     df = add_multi_tf_confluence(df, mtf)
     df = add_alt_data(df, dxy, etf, fred)
 
-    # PRIMARY + LABEL
     primary = primary_signal(df)
     labels = directional_barrier(df, primary)
 
-    # GATE 1
     ev = ev_check(df, labels)
+
+    if ev["n_primary"] == 0:
+        send_tg(
+            f"🛑 <b>NO PRIMARY SIGNALS</b> [{INSTRUMENT} {PRIMARY_TF}]\n"
+            f"Filter terlalu ketat untuk kondisi pasar saat ini.\n"
+            f"Semua tier (STRICT/MODERATE/RELAXED) menghasilkan 0."
+        )
+        return
+
     if ev["ev_net"] <= 0:
         send_tg(
             f"🛑 <b>GATE 1 FAILED</b> [{INSTRUMENT} {PRIMARY_TF}]\n"
@@ -1074,7 +1125,6 @@ def main():
         )
         return
 
-    # TRAIN
     models, scaler, meta = train_meta_model(df, primary, labels)
     if models is None:
         send_tg("⚠️ Training failed — insufficient data")
@@ -1090,7 +1140,6 @@ def main():
         )
         return
 
-    # GATE 3: Hurst
     hurst_val = df["hurst_100"].iloc[-2]
     hurst = 0.5 if pd.isna(hurst_val) else float(hurst_val)
     if HURST_MODE == "VETO" and hurst < HURST_MIN:
@@ -1098,13 +1147,11 @@ def main():
         send_tg(f"🚫 <b>VETO</b> — Hurst {hurst:.3f} < {HURST_MIN}")
         return
 
-    # GATE 4: Session
     if not int(df["in_session"].iloc[-2]):
         logger.info("Outside session (%d-%d UTC)",
                     CFG["session_start"], CFG["session_end"])
         return
 
-    # GATE 5: Current primary
     cur_p = int(primary.iloc[-2])
     if cur_p == 0:
         logger.info("No primary at current bar — HOLD")
@@ -1112,7 +1159,6 @@ def main():
             send_tg("⏸️ No primary signal")
         return
 
-    # GATE 6: p_profit vs dynamic threshold
     p_profit = predict_profit_prob(df, models, scaler, meta)
     if p_profit is None:
         send_tg("⚠️ Prediction failed")
@@ -1125,6 +1171,13 @@ def main():
     breakeven = (SL_MULT + cost_rel) / (TP_MULT + SL_MULT)
     threshold = breakeven + TRADE_MARGIN
 
+    if threshold > 0.85:
+        logger.warning("Threshold %.4f > 0.85 — vol too low (%.6f), skip",
+                       threshold, cur_vol)
+        if NOTIFY_HOLD:
+            send_tg(f"⏸️ Threshold too high ({threshold:.2%}) — vol too low")
+        return
+
     logger.info("═══ DECISION ═══")
     logger.info("Primary=%+d | p_profit=%.4f | thr=%.4f | Hurst=%.3f",
                 cur_p, p_profit, threshold, hurst)
@@ -1135,7 +1188,6 @@ def main():
             send_tg(f"⏸️ ML filter | p={p_profit:.2%} < {threshold:.2%}")
         return
 
-    # TRADE
     atr = float(df["atr_14"].iloc[-2])
     lot = risk.position_size(atr, hurst)
     if lot < CFG["min_lot"]:
