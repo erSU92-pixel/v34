@@ -1,17 +1,13 @@
 """
-XAUUSD QUANT BOT v10.0 — FINAL PRODUCTION
+XAUUSD QUANT BOT v10.1 — FINAL DEFINITIVE
 ================================================================
-Semua konfigurasi via env. TIDAK PERLU EDIT KODE.
+Perubahan dari v10.0:
+  1. BARRIER SWEEP: uji semua barrier (2:1, 3:1, 4:1, 1:1, 2:2) sekaligus
+  2. CONVICTION FILTER: hanya trade saat EMA gap lebar (momentum jelas)
+  3. AUTO-SELECT: pilih barrier dengan EV tertinggi positif, atau veto
 
-Default (paling masuk akal secara teori):
-    INSTRUMENT=XAU/USD  PRIMARY_TF=1d
-    PRIMARY_MODE=trend  BARRIER_MODE=asym_2_1
-
-Untuk eksperimen, ubah env:
-    INSTRUMENT: XAU/USD, BTC/USD, EUR/USD
-    PRIMARY_TF: 4h, 1d
-    PRIMARY_MODE: trend, mean_rev, hybrid
-    BARRIER_MODE: asym_2_1, sym_15, sym_20
+Jika v10.1 gagal di XAU 4H dengan semua barrier → tidak ada edge di XAU retail.
+Exit criteria jelas: ubah INSTRUMENT env atau berhenti.
 ================================================================
 """
 from __future__ import annotations
@@ -37,9 +33,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("XAUUSD_BOT")
 
-# =============================================================================
-# ENV
-# =============================================================================
 TWELVE_DATA_KEY = os.getenv("TWELVEDATA_API_KEY")
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
@@ -47,7 +40,7 @@ GIST_ID         = os.getenv("GIST_ID")
 GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 
 # =============================================================================
-# INSTRUMENT CONFIG
+# INSTRUMENT
 # =============================================================================
 INSTRUMENT = os.getenv("INSTRUMENT", "XAU/USD")
 INSTRUMENTS = {
@@ -72,33 +65,31 @@ CFG = INSTRUMENTS[INSTRUMENT]
 # TIMEFRAME & MODE
 # =============================================================================
 MULTI_TF            = os.getenv("MULTI_TF", "1") == "1"
-PRIMARY_TF          = os.getenv("PRIMARY_TF", "1d")
-PRIMARY_OUTPUT_SIZE = int(os.getenv("PRIMARY_OUTPUT_SIZE", "2000"))
+PRIMARY_TF          = os.getenv("PRIMARY_TF", "4h")
+PRIMARY_OUTPUT_SIZE = int(os.getenv("PRIMARY_OUTPUT_SIZE", "3000"))
 MTF_OUTPUT_SIZE     = int(os.getenv("MTF_OUTPUT_SIZE", "500"))
+PRIMARY_MODE        = os.getenv("PRIMARY_MODE", "trend")
 
-PRIMARY_MODE = os.getenv("PRIMARY_MODE", "trend")   # trend | mean_rev | hybrid
-BARRIER_MODE = os.getenv("BARRIER_MODE", "asym_2_1") # asym_2_1 | sym_15 | sym_20
+# CONVICTION FILTER: EMA9-EMA21 gap dalam unit ATR
+CONVICTION_ATR_MULT = float(os.getenv("CONVICTION_ATR_MULT", "0.3"))
 
-# Barrier presets
+# BARRIER SWEEP
 BARRIER_PRESETS = {
-    "asym_2_1": dict(tp=2.0, sl=1.0, breakeven=1.0/(2.0+1.0)),   # 33.3%
-    "sym_15":   dict(tp=1.5, sl=1.5, breakeven=0.5),               # 50.0%
-    "sym_20":   dict(tp=2.0, sl=2.0, breakeven=0.5),               # 50.0%
+    "asym_2_1": dict(tp=2.0, sl=1.0),
+    "asym_3_1": dict(tp=3.0, sl=1.0),
+    "asym_4_1": dict(tp=4.0, sl=1.0),
+    "sym_15":   dict(tp=1.5, sl=1.5),
+    "sym_20":   dict(tp=2.0, sl=2.0),
 }
-if BARRIER_MODE not in BARRIER_PRESETS:
-    raise ValueError(f"Unknown BARRIER_MODE: {BARRIER_MODE}")
-BARRIER = BARRIER_PRESETS[BARRIER_MODE]
 
 INTERVAL_MAP = {
     "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
     "45m": "45min", "1h": "1h", "2h": "2h", "4h": "4h", "8h": "8h",
     "1d": "1day", "1day": "1day", "1w": "1week", "1M": "1month",
 }
-def td_interval(tf: str) -> str:
-    if tf in INTERVAL_MAP:
-        return INTERVAL_MAP[tf]
-    if tf in INTERVAL_MAP.values():
-        return tf
+def td_interval(tf):
+    if tf in INTERVAL_MAP: return INTERVAL_MAP[tf]
+    if tf in INTERVAL_MAP.values(): return tf
     raise ValueError(f"Unknown interval: {tf}")
 
 # =============================================================================
@@ -115,7 +106,7 @@ FRED_START      = os.getenv("FRED_START", "2023-01-01")
 MAX_HOLDING_BARS = int(os.getenv("MAX_HOLDING_BARS", "12"))
 PURGE_EMBARGO    = int(os.getenv("PURGE_EMBARGO", "24"))
 N_CV_SPLITS      = 5
-MIN_PRIMARY_BARS = 60   # 1D data lebih sedikit, turunkan threshold
+MIN_PRIMARY_BARS = 100
 
 COST_BPS        = float(os.getenv("COST_BPS", "3.5"))
 TRADE_MARGIN    = float(os.getenv("TRADE_MARGIN", "0.03"))
@@ -130,10 +121,10 @@ HURST_MODE             = os.getenv("HURST_MODE", "VETO")
 NOTIFY_HOLD            = os.getenv("NOTIFY_HOLD", "0") == "1"
 
 # =============================================================================
-# RESILIENT HTTP
+# HTTP
 # =============================================================================
 class ResilientSession:
-    def __init__(self, min_interval_sec: float = 7.5):
+    def __init__(self, min_interval_sec=7.5):
         self.session = requests.Session()
         self.min_interval = min_interval_sec
         self._last = 0.0
@@ -143,7 +134,7 @@ class ResilientSession:
         if elapsed < self.min_interval:
             time.sleep(self.min_interval - elapsed)
 
-    def request(self, method: str, url: str, **kwargs) -> requests.Response:
+    def request(self, method, url, **kwargs):
         for attempt in range(5):
             self._throttle()
             try:
@@ -166,15 +157,13 @@ class ResilientSession:
 http = ResilientSession()
 
 # =============================================================================
-# DATA FETCH
+# DATA
 # =============================================================================
-def fetch_td(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+def fetch_td(symbol, interval, outputsize):
     url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": td_interval(interval),
-        "outputsize": outputsize, "apikey": TWELVE_DATA_KEY,
-        "format": "JSON", "timezone": "UTC",
-    }
+    params = {"symbol": symbol, "interval": td_interval(interval),
+              "outputsize": outputsize, "apikey": TWELVE_DATA_KEY,
+              "format": "JSON", "timezone": "UTC"}
     resp = http.request("GET", url, params=params)
     data = resp.json()
     if data.get("status") == "error":
@@ -182,7 +171,6 @@ def fetch_td(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
     values = data.get("values")
     if not values:
         raise RuntimeError(f"TD empty [{symbol} {interval}]")
-
     df = pd.DataFrame(values)
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.set_index("datetime").sort_index()
@@ -193,11 +181,11 @@ def fetch_td(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
     now = pd.Timestamp.now(tz="UTC")
     df = df[df.index <= now]
     if len(df) < 10:
-        raise RuntimeError(f"TD [{symbol} {interval}] too few bars")
+        raise RuntimeError(f"TD [{symbol} {interval}] too few")
     return df.reset_index()
 
 
-def fetch_multi_tf_ohlcv() -> Dict[str, pd.DataFrame]:
+def fetch_multi_tf_ohlcv():
     result = {}
     primary = fetch_td(CFG["symbol"], PRIMARY_TF, PRIMARY_OUTPUT_SIZE)
     result[PRIMARY_TF] = primary
@@ -206,40 +194,36 @@ def fetch_multi_tf_ohlcv() -> Dict[str, pd.DataFrame]:
                 primary["datetime"].iloc[0], primary["datetime"].iloc[-1])
     if MULTI_TF:
         for tf in ["1h", "1d"]:
-            if tf == PRIMARY_TF:
-                continue
+            if tf == PRIMARY_TF: continue
             try:
                 df = fetch_td(CFG["symbol"], tf, MTF_OUTPUT_SIZE)
                 result[tf] = df
                 logger.info("TD [%s %s]: %d bars", CFG["symbol"], tf, len(df))
             except Exception as e:
                 logger.warning("MTF [%s] failed: %s", tf, e)
-
     now = pd.Timestamp.now(tz="UTC")
-    age_min = (now - primary["datetime"].iloc[-1]).total_seconds() / 60
+    age = (now - primary["datetime"].iloc[-1]).total_seconds() / 60
     max_age = {"1h": 120, "4h": 300, "1d": 1800}.get(PRIMARY_TF, 300)
-    if age_min > max_age:
-        raise RuntimeError(f"Primary TF stale: {age_min:.0f}min > {max_age}")
-    logger.info("Data age: %.0f min (max %d)", age_min, max_age)
+    if age > max_age:
+        raise RuntimeError(f"Stale: {age:.0f}min > {max_age}")
+    logger.info("Data age: %.0f min", age)
     return result
 
 
-def fetch_dxy() -> Optional[pd.DataFrame]:
-    if not ENABLE_DXY:
-        return None
+def fetch_dxy():
+    if not ENABLE_DXY: return None
     try:
         dxy = fetch_td(CFG["ref_dxy"], PRIMARY_TF, PRIMARY_OUTPUT_SIZE)
         out = dxy[["datetime", "close"]].rename(columns={"close": "dxy_close"})
         logger.info("DXY proxy [%s]: %d bars", CFG["ref_dxy"], len(out))
         return out
     except Exception as e:
-        logger.warning("DXY proxy failed: %s", e)
+        logger.warning("DXY failed: %s", e)
         return None
 
 
-def fetch_etf_flow() -> Optional[pd.DataFrame]:
-    if not ENABLE_ETF_FLOW or not CFG["ref_etf"]:
-        return None
+def fetch_etf_flow():
+    if not ENABLE_ETF_FLOW or not CFG["ref_etf"]: return None
     try:
         etf = fetch_td(CFG["ref_etf"], "1d", 400)
         out = etf[["datetime", "close", "volume"]].rename(
@@ -247,49 +231,43 @@ def fetch_etf_flow() -> Optional[pd.DataFrame]:
         logger.info("ETF [%s]: %d bars", CFG["ref_etf"], len(out))
         return out
     except Exception as e:
-        logger.warning("ETF [%s] failed: %s", CFG["ref_etf"], e)
+        logger.warning("ETF failed: %s", e)
         return None
 
 
-def _fetch_fred_csv(series_id: str, start: str) -> Optional[pd.Series]:
+def _fetch_fred_csv(series_id, start):
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
     try:
         r = http.request("GET", url)
-        if r.status_code != 200:
-            return None
+        if r.status_code != 200: return None
         df = pd.read_csv(StringIO(r.text))
-        if df.shape[1] < 2:
-            return None
+        if df.shape[1] < 2: return None
         df.columns = ["datetime", "value"]
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna(subset=["value"])
-        return df.set_index("datetime")["value"]
+        return df.dropna(subset=["value"]).set_index("datetime")["value"]
     except Exception as e:
         logger.warning("FRED [%s] failed: %s", series_id, e)
         return None
 
 
-def fetch_fred() -> Optional[pd.DataFrame]:
-    if not ENABLE_FRED:
-        return None
+def fetch_fred():
+    if not ENABLE_FRED: return None
     try:
         t10y = _fetch_fred_csv("DGS10", FRED_START)
         cpi = _fetch_fred_csv("CPIAUCSL", FRED_START)
         if t10y is None or cpi is None or len(t10y) < 30 or len(cpi) < 15:
             return None
         cpi_yoy = cpi.pct_change(12).dropna() * 100
-        if len(cpi_yoy) < 5:
-            return None
+        if len(cpi_yoy) < 5: return None
         t10y_df = t10y.reset_index(); t10y_df.columns = ["datetime", "t10y"]
         cpi_df = cpi_yoy.reset_index(); cpi_df.columns = ["datetime", "cpi_yoy"]
         t10y_df = t10y_df.sort_values("datetime")
         cpi_df = cpi_df.sort_values("datetime")
-        merged = pd.merge_asof(t10y_df, cpi_df, on="datetime", direction="backward")
-        merged["real_yield"] = merged["t10y"] - merged["cpi_yoy"]
-        ry = merged[["datetime", "real_yield"]].dropna()
-        if len(ry) < 30:
-            return None
+        m = pd.merge_asof(t10y_df, cpi_df, on="datetime", direction="backward")
+        m["real_yield"] = m["t10y"] - m["cpi_yoy"]
+        ry = m[["datetime", "real_yield"]].dropna()
+        if len(ry) < 30: return None
         logger.info("FRED real yield: %d obs | last %.2f",
                     len(ry), float(ry["real_yield"].iloc[-1]))
         return ry
@@ -300,7 +278,7 @@ def fetch_fred() -> Optional[pd.DataFrame]:
 # =============================================================================
 # FEATURES
 # =============================================================================
-def _rolling_hurst(series: np.ndarray) -> float:
+def _rolling_hurst(series):
     if len(series) < 20: return 0.5
     lags = list(range(2, min(20, len(series) // 2)))
     if len(lags) < 2: return 0.5
@@ -314,7 +292,7 @@ def _rolling_hurst(series: np.ndarray) -> float:
         return 0.5
 
 
-def _rolling_entropy(series: np.ndarray, bins: int = 10) -> float:
+def _rolling_entropy(series, bins=10):
     if len(series) < 10: return 0.0
     rets = np.diff(np.log(np.clip(series, 1e-12, None)))
     if len(rets) == 0 or np.std(rets) < 1e-12: return 0.0
@@ -329,7 +307,7 @@ def _safe_int(s):
     return s.fillna(0).replace([np.inf, -np.inf], 0).astype(int)
 
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_features(df):
     df = df.copy()
     for span in (9, 21, 50, 200):
         df[f"ema_{span}"] = df["close"].ewm(span=span, adjust=False).mean()
@@ -349,11 +327,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["stoch_k"] = 100 * (df["close"] - low_5) / rng
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
 
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df["high"] - df["low"],
+                    (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
     df["atr_14"] = tr.rolling(14).mean().replace(0, np.nan).ffill()
     df["atr_pct"] = (df["atr_14"] / df["close"]).replace([np.inf, -np.inf], np.nan)
 
@@ -362,47 +338,44 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     dc = (df["donchian_high_20"] - df["donchian_low_20"]).replace(0, np.nan)
     df["donchian_pos"] = (df["close"] - df["donchian_low_20"]) / dc
 
-    has_volume = False
+    has_vol = False
     if "volume" in df.columns:
         v = df["volume"]
-        has_volume = (v.notna().sum() > len(v) * 0.5) and (v.std() > 0)
-    if has_volume:
+        has_vol = (v.notna().sum() > len(v) * 0.5) and (v.std() > 0)
+    if has_vol:
         vmean = df["volume"].rolling(20).mean().replace(0, np.nan)
         df["volume_ratio"] = (df["volume"] / vmean).fillna(1.0)
         df["_volume_available"] = 1
-        logger.info("Volume detected — filter ACTIVE")
     else:
         df["volume_ratio"] = 1.0
         df["_volume_available"] = 0
-        logger.info("Volume NOT available — filter DISABLED")
 
     df["hurst_100"] = df["close"].rolling(100).apply(_rolling_hurst, raw=True)
     df["entropy_50"] = df["close"].rolling(50).apply(_rolling_entropy, raw=True)
 
     df["datetime_utc"] = pd.to_datetime(df["datetime"], utc=True)
     df["hour"] = df["datetime_utc"].dt.hour
-    df["in_session"] = (
-        (df["hour"] >= CFG["session_start"]) &
-        (df["hour"] < CFG["session_end"])).astype(int)
+    df["in_session"] = ((df["hour"] >= CFG["session_start"]) &
+                        (df["hour"] < CFG["session_end"])).astype(int)
     return df
 
 
-def add_multi_tf_confluence(df, mtf) -> pd.DataFrame:
+def add_multi_tf_confluence(df, mtf):
     df = df.copy().sort_values("datetime").reset_index(drop=True)
     df["trend_primary"] = _safe_int(np.sign((df["close"] - df["sma_200"]).fillna(0)))
 
-    def get_tf_trend(tf_df, name):
+    def get_trend(tf_df, name):
         t = tf_df.copy().sort_values("datetime").reset_index(drop=True)
         t["ema50"] = t["close"].ewm(span=50, adjust=False).mean()
         t["trend"] = np.sign((t["close"] - t["ema50"]).fillna(0))
         t = t[["datetime", "trend"]].rename(columns={"trend": f"trend_{name}"})
-        merged = pd.merge_asof(df, t, on="datetime", direction="backward")
-        df[f"trend_{name}"] = _safe_int(merged[f"trend_{name}"].fillna(0))
+        m = pd.merge_asof(df, t, on="datetime", direction="backward")
+        df[f"trend_{name}"] = _safe_int(m[f"trend_{name}"].fillna(0))
 
     if MULTI_TF:
-        if "1d" in mtf: get_tf_trend(mtf["1d"], "1d")
+        if "1d" in mtf: get_trend(mtf["1d"], "1d")
         else: df["trend_1d"] = 0
-        if "1h" in mtf: get_tf_trend(mtf["1h"], "1h")
+        if "1h" in mtf: get_trend(mtf["1h"], "1h")
         else: df["trend_1h"] = 0
     else:
         df["trend_1d"] = 0; df["trend_1h"] = 0
@@ -413,9 +386,8 @@ def add_multi_tf_confluence(df, mtf) -> pd.DataFrame:
     return df
 
 
-def add_alt_data(df, dxy, etf, fred) -> pd.DataFrame:
+def add_alt_data(df, dxy, etf, fred):
     df = df.copy().sort_values("datetime").reset_index(drop=True)
-
     dxy_cols = ["dxy_close", "dxy_corr_20", "dxy_above_sma50", "dxy_momentum_20"]
     if dxy is not None and len(dxy) > 20:
         try:
@@ -425,8 +397,7 @@ def add_alt_data(df, dxy, etf, fred) -> pd.DataFrame:
             df["dxy_corr_20"] = df["close"].pct_change().rolling(20).corr(df["dxy_close"].pct_change())
             df["dxy_above_sma50"] = (df["dxy_close"] > df["dxy_close"].rolling(50).mean()).astype(int)
             df["dxy_momentum_20"] = df["dxy_close"].pct_change(20)
-        except Exception as e:
-            logger.warning("DXY merge failed: %s", e)
+        except Exception:
             for c in dxy_cols: df[c] = 0.0
     else:
         for c in dxy_cols: df[c] = 0.0
@@ -442,8 +413,7 @@ def add_alt_data(df, dxy, etf, fred) -> pd.DataFrame:
             vstd = df["etf_volume"].rolling(50).std().replace(0, np.nan)
             df["etf_flow_zscore"] = (df["etf_volume"] - vmean) / vstd
             df["etf_momentum_5d"] = df["etf_close"].pct_change(5)
-        except Exception as e:
-            logger.warning("ETF merge failed: %s", e)
+        except Exception:
             for c in etf_cols: df[c] = 0.0
     else:
         for c in etf_cols: df[c] = 0.0
@@ -456,17 +426,14 @@ def add_alt_data(df, dxy, etf, fred) -> pd.DataFrame:
             df["real_yield"] = m["real_yield"].ffill()
             df["real_yield_change_5d"] = df["real_yield"].diff(5)
             df["real_yield_change_20d"] = df["real_yield"].diff(20)
-        except Exception as e:
-            logger.warning("FRED merge failed: %s", e)
+        except Exception:
             for c in fred_cols: df[c] = 0.0
     else:
         for c in fred_cols: df[c] = 0.0
 
     for c in dxy_cols + etf_cols + fred_cols:
-        if c not in df.columns:
-            df[c] = 0.0
-        else:
-            df[c] = df[c].fillna(0.0).replace([np.inf, -np.inf], 0.0)
+        if c not in df.columns: df[c] = 0.0
+        else: df[c] = df[c].fillna(0.0).replace([np.inf, -np.inf], 0.0)
     return df
 
 
@@ -483,62 +450,68 @@ FEATURE_COLS = [
 ]
 
 # =============================================================================
-# PRIMARY SIGNAL — 3 MODES
+# PRIMARY SIGNAL + CONVICTION FILTER
 # =============================================================================
-def primary_signal(df: pd.DataFrame) -> pd.Series:
+def primary_signal(df):
     rsi = df["rsi_14"].values
     ema9 = df["ema_9"].values
     ema21 = df["ema_21"].values
     ema50 = df["ema_50"].values
     trend = df["trend_primary"].values
     htf = df["htf_score"].values
-    valid = (np.isfinite(rsi) & np.isfinite(ema9) &
-             np.isfinite(ema21) & np.isfinite(ema50) &
-             np.isfinite(trend) & np.isfinite(htf))
+    atr = df["atr_14"].values
+    close = df["close"].values
 
-    logger.info("═══ PRIMARY MODE: %s ═══", PRIMARY_MODE.upper())
+    valid = (np.isfinite(rsi) & np.isfinite(ema9) & np.isfinite(ema21) &
+             np.isfinite(ema50) & np.isfinite(trend) & np.isfinite(atr) &
+             np.isfinite(close) & np.isfinite(htf))
+
+    # CONVICTION: EMA gap harus lebar relatif terhadap ATR
+    ema_gap = np.abs(ema9 - ema21)
+    atr_safe = np.where((atr < 1e-8) | ~np.isfinite(atr), 0.01, atr)
+    conviction = ema_gap >= (CONVICTION_ATR_MULT * atr_safe)
+
+    logger.info("═══ PRIMARY MODE: %s | CONVICTION_ATR_MULT=%.2f ═══",
+                PRIMARY_MODE.upper(), CONVICTION_ATR_MULT)
+
     primary = np.zeros(len(df), dtype=int)
 
     if PRIMARY_MODE == "trend":
-        # Pure momentum: EMA alignment, no RSI
-        long_cond = (valid & (trend == 1) & (ema9 > ema21) & (ema21 > ema50))
-        short_cond = (valid & (trend == -1) & (ema9 < ema21) & (ema21 < ema50))
+        long_cond = (valid & conviction & (trend == 1) &
+                     (ema9 > ema21) & (ema21 > ema50))
+        short_cond = (valid & conviction & (trend == -1) &
+                      (ema9 < ema21) & (ema21 < ema50))
         primary[long_cond] = 1
         primary[short_cond] = -1
-
     elif PRIMARY_MODE == "mean_rev":
-        # Original RSI counter-trend (untuk pembanding)
-        long_cond = (valid & (trend == 1) & (rsi < 30))
-        short_cond = (valid & (trend == -1) & (rsi > 70))
+        long_cond = valid & conviction & (trend == 1) & (rsi < 30)
+        short_cond = valid & conviction & (trend == -1) & (rsi > 70)
         primary[long_cond] = 1
         primary[short_cond] = -1
-
     elif PRIMARY_MODE == "hybrid":
-        # Trend filter + RSI pullback (momentum + dip buying)
-        long_cond = (valid & (trend == 1) & (ema9 > ema21) &
-                     (rsi > 40) & (rsi < 60))
-        short_cond = (valid & (trend == -1) & (ema9 < ema21) &
-                      (rsi > 40) & (rsi < 60))
+        long_cond = (valid & conviction & (trend == 1) &
+                     (ema9 > ema21) & (rsi > 40) & (rsi < 60))
+        short_cond = (valid & conviction & (trend == -1) &
+                      (ema9 < ema21) & (rsi > 40) & (rsi < 60))
         primary[long_cond] = 1
         primary[short_cond] = -1
 
     s = pd.Series(primary, index=df.index, name="primary")
-    n_l = int((s == 1).sum())
-    n_s = int((s == -1).sum())
+    n_l = int((s == 1).sum()); n_s = int((s == -1).sum())
     logger.info("LONG=%d SHORT=%d TOTAL=%d (%.1f%%)",
                 n_l, n_s, n_l + n_s, 100 * (n_l + n_s) / len(s))
     return s
 
 # =============================================================================
-# BARRIER & EV
+# BARRIER
 # =============================================================================
-def barrier_labels(df: pd.DataFrame, primary: pd.Series) -> pd.Series:
+def barrier_labels(df, primary, preset):
     close = df["close"].values; high = df["high"].values; low = df["low"].values
     vol = df["atr_pct"].values
     vol = np.where((vol < 1e-5) | ~np.isfinite(vol), 0.003, vol)
     pv = primary.values; n = len(df)
     labels = np.full(n, np.nan)
-    tp_mult = BARRIER["tp"]; sl_mult = BARRIER["sl"]
+    tp_mult = preset["tp"]; sl_mult = preset["sl"]
 
     for i in range(n - 1):
         d = pv[i]
@@ -563,60 +536,66 @@ def barrier_labels(df: pd.DataFrame, primary: pd.Series) -> pd.Series:
     return pd.Series(labels, index=df.index, name="label")
 
 
-def _ev_stats(labels, vol):
+def _ev_stats(labels, vol, preset):
     mask = ~np.isnan(labels.values)
     n = int(mask.sum())
     if n == 0:
         return {"n": 0, "win": 0.0, "ev_gross": 0.0, "ev_net": -1.0}
     y = labels.values[mask]; v = vol[mask]
-    pnl = np.where(y == 1, BARRIER["tp"] * v, -BARRIER["sl"] * v)
+    pnl = np.where(y == 1, preset["tp"] * v, -preset["sl"] * v)
     win = float((y == 1).mean())
     ev_gross = float(pnl.mean())
     ev_net = ev_gross - COST_BPS / 10000.0
     return {"n": n, "win": win, "ev_gross": ev_gross, "ev_net": ev_net}
 
-
-def ev_check_with_diagnostic(df, primary) -> Dict[str, float]:
+# =============================================================================
+# BARRIER SWEEP (FITUR UTAMA v10.1)
+# =============================================================================
+def barrier_sweep(df, primary):
+    """Uji semua barrier, kembalikan yang terbaik + report semua."""
     vol = df["atr_pct"].values
     vol = np.where((vol < 1e-5) | ~np.isfinite(vol), 0.003, vol)
 
-    orig = _ev_stats(barrier_labels(df, primary), vol)
-    inv = _ev_stats(barrier_labels(df, -primary), vol)
-    be = BARRIER["breakeven"]
+    logger.info("═══ BARRIER SWEEP (GATE 1) ═══")
+    logger.info("%-12s | %5s | %7s | %7s | %9s | %10s",
+                "Barrier", "n", "Win%", "BE%", "Edge pp", "EV net")
+    logger.info("-" * 75)
 
-    logger.info("═══ EV (GATE 1) | BARRIER=%s | BE=%.1f%% ═══",
-                BARRIER_MODE, be * 100)
-    logger.info("")
-    logger.info("ORIGINAL (%s):", PRIMARY_MODE)
-    logger.info("  n=%d | win=%.2f%% | edge=%+.2f pp | EV net=%+.6f",
-                orig["n"], orig["win"] * 100,
-                (orig["win"] - be) * 100, orig["ev_net"])
-    logger.info("INVERTED:")
-    logger.info("  n=%d | win=%.2f%% | edge=%+.2f pp | EV net=%+.6f",
-                inv["n"], inv["win"] * 100,
-                (inv["win"] - be) * 100, inv["ev_net"])
-    logger.info("")
+    results = {}
+    best_name = None; best_ev = -999.0; best_preset = None
 
-    if orig["n"] == 0:
-        logger.critical("❌ GATE 1 FAILED: 0 signals")
-        return {"n_primary": 0, "win_rate": 0.0, "breakeven": be,
-                "edge_pp": 0.0, "ev_gross": 0.0, "ev_net": -1.0,
-                "inverted_ev_net": inv["ev_net"], "inverted_win": inv["win"]}
+    for name, preset in BARRIER_PRESETS.items():
+        labels = barrier_labels(df, primary, preset)
+        stats = _ev_stats(labels, vol, preset)
+        be = preset["sl"] / (preset["tp"] + preset["sl"])
+        edge = (stats["win"] - be) * 100
 
-    if orig["ev_net"] <= 0:
-        logger.critical("❌ GATE 1 FAILED")
-        if inv["ev_net"] > orig["ev_net"] + 0.001:
-            logger.warning("💡 INVERTED better: %.6f vs %.6f",
-                           inv["ev_net"], orig["ev_net"])
-            logger.warning("💡 Coba env: PRIMARY_MODE=%s tapi inverse logic manual",
-                           PRIMARY_MODE)
+        results[name] = {**stats, "breakeven": be, "edge_pp": edge,
+                         "preset": preset, "labels": labels}
+
+        logger.info("%-12s | %5d | %6.2f%% | %6.2f%% | %+8.2f | %+10.6f",
+                    name, stats["n"], stats["win"] * 100, be * 100,
+                    edge, stats["ev_net"])
+
+        if stats["n"] > 0 and stats["ev_net"] > best_ev:
+            best_ev = stats["ev_net"]; best_name = name; best_preset = preset
+
+    logger.info("-" * 75)
+    logger.info("BEST: %s | EV net=%+.6f", best_name, best_ev)
+
+    if best_ev <= 0:
+        logger.critical("❌ GATE 1 FAILED: semua barrier EV negatif")
+        logger.critical("   → Signal tidak punya edge di instrument/TF ini")
     else:
-        logger.info("✅ GATE 1 PASSED")
+        logger.info("✅ GATE 1 PASSED: barrier %s punya EV positif", best_name)
 
-    return {"n_primary": orig["n"], "win_rate": orig["win"], "breakeven": be,
-            "edge_pp": (orig["win"] - be) * 100,
-            "ev_gross": orig["ev_gross"], "ev_net": orig["ev_net"],
-            "inverted_ev_net": inv["ev_net"], "inverted_win": inv["win"]}
+    return {
+        "best_name": best_name, "best_ev": best_ev,
+        "best_preset": best_preset,
+        "best_labels": results[best_name]["labels"] if best_name else None,
+        "best_stats": results[best_name] if best_name else None,
+        "all_results": results,
+    }
 
 # =============================================================================
 # PURGED CV + TRAIN
@@ -644,10 +623,11 @@ def train_meta_model(df, primary, labels):
     meta = {"baseline_acc": None, "random_acc": None, "model_weights": {},
             "cv_scores": {}, "feature_importance": {},
             "gate2_passed": False, "best_model_acc": None}
+
     valid_mask = (~np.isnan(labels.values) &
                   df[FEATURE_COLS].notna().all(axis=1).values)
     if valid_mask.sum() < MIN_PRIMARY_BARS:
-        logger.warning("Insufficient: %d < %d", valid_mask.sum(), MIN_PRIMARY_BARS)
+        logger.warning("Insufficient: %d", valid_mask.sum())
         return None, None, meta
     idx = np.where(valid_mask)[0]
     X = df[FEATURE_COLS].values[idx].astype(np.float64)
@@ -655,8 +635,7 @@ def train_meta_model(df, primary, labels):
     if len(np.unique(y)) < 2:
         logger.warning("Single class"); return None, None, meta
     splits = purged_kfold_primary(idx)
-    if not splits:
-        logger.warning("No splits"); return None, None, meta
+    if not splits: return None, None, meta
     logger.info("Training: %d samples, %d splits", len(idx), len(splits))
 
     factories = {
@@ -670,7 +649,7 @@ def train_meta_model(df, primary, labels):
             random_state=42, n_jobs=-1),
     }
     scores = {k: [] for k in factories}
-    dummy_scores, random_scores, cv_preds = [], [], []
+    dummy_s, random_s, cv_preds = [], [], []
 
     for train_pos, test_pos in splits:
         X_tr, X_te = X[train_pos], X[test_pos]
@@ -678,24 +657,23 @@ def train_meta_model(df, primary, labels):
         sc = StandardScaler()
         X_tr = sc.fit_transform(X_tr); X_te = sc.transform(X_te)
         dm = DummyClassifier(strategy="most_frequent").fit(X_tr, y_tr)
-        dummy_scores.append(accuracy_score(y_te, dm.predict(X_te)))
+        dummy_s.append(accuracy_score(y_te, dm.predict(X_te)))
         rd = DummyClassifier(strategy="stratified", random_state=42).fit(X_tr, y_tr)
-        random_scores.append(accuracy_score(y_te, rd.predict(X_te)))
+        random_s.append(accuracy_score(y_te, rd.predict(X_te)))
         fold_probs = []
         for name, factory in factories.items():
             m = factory(); m.fit(X_tr, y_tr)
             scores[name].append(accuracy_score(y_te, m.predict(X_te)))
             fold_probs.append(m.predict_proba(X_te)[:, 1])
-        ens_prob = np.mean(fold_probs, axis=0)
-        cv_preds.append((y_te, (ens_prob > 0.5).astype(int), ens_prob))
+        ens = np.mean(fold_probs, axis=0)
+        cv_preds.append((y_te, (ens > 0.5).astype(int), ens))
 
-    meta["baseline_acc"] = float(np.mean(dummy_scores))
-    meta["random_acc"] = float(np.mean(random_scores))
+    meta["baseline_acc"] = float(np.mean(dummy_s))
+    meta["random_acc"] = float(np.mean(random_s))
     meta["cv_scores"] = {k: (float(np.mean(v)), float(np.std(v))) for k, v in scores.items()}
 
     logger.info("═══ CV (GATE 2) ═══")
-    logger.info("Dummy: %.4f | Random: %.4f",
-                meta["baseline_acc"], meta["random_acc"])
+    logger.info("Dummy: %.4f | Random: %.4f", meta["baseline_acc"], meta["random_acc"])
     for name, (m, s) in meta["cv_scores"].items():
         logger.info("  %s: %.4f ± %.4f | edge: %+.4f",
                     name.upper(), m, s, m - meta["random_acc"])
@@ -708,10 +686,10 @@ def train_meta_model(df, primary, labels):
     best = max(m for m, _ in meta["cv_scores"].values())
     meta["best_model_acc"] = best
     meta["gate2_passed"] = (best - meta["random_acc"]) > 0.02
-    if not meta["gate2_passed"]:
-        logger.critical("❌ GATE 2 FAILED: %.4f vs %.4f", best, meta["random_acc"])
-    else:
+    if meta["gate2_passed"]:
         logger.info("✅ GATE 2 PASSED")
+    else:
+        logger.critical("❌ GATE 2 FAILED")
 
     sc_final = StandardScaler(); X_all = sc_final.fit_transform(X)
     final_models = {}
@@ -732,8 +710,7 @@ def predict_profit_prob(df, models, scaler, meta):
     row = df.iloc[-2]
     try:
         X = row[FEATURE_COLS].to_numpy(dtype=np.float64).reshape(1, -1)
-    except (ValueError, TypeError):
-        return None
+    except (ValueError, TypeError): return None
     if not np.isfinite(X).all(): return None
     Xs = scaler.transform(X)
     weights = meta.get("model_weights", {})
@@ -742,45 +719,6 @@ def predict_profit_prob(df, models, scaler, meta):
         w = weights.get(name, 1.0 / len(models))
         p += w * float(m.predict_proba(Xs)[0, 1])
     return p
-
-# =============================================================================
-# BACKTEST
-# =============================================================================
-def backtest(cv_preds, df, labels):
-    if not cv_preds: return {}
-    valid = ~np.isnan(labels.values)
-    vol = df["atr_pct"].values
-    vol = np.where((vol < 1e-5) | ~np.isfinite(vol), 0.003, vol)
-    y_pred = np.concatenate([p[1] for p in cv_preds])
-    n = len(y_pred)
-    v = vol[valid][-n:]; lab = labels.values[valid][-n:]
-    pnl_all = np.where(lab == 1, BARRIER["tp"] * v, -BARRIER["sl"] * v) - COST_BPS / 10000.0
-    eq_p = np.cumprod(1 + pnl_all)
-    primary_m = {"n": int(len(pnl_all)), "win": float((lab == 1).mean()),
-                 "ret": float(eq_p[-1] - 1),
-                 "sharpe": float(pnl_all.mean() / pnl_all.std()) if pnl_all.std() > 0 else 0.0}
-    mask = y_pred == 1
-    ml_m = {}
-    if mask.sum() > 0:
-        pnl_ml = pnl_all[mask]
-        eq = np.cumprod(1 + pnl_ml)
-        peak = np.maximum.accumulate(eq)
-        dd = (eq - peak) / peak
-        ml_m = {"n": int(mask.sum()), "win": float((pnl_ml > 0).mean()),
-                "ret": float(eq[-1] - 1),
-                "sharpe": float(pnl_ml.mean() / pnl_ml.std()) if pnl_ml.std() > 0 else 0.0,
-                "max_dd": float(dd.min()),
-                "pf": float(pnl_ml[pnl_ml > 0].sum() / abs(pnl_ml[pnl_ml < 0].sum()))
-                    if (pnl_ml < 0).any() else float("inf")}
-    logger.info("═══ BACKTEST ═══")
-    logger.info("PRIMARY: n=%d | win=%.1f%% | ret=%+.2f%% | sharpe=%.2f",
-                primary_m["n"], primary_m["win"] * 100,
-                primary_m["ret"] * 100, primary_m["sharpe"])
-    if ml_m:
-        logger.info("ML-FILTERED: n=%d | win=%.1f%% | ret=%+.2f%% | dd=%.2f%% | sharpe=%.2f | pf=%.2f",
-                    ml_m["n"], ml_m["win"] * 100, ml_m["ret"] * 100,
-                    ml_m["max_dd"] * 100, ml_m["sharpe"], ml_m["pf"])
-    return {"primary_only": primary_m, "ml_filtered": ml_m}
 
 # =============================================================================
 # RISK ENGINE
@@ -794,8 +732,7 @@ class RiskEngine:
 
     def _daily_reset(self):
         t = datetime.now(timezone.utc).date()
-        if t != self._reset:
-            self.daily_pnl = 0.0; self._reset = t
+        if t != self._reset: self.daily_pnl = 0.0; self._reset = t
 
     def check_circuit_breaker(self, equity):
         self._daily_reset()
@@ -808,7 +745,7 @@ class RiskEngine:
         elif dl >= MAX_DAILY_LOSS_PCT:
             logger.critical("CB: daily loss %.2f%%", dl * 100); self.halted = True
         elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            logger.critical("CB: %d consecutive losses", self.consecutive_losses); self.halted = True
+            logger.critical("CB: %d losses", self.consecutive_losses); self.halted = True
         return self.halted
 
     def position_size(self, atr, hurst):
@@ -822,9 +759,9 @@ class RiskEngine:
             elif hurst < 0.52: lot *= 0.75
         return max(min(lot, self.cfg["max_lot"]), 0.0)
 
-    def compute_sl_tp(self, entry, direction, atr):
+    def compute_sl_tp(self, entry, direction, atr, preset):
         sl_d = ATR_MULT_SL * atr
-        tp_d = (BARRIER["tp"] / BARRIER["sl"]) * sl_d
+        tp_d = (preset["tp"] / preset["sl"]) * sl_d
         buf = self.cfg["spread_buffer"] + self.cfg["slippage_buffer"]
         if direction == 1:
             return round(entry - sl_d - buf, 4), round(entry + tp_d + buf, 4)
@@ -838,12 +775,12 @@ def load_state():
     h = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     r = http.request("GET", url, headers=h)
     if r.status_code != 200: return {"etag": None, "content": {}}
-    etag = r.headers.get("ETag"); content = {}
+    content = {}
     for name, f in r.json().get("files", {}).items():
         if name.endswith(".json"):
             try: content = json.loads(f.get("content", "{}")); break
-            except json.JSONDecodeError: continue
-    return {"etag": etag, "content": content}
+            except: continue
+    return {"etag": r.headers.get("ETag"), "content": content}
 
 
 def save_state(state, etag):
@@ -864,9 +801,8 @@ def send_tg(msg):
         except RuntimeError: return False
         if r.status_code == 200: return True
         if r.status_code == 429:
-            ra = 5
             try: ra = int(r.json().get("parameters", {}).get("retry_after", 5))
-            except Exception: pass
+            except: ra = 5
             time.sleep(ra + 1); continue
         time.sleep(2 ** a)
     return False
@@ -875,9 +811,8 @@ def send_tg(msg):
 # MAIN
 # =============================================================================
 def main():
-    logger.info("═══ %s BOT v10.0 FINAL ═══", INSTRUMENT)
-    logger.info("Config: INSTRUMENT=%s | PRIMARY_TF=%s | PRIMARY_MODE=%s | BARRIER=%s",
-                INSTRUMENT, PRIMARY_TF, PRIMARY_MODE, BARRIER_MODE)
+    logger.info("═══ %s BOT v10.1 | TF=%s | MODE=%s ═══",
+                INSTRUMENT, PRIMARY_TF, PRIMARY_MODE)
 
     missing = [n for n, v in [
         ("TWELVEDATA_API_KEY", TWELVE_DATA_KEY),
@@ -889,9 +824,8 @@ def main():
         logger.error("Env missing: %s", missing); sys.exit(1)
 
     state = load_state(); content = state.get("content") or {}
-    risk = RiskEngine(
-        balance=float(content.get("balance", ACCOUNT_BALANCE)),
-        risk_pct=RISK_PCT, cfg=CFG)
+    risk = RiskEngine(balance=float(content.get("balance", ACCOUNT_BALANCE)),
+                      risk_pct=RISK_PCT, cfg=CFG)
     risk.halted = bool(content.get("halted", False))
     risk.daily_pnl = float(content.get("daily_pnl", 0.0))
     risk.consecutive_losses = int(content.get("consecutive_losses", 0))
@@ -903,53 +837,43 @@ def main():
     try:
         mtf = fetch_multi_tf_ohlcv()
         primary_df = mtf[PRIMARY_TF].copy()
-        dxy = fetch_dxy()
-        etf = fetch_etf_flow()
-        fred = fetch_fred()
+        dxy = fetch_dxy(); etf = fetch_etf_flow(); fred = fetch_fred()
     except Exception as e:
-        logger.exception("Data pipeline failed")
-        send_tg(f"⚠️ Data error: {e}"); return
+        logger.exception("Data failed"); send_tg(f"⚠️ Data: {e}"); return
 
     df = add_features(primary_df)
     df = add_multi_tf_confluence(df, mtf)
     df = add_alt_data(df, dxy, etf, fred)
 
     primary = primary_signal(df)
-    ev = ev_check_with_diagnostic(df, primary)
+    sweep = barrier_sweep(df, primary)
 
-    if ev["n_primary"] == 0:
-        send_tg(
-            f"🛑 <b>NO PRIMARY</b>\n"
-            f"{INSTRUMENT} {PRIMARY_TF} {PRIMARY_MODE}\n"
-            f"Signal tidak fire pada kondisi pasar ini.")
-        return
-
-    if ev["ev_net"] <= 0:
-        inv_note = ""
-        if ev.get("inverted_ev_net", -1) > 0.0001:
-            inv_note = (
-                f"\n\n💡 INVERTED EV positif: {ev['inverted_ev_net']:+.6f}\n"
-                f"Win inverted: {ev['inverted_win']:.2%}\n"
-                f"Artinya: pasar counter-momentum kuat.\n"
-                f"Rekomendasi: coba PRIMARY_TF=1d atau INSTRUMENT=BTC/USD.")
+    if sweep["best_ev"] <= 0:
+        all_evs = {n: r["ev_net"] for n, r in sweep["all_results"].items()}
+        best_of_bad = max(all_evs, key=all_evs.get) if all_evs else "none"
         send_tg(
             f"🛑 <b>GATE 1 FAILED</b>\n"
-            f"{INSTRUMENT} {PRIMARY_TF} {PRIMARY_MODE} {BARRIER_MODE}\n"
-            f"Win: {ev['win_rate']:.2%} | BE: {ev['breakeven']:.2%}\n"
-            f"Edge: {ev['edge_pp']:+.2f} pp\n"
-            f"EV net: {ev['ev_net']:+.6f}\n"
-            f"n={ev['n_primary']}{inv_note}")
+            f"{INSTRUMENT} {PRIMARY_TF} {PRIMARY_MODE}\n"
+            f"All barriers negative EV:\n"
+            + "\n".join(f"  {n}: {e:+.6f}" for n, e in all_evs.items())
+            + f"\n\nBest (still neg): {best_of_bad}={all_evs[best_of_bad]:+.6f}\n"
+            f"→ Try INSTRUMENT=BTC/USD or PRIMARY_TF=1d")
         return
 
-    labels = barrier_labels(df, primary)
-    models, scaler, meta = train_meta_model(df, primary, labels)
+    best_preset = sweep["best_preset"]
+    best_labels = sweep["best_labels"]
+    best_stats = sweep["best_stats"]
+    logger.info("Using barrier: %s | EV=%.6f | win=%.2f%%",
+                sweep["best_name"], sweep["best_ev"], best_stats["win"] * 100)
+
+    models, scaler, meta = train_meta_model(df, primary, best_labels)
     if models is None:
         send_tg("⚠️ Training failed"); return
-    bt = backtest(meta.get("cv_predictions", []), df, labels)
 
     if not meta.get("gate2_passed", False):
         send_tg(
             f"🛑 <b>GATE 2 FAILED</b>\n"
+            f"Barrier {sweep['best_name']} EV+ but ML filter no edge\n"
             f"Best: {meta.get('best_model_acc', 0):.4f} | "
             f"Random: {meta.get('random_acc', 0):.4f}")
         return
@@ -957,7 +881,7 @@ def main():
     hurst_val = df["hurst_100"].iloc[-2]
     hurst = 0.5 if pd.isna(hurst_val) else float(hurst_val)
     if HURST_MODE == "VETO" and hurst < HURST_MIN:
-        logger.info("VETO: Hurst %.3f < %.2f", hurst, HURST_MIN)
+        logger.info("VETO: Hurst %.3f", hurst)
         send_tg(f"🚫 <b>VETO</b> — Hurst {hurst:.3f} < {HURST_MIN}")
         return
 
@@ -966,7 +890,7 @@ def main():
 
     cur_p = int(primary.iloc[-2])
     if cur_p == 0:
-        logger.info("No primary at current bar")
+        logger.info("No primary — HOLD")
         if NOTIFY_HOLD: send_tg("⏸️ No primary")
         return
 
@@ -976,28 +900,29 @@ def main():
 
     cur_vol = float(df["atr_pct"].iloc[-2])
     if cur_vol < 1e-6 or not np.isfinite(cur_vol): cur_vol = 0.003
+    be = best_preset["sl"] / (best_preset["tp"] + best_preset["sl"])
     cost_rel = (COST_BPS / 10000.0) / cur_vol
-    threshold = BARRIER["sl"] / (BARRIER["tp"] + BARRIER["sl"]) + cost_rel / (BARRIER["tp"] + BARRIER["sl"]) + TRADE_MARGIN
+    threshold = be + cost_rel / (best_preset["tp"] + best_preset["sl"]) + TRADE_MARGIN
     if threshold > 0.85:
-        logger.warning("Threshold %.4f > 0.85 — vol too low", threshold); return
+        logger.warning("Threshold too high"); return
 
     logger.info("═══ DECISION ═══")
-    logger.info("Primary=%+d | p=%.4f | thr=%.4f | Hurst=%.3f",
-                cur_p, p_profit, threshold, hurst)
+    logger.info("Primary=%+d | p=%.4f | thr=%.4f | barrier=%s",
+                cur_p, p_profit, threshold, sweep["best_name"])
 
     if p_profit < threshold:
         logger.info("ML filter: HOLD")
         if NOTIFY_HOLD:
-            send_tg(f"⏸️ ML filter | p={p_profit:.2%} < {threshold:.2%}")
+            send_tg(f"⏸️ p={p_profit:.2%} < {threshold:.2%}")
         return
 
     atr = float(df["atr_14"].iloc[-2])
     lot = risk.position_size(atr, hurst)
     if lot < CFG["min_lot"]:
-        send_tg("⚠️ Lot below minimum"); return
+        send_tg("⚠️ Lot below min"); return
 
     entry = float(df["close"].iloc[-2])
-    sl, tp = risk.compute_sl_tp(entry, cur_p, atr)
+    sl, tp = risk.compute_sl_tp(entry, cur_p, atr, best_preset)
     dir_str = "🟢 <b>BUY</b>" if cur_p == 1 else "🔴 <b>SELL</b>"
 
     msg = (
@@ -1009,26 +934,20 @@ def main():
         f"Lot:   <code>{lot:.4f}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"p_profit: {p_profit:.2%} > {threshold:.2%}\n"
-        f"Hurst: {hurst:.3f} | ATR: {atr:.4f}\n"
-        f"EV net: {ev['ev_net']:+.6f}\n"
-        f"Barrier: {BARRIER_MODE}")
-    if bt.get("ml_filtered", {}).get("n", 0) > 0:
-        m = bt["ml_filtered"]
-        msg += (f"\n\n📊 Backtest (n={m['n']}):\n"
-                f"Win {m['win']:.1%} | Ret {m['ret']:+.2%}\n"
-                f"Sharpe {m['sharpe']:.2f} | PF {m['pf']:.2f}")
+        f"Barrier: {sweep['best_name']} (EV={sweep['best_ev']:+.6f})\n"
+        f"Win rate backtest: {best_stats['win']:.2%}\n"
+        f"Hurst: {hurst:.3f} | ATR: {atr:.4f}")
     send_tg(msg)
 
     new_state = {
         "instrument": INSTRUMENT, "primary_tf": PRIMARY_TF,
-        "primary_mode": PRIMARY_MODE, "barrier_mode": BARRIER_MODE,
+        "primary_mode": PRIMARY_MODE, "best_barrier": sweep["best_name"],
         "balance": risk.balance, "halted": risk.halted,
         "daily_pnl": risk.daily_pnl,
         "consecutive_losses": risk.consecutive_losses,
         "peak_equity": risk.peak_equity,
         "last_signal": cur_p, "last_p_profit": p_profit,
-        "last_threshold": threshold, "last_ev_net": ev["ev_net"],
-        "last_backtest": bt,
+        "last_threshold": threshold, "last_ev_net": sweep["best_ev"],
         "last_update": datetime.now(timezone.utc).isoformat()}
     for _ in range(2):
         if save_state(new_state, state.get("etag")): break
