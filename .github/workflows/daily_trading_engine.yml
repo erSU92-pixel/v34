@@ -7,10 +7,10 @@ on:
     
   workflow_dispatch: # Tombol eksekusi manual di tab Actions
 
-# MENUTUP CELAH BENTROK: Mencegah job berjalan bersamaan/tumpang tindih
+# KOREKSI: Mengubah cancel-in-concurrency menjadi cancel-in-progress yang valid
 concurrency:
   group: institutional-engine-pipeline
-  cancel-in-concurrency: false
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -51,10 +51,8 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           
-          # Ambil pembaruan terbaru dari remote dengan autostash untuk amankan state
           git pull origin main --rebase --autostash || echo "Pull rebase skipped"
           
-          # Tambahkan file state, commit, lalu push
           git add signal_state.json
           git commit -m "chore: update signal state [skip ci]" || echo "No changes to commit"
           git push origin main
