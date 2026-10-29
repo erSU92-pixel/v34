@@ -1,0 +1,38 @@
+name: XAUUSD Quant Bot
+
+on:
+  schedule:
+    - cron: "5 * * * *"   # setiap jam pada menit ke-5 (bar 1H sudah closed)
+  workflow_dispatch:       # manual trigger
+
+concurrency:
+  group: xauusd-bot
+  cancel-in-progress: false   # jangan batalkan run yang sedang berjalan
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install numpy pandas scikit-learn scipy requests
+
+      - name: Run bot
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          ACCOUNT_BALANCE: "10000"
+          RISK_PCT: "0.01"
+        run: python 10pilar.py
