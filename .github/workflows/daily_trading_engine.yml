@@ -5,9 +5,8 @@ on:
     # Berjalan otomatis setiap 15 menit dari hari Senin sampai Jumat (24/5)
     - cron: '*/15 * * * 1-5'
     
-  workflow_dispatch: # Tombol eksekusi manual kapan saja di tab Actions
+  workflow_dispatch: # Tombol eksekusi manual di tab Actions
 
-# BLOK IZIN TULIS (PENTING untuk mengatasi error 403)
 permissions:
   contents: write
 
@@ -40,9 +39,12 @@ jobs:
           python main.py
 
       - name: Commit and Push Updated Signal State
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git add signal_state.json
           git commit -m "chore: update signal state [skip ci]" || echo "No changes to commit"
           git push
