@@ -2,20 +2,19 @@ name: XAUUSD London Breakout
 
 on:
   schedule:
-    # Setiap jam pada menit ke-5 (bar 1H sudah closed)
     - cron: "5 * * * *"
   workflow_dispatch:
     inputs:
       backtest_mode:
-        description: "Backtest mode (1=test historis, 0=live)"
+        description: "1=backtest historis, 0=live"
         required: false
-        default: "0"
+        default: "1"
         type: choice
         options:
           - "0"
           - "1"
       backtest_days:
-        description: "Jumlah hari backtest (default 14)"
+        description: "Jumlah hari backtest"
         required: false
         default: "14"
 
@@ -29,58 +28,41 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+      - run: pip install -r requirements.txt
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run London Breakout Bot
+      - name: Run London Breakout
         env:
-          # === SECRETS (set di repo Settings → Secrets) ===
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
 
-          # === INSTRUMENT ===
           SYMBOL: "XAU/USD"
-
-          # === RISK (default 0.3% — JANGAN naikkan sebelum 3 bulan konsisten) ===
           ACCOUNT_BALANCE: "10000"
           RISK_PCT: "0.003"
 
-          # === TIMING (ubah jika broker GMT+2/3) ===
           SERVER_TZ_OFFSET: "0"
           ASIA_START_HOUR: "3"
           ASIA_END_HOUR: "8"
           ENTRY_HOUR: "8"
           CLOSE_HOUR: "21"
 
-          # === FILTER RANGE ===
           RANGE_MIN_PCT: "0.0030"
           RANGE_MAX_PCT: "0.0160"
           SL_MAX_PCT: "0.0060"
-
-          # === BARRIER ===
           TP_R: "2.5"
           BE_R: "1.5"
 
-          # === BACKTEST MODE ===
-          # 1 = langsung test historis (tidak nunggu jam 08:00 UTC)
-          # 0 = live mode (cron tiap jam)
-          # Saat manual trigger: ambil dari input, default "0"
-          # Saat cron: default "0"
+          # Saat manual trigger: ambil input (default 1 = backtest)
+          # Saat cron otomatis: default 0 = live
           BACKTEST_MODE: ${{ github.event.inputs.backtest_mode || '0' }}
           BACKTEST_DAYS: ${{ github.event.inputs.backtest_days || '14' }}
 
-          # === NOTIFIKASI ===
           NOTIFY_HOLD: "0"
         run: python london_breakout.py
