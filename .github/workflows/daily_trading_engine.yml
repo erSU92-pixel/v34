@@ -7,6 +7,11 @@ on:
     
   workflow_dispatch: # Tombol eksekusi manual di tab Actions
 
+# MENUTUP CELAH BENTROK: Mencegah job berjalan bersamaan/tumpang tindih
+concurrency:
+  group: institutional-engine-pipeline
+  cancel-in-concurrency: false
+
 permissions:
   contents: write
 
@@ -38,7 +43,7 @@ jobs:
         run: |
           python main.py
 
-      - name: Commit, Pull Rebase, and Push
+      - name: Safe Sync, Commit, and Push State
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -46,12 +51,10 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           
-          # 1. Add dan Commit lokal terlebih dahulu
+          # Ambil pembaruan terbaru dari remote dengan autostash untuk amankan state
+          git pull origin main --rebase --autostash || echo "Pull rebase skipped"
+          
+          # Tambahkan file state, commit, lalu push
           git add signal_state.json
           git commit -m "chore: update signal state [skip ci]" || echo "No changes to commit"
-          
-          # 2. Pull rebase untuk mengambil pembaruan remote tanpa konflik
-          git pull origin main --rebase || echo "Rebase skipped"
-          
-          # 3. Push hasil akhir ke GitHub
           git push origin main
