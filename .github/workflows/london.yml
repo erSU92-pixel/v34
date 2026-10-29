@@ -16,7 +16,13 @@ on:
       backtest_days:
         description: "Jumlah hari backtest"
         required: false
-        default: "14"
+        default: "60"
+        type: choice
+        options:
+          - "14"
+          - "30"
+          - "60"
+          - "90"
 
 concurrency:
   group: london-bo
@@ -59,10 +65,10 @@ jobs:
           TP_R: "2.5"
           BE_R: "1.5"
 
-          # Saat manual trigger: ambil input (default 1 = backtest)
-          # Saat cron otomatis: default 0 = live
-          BACKTEST_MODE: ${{ github.event.inputs.backtest_mode || '0' }}
-          BACKTEST_DAYS: ${{ github.event.inputs.backtest_days || '14' }}
+          # === 3 BARIS YANG BERUBAH dari versi sebelumnya ===
+          OUTPUT_SIZE: "3000"     # ambil 3000 bar (~125 hari data 1H)
+          BACKTEST_MODE: ${{ github.event.inputs.backtest_mode || '1' }}
+          BACKTEST_DAYS: ${{ github.event.inputs.backtest_days || '60' }}
 
           NOTIFY_HOLD: "0"
         run: python london_breakout.py
