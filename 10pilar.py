@@ -1,20 +1,7 @@
 """
-================================================================================
-XAUUSD QUANT BOT v9.0 — ALL 4 PATHS IMPLEMENTED
-================================================================================
-Paths:
-    [A] Timeframe Shift       Multi-TF (1H+4H+1D) + HTF-aligned primary
-    [B] Alternative Data      FRED real yield + DXY regime + ETF flow proxy
-    [C] Instrument Pivot      Config-driven instrument abstraction
-    [D] Strategy Refinement   Refined primary + isotonic probability calibration
-
-Framework: López de Prado — Triple Barrier + Meta-Labeling + Purged CV
-================================================================================
-Sumber data (semua gratis):
-    - Twelve Data    : OHLCV multi-TF + DXY + ETF (8 req/min free tier)
-    - FRED           : DGS10, CPIAUCSL (120 req/min, no key needed)
-    - pandas-datareader : wrapper FRED
-================================================================================
+XAUUSD QUANT BOT v9.1 — ALL 4 PATHS, ALL FIXES
+v9.1 fixes: 1day interval, UUP proxy DXY, FRED via requests,
+            NaN-safe int casting, auto-fill alt features
 """
 from __future__ import annotations
 
@@ -24,20 +11,22 @@ import time
 import json
 import math
 import logging
+from io import StringIO
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier,
+)
 from sklearn.dummy import DummyClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
-from sklearn.calibration import CalibratedClassifierCV
 
 # =============================================================================
-# KONFIGURASI
+# LOGGING
 # =============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -45,87 +34,87 @@ logging.basicConfig(
 )
 logger = logging.getLogger("XAUUSD_BOT")
 
+# =============================================================================
+# ENV
+# =============================================================================
 TWELVE_DATA_KEY = os.getenv("TWELVEDATA_API_KEY")
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
 GIST_ID         = os.getenv("GIST_ID")
 GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 
-# --- PATH C: Instrument Config ---
+# =============================================================================
+# PATH C: INSTRUMENT CONFIG
+# =============================================================================
 INSTRUMENT = os.getenv("INSTRUMENT", "XAU/USD")
-
 INSTRUMENTS = {
-    "XAU/USD": {
-        "symbol": "XAU/USD",
-        "contract_size": 100,       # 1 lot = 100 oz
-        "tick_size": 0.01,
-        "spread_buffer": 0.30,
-        "slippage_buffer": 0.15,
-        "session_start_utc": 7,
-        "session_end_utc": 16,
-        "min_lot": 0.01,
-        "max_lot": 5.0,
-        "ref_etf": "GLD",           # ETF flow proxy
-    },
-    "BTC/USD": {
-        "symbol": "BTC/USD",
-        "contract_size": 1,         # 1 lot = 1 BTC
-        "tick_size": 0.01,
-        "spread_buffer": 20.0,
-        "slippage_buffer": 10.0,
-        "session_start_utc": 0,     # crypto 24/7
-        "session_end_utc": 24,
-        "min_lot": 0.001,
-        "max_lot": 1.0,
-        "ref_etf": "IBIT",
-    },
-    "EUR/USD": {
-        "symbol": "EUR/USD",
-        "contract_size": 100000,    # 1 lot = 100k EUR
-        "tick_size": 0.00001,
-        "spread_buffer": 0.00010,
-        "slippage_buffer": 0.00005,
-        "session_start_utc": 7,
-        "session_end_utc": 16,
-        "min_lot": 0.01,
-        "max_lot": 10.0,
-        "ref_etf": None,
-    },
+    "XAU/USD": dict(symbol="XAU/USD", contract_size=100, tick_size=0.01,
+                    spread_buffer=0.30, slippage_buffer=0.15,
+                    session_start=7, session_end=16,
+                    min_lot=0.01, max_lot=5.0, ref_etf="GLD", ref_dxy="UUP"),
+    "BTC/USD": dict(symbol="BTC/USD", contract_size=1, tick_size=0.01,
+                    spread_buffer=20.0, slippage_buffer=10.0,
+                    session_start=0, session_end=24,
+                    min_lot=0.001, max_lot=1.0, ref_etf="IBIT", ref_dxy="UUP"),
+    "EUR/USD": dict(symbol="EUR/USD", contract_size=100000, tick_size=0.00001,
+                    spread_buffer=0.00010, slippage_buffer=0.00005,
+                    session_start=7, session_end=16,
+                    min_lot=0.01, max_lot=10.0, ref_etf=None, ref_dxy="UUP"),
 }
-
 if INSTRUMENT not in INSTRUMENTS:
-    raise ValueError(f"Unknown instrument: {INSTRUMENT}. Options: {list(INSTRUMENTS)}")
+    raise ValueError(f"Unknown instrument: {INSTRUMENT}")
 CFG = INSTRUMENTS[INSTRUMENT]
 
-# --- PATH A: Timeframe Config ---
-MULTI_TF = os.getenv("MULTI_TF", "1") == "1"
-PRIMARY_TF = os.getenv("PRIMARY_TF", "4h")   # Primary TF untuk decision
-PRIMARY_OUTPUT_SIZE = 3000                    # 4H × 3000 bars ≈ 500 hari
-MTF_OUTPUT_SIZE = 500                         # 1H/1D untuk confluence
+# =============================================================================
+# PATH A: TIMEFRAME
+# =============================================================================
+MULTI_TF            = os.getenv("MULTI_TF", "1") == "1"
+PRIMARY_TF          = os.getenv("PRIMARY_TF", "4h")
+PRIMARY_OUTPUT_SIZE = int(os.getenv("PRIMARY_OUTPUT_SIZE", "3000"))
+MTF_OUTPUT_SIZE     = int(os.getenv("MTF_OUTPUT_SIZE", "500"))
 
-# --- PATH B: Alt Data ---
-ENABLE_FRED = os.getenv("ENABLE_FRED", "1") == "1"
+# Interval mapping — Twelve Data uses: 1min, 5min, 15min, 30min, 45min,
+# 1h, 2h, 4h, 8h, 1day, 1week, 1month
+INTERVAL_MAP = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "4h": "4h", "1d": "1day", "1day": "1day",
+    "1w": "1week", "1M": "1month",
+}
+def td_interval(tf: str) -> str:
+    if tf in INTERVAL_MAP:
+        return INTERVAL_MAP[tf]
+    if tf in INTERVAL_MAP.values():
+        return tf
+    raise ValueError(f"Unknown interval: {tf}")
+
+# =============================================================================
+# PATH B: ALT DATA
+# =============================================================================
+ENABLE_FRED     = os.getenv("ENABLE_FRED", "1") == "1"
 ENABLE_ETF_FLOW = os.getenv("ENABLE_ETF_FLOW", "1") == "1"
-FRED_START = os.getenv("FRED_START", "2023-01-01")
+ENABLE_DXY      = os.getenv("ENABLE_DXY", "1") == "1"
+FRED_START      = os.getenv("FRED_START", "2023-01-01")
 
-# --- PATH D: Refined Primary ---
-REFINED_PRIMARY = os.getenv("REFINED_PRIMARY", "1") == "1"
-RSI_EXTREME_LOW  = float(os.getenv("RSI_EXTREME_LOW",  "30"))
+# =============================================================================
+# PATH D: REFINED PRIMARY
+# =============================================================================
+REFINED_PRIMARY  = os.getenv("REFINED_PRIMARY", "1") == "1"
+RSI_EXTREME_LOW  = float(os.getenv("RSI_EXTREME_LOW", "30"))
 RSI_EXTREME_HIGH = float(os.getenv("RSI_EXTREME_HIGH", "70"))
 VOLUME_MULT      = float(os.getenv("VOLUME_MULT", "1.2"))
-CALIBRATE        = os.getenv("CALIBRATE", "1") == "1"
 
-# --- BARRIER ---
-TP_MULT = float(os.getenv("TP_MULT", "2.0"))
-SL_MULT = float(os.getenv("SL_MULT", "1.0"))
+# =============================================================================
+# BARRIER & RISK
+# =============================================================================
+TP_MULT          = float(os.getenv("TP_MULT", "2.0"))
+SL_MULT          = float(os.getenv("SL_MULT", "1.0"))
 MAX_HOLDING_BARS = int(os.getenv("MAX_HOLDING_BARS", "12"))
 PURGE_EMBARGO    = int(os.getenv("PURGE_EMBARGO", "24"))
 N_CV_SPLITS      = 5
 MIN_PRIMARY_BARS = 100
 
-# --- THRESHOLD & RISK ---
-COST_BPS     = float(os.getenv("COST_BPS", "3.5"))
-TRADE_MARGIN = float(os.getenv("TRADE_MARGIN", "0.03"))
+COST_BPS        = float(os.getenv("COST_BPS", "3.5"))
+TRADE_MARGIN    = float(os.getenv("TRADE_MARGIN", "0.03"))
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000"))
 RISK_PCT        = float(os.getenv("RISK_PCT", "0.01"))
 ATR_MULT_SL     = 1.5
@@ -170,17 +159,20 @@ class ResilientSession:
                 time.sleep((2 ** attempt) + np.random.uniform(0, 1))
         raise RuntimeError(f"HTTP failed: {method} {url}")
 
-
 http = ResilientSession()
 
 # =============================================================================
-# DATA: Twelve Data multi-TF (Path A) + DXY/ETF (Path B)
+# DATA FETCH: Twelve Data
 # =============================================================================
 def fetch_td(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol, "interval": interval, "outputsize": outputsize,
-        "apikey": TWELVE_DATA_KEY, "format": "JSON", "timezone": "UTC",
+        "symbol": symbol,
+        "interval": td_interval(interval),
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_KEY,
+        "format": "JSON",
+        "timezone": "UTC",
     }
     resp = http.request("GET", url, params=params)
     data = resp.json()
@@ -198,88 +190,127 @@ def fetch_td(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"])
 
+    # Reject future bars
     now = pd.Timestamp.now(tz="UTC")
     df = df[df.index <= now]
-    return df
+    if len(df) < 10:
+        raise RuntimeError(f"TD [{symbol} {interval}] too few bars after filter")
+    return df.reset_index()
 
 
 def fetch_multi_tf_ohlcv() -> Dict[str, pd.DataFrame]:
-    """Fetch primary TF + context TFs (1H, 1D)."""
     result = {}
     primary = fetch_td(CFG["symbol"], PRIMARY_TF, PRIMARY_OUTPUT_SIZE)
-    result[PRIMARY_TF] = primary.reset_index()
+    result[PRIMARY_TF] = primary
     logger.info("TD [%s %s]: %d bars | %s → %s",
-                CFG["symbol"], PRIMARY_TF, len(result[PRIMARY_TF]),
-                result[PRIMARY_TF]["datetime"].iloc[0],
-                result[PRIMARY_TF]["datetime"].iloc[-1])
+                CFG["symbol"], PRIMARY_TF, len(primary),
+                primary["datetime"].iloc[0], primary["datetime"].iloc[-1])
 
     if MULTI_TF:
-        for tf, size in [("1h", MTF_OUTPUT_SIZE), ("1d", MTF_OUTPUT_SIZE)]:
+        for tf in ["1h", "1d"]:
             if tf == PRIMARY_TF:
                 continue
             try:
-                df = fetch_td(CFG["symbol"], tf, size).reset_index()
+                df = fetch_td(CFG["symbol"], tf, MTF_OUTPUT_SIZE)
                 result[tf] = df
                 logger.info("TD [%s %s]: %d bars", CFG["symbol"], tf, len(df))
             except Exception as e:
-                logger.warning("MTF fetch [%s] failed: %s", tf, e)
+                logger.warning("MTF [%s] failed: %s", tf, e)
 
-    # Verify freshness on primary
+    # Freshness
     now = pd.Timestamp.now(tz="UTC")
-    age = (now - result[PRIMARY_TF]["datetime"].iloc[-1]).total_seconds() / 60
-    if age > 240:  # 4H bar boleh up to 4h+margin
-        raise RuntimeError(f"Primary TF stale: {age:.0f} min")
-
+    age_min = (now - primary["datetime"].iloc[-1]).total_seconds() / 60
+    max_age = {"1h": 120, "4h": 300, "1d": 1500}.get(PRIMARY_TF, 300)
+    if age_min > max_age:
+        raise RuntimeError(f"Primary TF stale: {age_min:.0f}min > {max_age}")
+    logger.info("Data age: %.0f min (max %d)", age_min, max_age)
     return result
 
 
-def fetch_dxy(primary_dt: pd.Series) -> Optional[pd.DataFrame]:
+# =============================================================================
+# DATA FETCH: DXY (via UUP ETF proxy)
+# =============================================================================
+def fetch_dxy() -> Optional[pd.DataFrame]:
+    """DXY proxy via UUP ETF — valid di Twelve Data gratis tier."""
+    if not ENABLE_DXY:
+        return None
     try:
-        dxy = fetch_td("DXY", PRIMARY_TF, PRIMARY_OUTPUT_SIZE).reset_index()
-        return dxy[["datetime", "close"]].rename(columns={"close": "dxy_close"})
+        dxy = fetch_td(CFG["ref_dxy"], PRIMARY_TF, PRIMARY_OUTPUT_SIZE)
+        out = dxy[["datetime", "close"]].rename(columns={"close": "dxy_close"})
+        logger.info("DXY proxy [%s]: %d bars", CFG["ref_dxy"], len(out))
+        return out
     except Exception as e:
-        logger.warning("DXY failed: %s", e)
+        logger.warning("DXY proxy failed: %s", e)
         return None
 
 
+# =============================================================================
+# DATA FETCH: ETF Flow
+# =============================================================================
 def fetch_etf_flow() -> Optional[pd.DataFrame]:
-    """ETF flow proxy — bukan COT langsung, tapi arah institusional."""
     if not ENABLE_ETF_FLOW or not CFG["ref_etf"]:
         return None
     try:
-        etf = fetch_td(CFG["ref_etf"], "1d", 400).reset_index()
-        etf = etf[["datetime", "close", "volume"]].rename(
+        etf = fetch_td(CFG["ref_etf"], "1d", 400)
+        out = etf[["datetime", "close", "volume"]].rename(
             columns={"close": "etf_close", "volume": "etf_volume"}
         )
-        logger.info("ETF [%s]: %d bars", CFG["ref_etf"], len(etf))
-        return etf
+        logger.info("ETF [%s]: %d bars", CFG["ref_etf"], len(out))
+        return out
     except Exception as e:
         logger.warning("ETF [%s] failed: %s", CFG["ref_etf"], e)
         return None
 
 
+# =============================================================================
+# DATA FETCH: FRED (via public CSV endpoint, no extra library)
+# =============================================================================
+def _fetch_fred_csv(series_id: str, start: str) -> Optional[pd.Series]:
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
+    try:
+        r = http.request("GET", url)
+        if r.status_code != 200:
+            logger.warning("FRED [%s] HTTP %d", series_id, r.status_code)
+            return None
+        df = pd.read_csv(StringIO(r.text))
+        if df.shape[1] < 2:
+            return None
+        df.columns = ["datetime", "value"]
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["value"])
+        return df.set_index("datetime")["value"]
+    except Exception as e:
+        logger.warning("FRED [%s] failed: %s", series_id, e)
+        return None
+
+
 def fetch_fred() -> Optional[pd.DataFrame]:
-    """FRED real yield (DGS10 - CPI YoY). Path B."""
+    """Real yield = DGS10 - CPI_YoY. No API key required."""
     if not ENABLE_FRED:
         return None
     try:
-        import pandas_datareader as pdr
-        t10y = pdr.get_data_fred("DGS10", start=FRED_START)
-        cpi = pdr.get_data_fred("CPIAUCSL", start=FRED_START)
-        cpi_yoy = cpi.pct_change(12).fillna(0) * 100
-        real_yield = (t10y["DGS10"] - cpi_yoy["CPIAUCSL"]).ffill()
+        t10y = _fetch_fred_csv("DGS10", FRED_START)
+        cpi = _fetch_fred_csv("CPIAUCSL", FRED_START)
+        if t10y is None or cpi is None or len(t10y) < 10 or len(cpi) < 10:
+            return None
+        cpi_yoy = cpi.pct_change(12) * 100
+        real_yield = (t10y - cpi_yoy).dropna()
+        if len(real_yield) < 10:
+            return None
         ry = real_yield.reset_index()
         ry.columns = ["datetime", "real_yield"]
         ry["datetime"] = pd.to_datetime(ry["datetime"], utc=True)
         logger.info("FRED real yield: %d obs | last %.2f",
-                    len(ry), ry["real_yield"].iloc[-1])
+                    len(ry), float(ry["real_yield"].iloc[-1]))
         return ry
     except Exception as e:
         logger.warning("FRED failed: %s", e)
         return None
 
+
 # =============================================================================
-# FEATURES (10 PILAR + PATH B features)
+# FEATURES (10 PILAR)
 # =============================================================================
 def _rolling_hurst(series: np.ndarray) -> float:
     if len(series) < 20:
@@ -312,18 +343,22 @@ def _rolling_entropy(series: np.ndarray, bins: int = 10) -> float:
     return float(-np.sum(probs * np.log(probs + 1e-12)))
 
 
+def _safe_int(s: pd.Series) -> pd.Series:
+    """astype(int) yang aman untuk NaN/inf."""
+    return s.fillna(0).replace([np.inf, -np.inf], 0).astype(int)
+
+
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Features pada PRIMARY TF."""
     df = df.copy()
 
-    # Pilar 1: Trend
+    # Pilar 1
     for span in (9, 21, 50, 200):
         df[f"ema_{span}"] = df["close"].ewm(span=span, adjust=False).mean()
     df["sma_200"] = df["close"].rolling(200).mean()
     roll_std = df["close"].rolling(20).std().replace(0, np.nan)
     df["zscore_20"] = (df["close"] - df["close"].rolling(20).mean()) / roll_std
 
-    # Pilar 2: Momentum
+    # Pilar 2
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -336,186 +371,193 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["stoch_k"] = 100 * (df["close"] - low_5) / rng
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
 
-    # Pilar 4: Volatilitas
+    # Pilar 4
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
         (df["low"] - df["close"].shift()).abs(),
     ], axis=1).max(axis=1)
     df["atr_14"] = tr.rolling(14).mean().replace(0, np.nan).ffill()
-    df["atr_pct"] = df["atr_14"] / df["close"]
+    df["atr_pct"] = (df["atr_14"] / df["close"]).replace([np.inf, -np.inf], np.nan)
 
     df["donchian_high_20"] = df["high"].rolling(20).max()
     df["donchian_low_20"] = df["low"].rolling(20).min()
     dc = (df["donchian_high_20"] - df["donchian_low_20"]).replace(0, np.nan)
     df["donchian_pos"] = (df["close"] - df["donchian_low_20"]) / dc
 
-    # Volume spike (Path D)
-    vol_mean = df["volume"].rolling(20).mean().replace(0, np.nan) if "volume" in df else pd.Series(1, index=df.index)
-    df["volume_ratio"] = (df["volume"] / vol_mean).fillna(1.0) if "volume" in df else 1.0
+    if "volume" in df.columns:
+        vmean = df["volume"].rolling(20).mean().replace(0, np.nan)
+        df["volume_ratio"] = (df["volume"] / vmean).fillna(1.0)
+    else:
+        df["volume_ratio"] = 1.0
 
-    # Pilar 5: Regime
+    # Pilar 5
     df["hurst_100"] = df["close"].rolling(100).apply(_rolling_hurst, raw=True)
     df["entropy_50"] = df["close"].rolling(50).apply(_rolling_entropy, raw=True)
 
-    # Pilar 10: Seasonality
+    # Pilar 10
     df["datetime_utc"] = pd.to_datetime(df["datetime"], utc=True)
     df["hour"] = df["datetime_utc"].dt.hour
     df["in_session"] = (
-        (df["hour"] >= CFG["session_start_utc"]) &
-        (df["hour"] < CFG["session_end_utc"])
+        (df["hour"] >= CFG["session_start"]) &
+        (df["hour"] < CFG["session_end"])
     ).astype(int)
 
     return df
 
 
 def add_multi_tf_confluence(df: pd.DataFrame, mtf: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Path A: tambahkan trend alignment dari 1D dan 1H."""
-    if not MULTI_TF:
-        df["htf_1d_aligned"] = 1
-        df["htf_1h_aligned"] = 1
-        df["htf_score"] = 3
-        return df
+    """Path A: HTF trend alignment."""
+    df = df.copy().sort_values("datetime").reset_index(drop=True)
 
-    def tf_trend(tf_df: pd.DataFrame) -> pd.DataFrame:
-        t = tf_df.copy()
+    # trend_primary dengan NaN-safe conversion
+    diff = df["close"] - df["sma_200"]
+    df["trend_primary"] = _safe_int(np.sign(diff).fillna(0))
+
+    def get_tf_trend(tf_df: pd.DataFrame, name: str) -> None:
+        t = tf_df.copy().sort_values("datetime").reset_index(drop=True)
         t["ema50"] = t["close"].ewm(span=50, adjust=False).mean()
-        t["trend"] = np.sign(t["close"] - t["ema50"]).astype(int)
-        return t[["datetime", "trend"]]
+        t["trend"] = np.sign((t["close"] - t["ema50"]).fillna(0))
+        t = t[["datetime", "trend"]].rename(columns={"trend": f"trend_{name}"})
+        merged = pd.merge_asof(df, t, on="datetime", direction="backward")
+        df[f"trend_{name}"] = _safe_int(merged[f"trend_{name}"].fillna(0))
 
-    if "1d" in mtf:
-        daily = tf_trend(mtf["1d"])
-        # Merge asof: gunakan bar 1D terakhir yang ≤ timestamp primary
-        df = pd.merge_asof(
-            df.sort_values("datetime"),
-            daily.sort_values("datetime").rename(columns={"trend": "trend_1d"}),
-            on="datetime", direction="backward",
-        )
+    if MULTI_TF:
+        if "1d" in mtf:
+            get_tf_trend(mtf["1d"], "1d")
+        else:
+            df["trend_1d"] = 0
+        if "1h" in mtf:
+            get_tf_trend(mtf["1h"], "1h")
+        else:
+            df["trend_1h"] = 0
     else:
         df["trend_1d"] = 0
-
-    if "1h" in mtf:
-        hourly = tf_trend(mtf["1h"])
-        df = pd.merge_asof(
-            df.sort_values("datetime"),
-            hourly.sort_values("datetime").rename(columns={"trend": "trend_1h"}),
-            on="datetime", direction="backward",
-        )
-    else:
         df["trend_1h"] = 0
 
-    df["trend_primary"] = np.sign(df["close"] - df["sma_200"]).astype(int)
-    df["trend_1d"] = df["trend_1d"].fillna(0).astype(int)
-    df["trend_1h"] = df["trend_1h"].fillna(0).astype(int)
     df["htf_score"] = df["trend_primary"] + df["trend_1d"] + df["trend_1h"]
-    df["htf_1d_aligned"] = (df["trend_1d"] == df["trend_primary"]).astype(int)
-    df["htf_1h_aligned"] = (df["trend_1h"] == df["trend_primary"]).astype(int)
+    df["htf_1d_aligned"] = _safe_int((df["trend_1d"] == df["trend_primary"]).astype(int))
+    df["htf_1h_aligned"] = _safe_int((df["trend_1h"] == df["trend_primary"]).astype(int))
     return df
 
 
-def add_alt_data(df: pd.DataFrame, dxy: Optional[pd.DataFrame],
-                 etf: Optional[pd.DataFrame], fred: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Path B: DXY regime + ETF flow + FRED real yield."""
-    df = df.copy()
+def add_alt_data(
+    df: pd.DataFrame,
+    dxy: Optional[pd.DataFrame],
+    etf: Optional[pd.DataFrame],
+    fred: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Path B: DXY + ETF flow + FRED real yield, dengan NaN-safe merge."""
+    df = df.copy().sort_values("datetime").reset_index(drop=True)
 
-    # DXY
+    # --- DXY ---
+    dxy_cols = ["dxy_close", "dxy_corr_20", "dxy_above_sma50", "dxy_momentum_20"]
     if dxy is not None and len(dxy) > 20:
-        df = pd.merge_asof(
-            df.sort_values("datetime"),
-            dxy.sort_values("datetime"),
-            on="datetime", direction="backward",
-        )
-        df["dxy_close"] = df["dxy_close"].ffill()
-        dxy_ret = df["dxy_close"].pct_change()
-        xau_ret = df["close"].pct_change()
-        df["dxy_corr_20"] = xau_ret.rolling(20).corr(dxy_ret)
-        df["dxy_above_sma50"] = (df["dxy_close"] > df["dxy_close"].rolling(50).mean()).astype(int)
-        df["dxy_momentum_20"] = df["dxy_close"].pct_change(20)
+        try:
+            merged = pd.merge_asof(
+                df, dxy.sort_values("datetime"), on="datetime", direction="backward"
+            )
+            df["dxy_close"] = merged["dxy_close"].ffill()
+            dxy_ret = df["dxy_close"].pct_change()
+            xau_ret = df["close"].pct_change()
+            df["dxy_corr_20"] = xau_ret.rolling(20).corr(dxy_ret)
+            df["dxy_above_sma50"] = (
+                df["dxy_close"] > df["dxy_close"].rolling(50).mean()
+            ).astype(int)
+            df["dxy_momentum_20"] = df["dxy_close"].pct_change(20)
+        except Exception as e:
+            logger.warning("DXY merge failed: %s", e)
+            for c in dxy_cols:
+                df[c] = 0.0
     else:
-        for c in ["dxy_close", "dxy_corr_20", "dxy_above_sma50", "dxy_momentum_20"]:
+        for c in dxy_cols:
             df[c] = 0.0
 
-    # ETF flow
+    # --- ETF ---
+    etf_cols = ["etf_close", "etf_volume", "etf_flow_zscore", "etf_momentum_5d"]
     if etf is not None and len(etf) > 20:
-        df = pd.merge_asof(
-            df.sort_values("datetime"),
-            etf.sort_values("datetime"),
-            on="datetime", direction="backward",
-        )
-        df["etf_close"] = df["etf_close"].ffill()
-        df["etf_volume"] = df["etf_volume"].ffill()
-        df["etf_flow_zscore"] = (
-            (df["etf_volume"] - df["etf_volume"].rolling(50).mean()) /
-            df["etf_volume"].rolling(50).std().replace(0, np.nan)
-        )
-        df["etf_momentum_5d"] = df["etf_close"].pct_change(5)
+        try:
+            merged = pd.merge_asof(
+                df, etf.sort_values("datetime"), on="datetime", direction="backward"
+            )
+            df["etf_close"] = merged["etf_close"].ffill()
+            df["etf_volume"] = merged["etf_volume"].ffill()
+            vmean = df["etf_volume"].rolling(50).mean()
+            vstd = df["etf_volume"].rolling(50).std().replace(0, np.nan)
+            df["etf_flow_zscore"] = (df["etf_volume"] - vmean) / vstd
+            df["etf_momentum_5d"] = df["etf_close"].pct_change(5)
+        except Exception as e:
+            logger.warning("ETF merge failed: %s", e)
+            for c in etf_cols:
+                df[c] = 0.0
     else:
-        for c in ["etf_close", "etf_volume", "etf_flow_zscore", "etf_momentum_5d"]:
+        for c in etf_cols:
             df[c] = 0.0
 
-    # FRED real yield
+    # --- FRED ---
+    fred_cols = ["real_yield", "real_yield_change_5d", "real_yield_change_20d"]
     if fred is not None and len(fred) > 10:
-        df = pd.merge_asof(
-            df.sort_values("datetime"),
-            fred.sort_values("datetime"),
-            on="datetime", direction="backward",
-        )
-        df["real_yield"] = df["real_yield"].ffill()
-        df["real_yield_change_5d"] = df["real_yield"].diff(5)
-        df["real_yield_change_20d"] = df["real_yield"].diff(20)
+        try:
+            merged = pd.merge_asof(
+                df, fred.sort_values("datetime"), on="datetime", direction="backward"
+            )
+            df["real_yield"] = merged["real_yield"].ffill()
+            df["real_yield_change_5d"] = df["real_yield"].diff(5)
+            df["real_yield_change_20d"] = df["real_yield"].diff(20)
+        except Exception as e:
+            logger.warning("FRED merge failed: %s", e)
+            for c in fred_cols:
+                df[c] = 0.0
     else:
-        for c in ["real_yield", "real_yield_change_5d", "real_yield_change_20d"]:
+        for c in fred_cols:
             df[c] = 0.0
+
+    # NaN audit + fillna(0) — CRITICAL: mencegah training gagal
+    all_alt_cols = dxy_cols + etf_cols + fred_cols
+    for c in all_alt_cols:
+        if c not in df.columns:
+            df[c] = 0.0
+            continue
+        nan_pct = df[c].isna().mean()
+        if nan_pct > 0.5:
+            logger.warning("Feature %s has %.0f%% NaN — degraded", c, nan_pct * 100)
+        df[c] = df[c].fillna(0.0).replace([np.inf, -np.inf], 0.0)
 
     return df
 
 
 FEATURE_COLS = [
-    # Pilar 1-2
     "ema_9", "ema_21", "ema_50", "zscore_20",
     "rsi_14", "stoch_k", "stoch_d",
-    # Pilar 4
     "atr_pct", "donchian_pos", "volume_ratio",
-    # Pilar 5
     "hurst_100", "entropy_50",
-    # Pilar 10
     "in_session",
-    # Path A
     "htf_score", "htf_1d_aligned", "htf_1h_aligned",
-    # Path B
     "dxy_corr_20", "dxy_above_sma50", "dxy_momentum_20",
     "etf_flow_zscore", "etf_momentum_5d",
     "real_yield_change_5d", "real_yield_change_20d",
 ]
 
 # =============================================================================
-# PATH D: REFINED PRIMARY (RSI extreme + volume + HTF alignment)
+# PRIMARY SIGNAL (PATH D)
 # =============================================================================
 def primary_signal(df: pd.DataFrame) -> pd.Series:
-    close = df["close"].values
     rsi = df["rsi_14"].values
     trend_primary = df["trend_primary"].values
-    htf_score = df["htf_score"].values if "htf_score" in df else np.zeros(len(df))
-    vol_ratio = df["volume_ratio"].values if "volume_ratio" in df else np.ones(len(df))
+    htf_score = df["htf_score"].values
+    vol_ratio = df["volume_ratio"].values
 
     primary = np.zeros(len(df), dtype=int)
     valid = np.isfinite(rsi) & np.isfinite(trend_primary)
 
     if REFINED_PRIMARY:
-        # LONG: uptrend + RSI oversold extreme + volume spike + HTF confluence
         long_cond = (
-            valid &
-            (trend_primary == 1) &
-            (rsi < RSI_EXTREME_LOW) &
-            (vol_ratio > VOLUME_MULT) &
-            (htf_score >= 1)               # minimal 2/3 TF align
+            valid & (trend_primary == 1) & (rsi < RSI_EXTREME_LOW) &
+            (vol_ratio > VOLUME_MULT) & (htf_score >= 1)
         )
         short_cond = (
-            valid &
-            (trend_primary == -1) &
-            (rsi > RSI_EXTREME_HIGH) &
-            (vol_ratio > VOLUME_MULT) &
-            (htf_score <= -1)
+            valid & (trend_primary == -1) & (rsi > RSI_EXTREME_HIGH) &
+            (vol_ratio > VOLUME_MULT) & (htf_score <= -1)
         )
     else:
         long_cond = valid & (trend_primary == 1) & (rsi < 40)
@@ -523,10 +565,10 @@ def primary_signal(df: pd.DataFrame) -> pd.Series:
 
     primary[long_cond] = 1
     primary[short_cond] = -1
-
     s = pd.Series(primary, index=df.index, name="primary")
+
     n = len(s)
-    logger.info("═══ PRIMARY (Path D: %s) ═══", "REFINED" if REFINED_PRIMARY else "BASIC")
+    logger.info("═══ PRIMARY (%s) ═══", "REFINED" if REFINED_PRIMARY else "BASIC")
     logger.info("Bars: %d | LONG: %d (%.1f%%) | SHORT: %d (%.1f%%) | NO: %.1f%%",
                 n, (s == 1).sum(), 100 * (s == 1).mean(),
                 (s == -1).sum(), 100 * (s == -1).mean(),
@@ -610,14 +652,17 @@ def ev_check(df: pd.DataFrame, labels: pd.Series) -> Dict[str, float]:
 
     return {
         "n_primary": n_primary, "win_rate": win, "breakeven": breakeven,
-        "edge_pp": (win - breakeven) * 100, "ev_gross": ev_gross, "ev_net": ev_net,
+        "edge_pp": (win - breakeven) * 100,
+        "ev_gross": ev_gross, "ev_net": ev_net,
     }
 
 # =============================================================================
 # PURGED CV
 # =============================================================================
 def purged_kfold_primary(
-    primary_indices: np.ndarray, n_splits: int = N_CV_SPLITS, embargo: int = PURGE_EMBARGO
+    primary_indices: np.ndarray,
+    n_splits: int = N_CV_SPLITS,
+    embargo: int = PURGE_EMBARGO,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     n = len(primary_indices)
     pos = np.arange(n)
@@ -626,6 +671,8 @@ def purged_kfold_primary(
     for k in range(n_splits):
         ts, te = k * fold, min((k + 1) * fold, n)
         test_pos = pos[ts:te]
+        if len(test_pos) < 15:
+            continue
         test_idx = primary_indices[test_pos]
         tmin, tmax = test_idx.min(), test_idx.max()
         train_mask = np.ones(n, dtype=bool)
@@ -633,12 +680,12 @@ def purged_kfold_primary(
             if tmin - embargo <= primary_indices[p] <= tmax + embargo:
                 train_mask[p] = False
         train_pos = pos[train_mask]
-        if len(train_pos) >= 30 and len(test_pos) >= 15:
+        if len(train_pos) >= 30:
             splits.append((train_pos, test_pos))
     return splits
 
 # =============================================================================
-# TRAIN META-MODEL (Path D: isotonic calibration)
+# TRAIN META-MODEL
 # =============================================================================
 def train_meta_model(
     df: pd.DataFrame, primary: pd.Series, labels: pd.Series
@@ -649,9 +696,13 @@ def train_meta_model(
         "gate2_passed": False, "best_model_acc": None,
     }
 
-    valid_mask = ~np.isnan(labels.values) & df[FEATURE_COLS].notna().all(axis=1).values
+    valid_mask = (
+        ~np.isnan(labels.values) &
+        df[FEATURE_COLS].notna().all(axis=1).values
+    )
     if valid_mask.sum() < MIN_PRIMARY_BARS:
-        logger.warning("Primary insufficient: %d", valid_mask.sum())
+        logger.warning("Primary insufficient: %d < %d",
+                       valid_mask.sum(), MIN_PRIMARY_BARS)
         return None, None, meta
 
     idx = np.where(valid_mask)[0]
@@ -659,10 +710,12 @@ def train_meta_model(
     y = labels.values[idx].astype(int)
 
     if len(np.unique(y)) < 2:
+        logger.warning("Single class in labels")
         return None, None, meta
 
     splits = purged_kfold_primary(idx)
     if not splits:
+        logger.warning("No valid CV splits")
         return None, None, meta
 
     logger.info("Training: %d primary samples, %d CV splits", len(idx), len(splits))
@@ -710,22 +763,27 @@ def train_meta_model(
     meta["cv_scores"] = {k: (float(np.mean(v)), float(np.std(v))) for k, v in scores.items()}
 
     logger.info("═══ CV (GATE 2) ═══")
-    logger.info("Dummy: %.4f | Random: %.4f", meta["baseline_acc"], meta["random_acc"])
+    logger.info("Dummy: %.4f | Random: %.4f",
+                meta["baseline_acc"], meta["random_acc"])
     for name, (m, s) in meta["cv_scores"].items():
         logger.info("  %s: %.4f ± %.4f | edge: %+.4f",
                     name.upper(), m, s, m - meta["random_acc"])
 
-    raw_w = {n: max(0.0, m - meta["random_acc"]) for n, (m, _) in meta["cv_scores"].items()}
+    raw_w = {n: max(0.0, m - meta["random_acc"])
+             for n, (m, _) in meta["cv_scores"].items()}
     tw = sum(raw_w.values())
-    meta["model_weights"] = {k: v / tw for k, v in raw_w.items()} if tw > 0 else \
-                            {k: 1.0 / len(raw_w) for k in raw_w}
+    meta["model_weights"] = (
+        {k: v / tw for k, v in raw_w.items()} if tw > 0
+        else {k: 1.0 / len(raw_w) for k in raw_w}
+    )
 
     best = max(m for m, _ in meta["cv_scores"].values())
     meta["best_model_acc"] = best
     meta["gate2_passed"] = (best - meta["random_acc"]) > 0.02
 
     if not meta["gate2_passed"]:
-        logger.critical("❌ GATE 2 FAILED: %.4f vs random %.4f", best, meta["random_acc"])
+        logger.critical("❌ GATE 2 FAILED: %.4f vs random %.4f",
+                        best, meta["random_acc"])
     else:
         logger.info("✅ GATE 2 PASSED")
 
@@ -747,22 +805,24 @@ def train_meta_model(
                         [(FEATURE_COLS[i], f"{imp[i]:.3f}") for i in top])
 
     meta["cv_predictions"] = cv_preds
-    meta["X_all_shape"] = X_all.shape
     return final_models, sc_final, meta
 
 # =============================================================================
 # PREDICT
 # =============================================================================
-def predict_profit_prob(df: pd.DataFrame, models: Dict, scaler: StandardScaler,
-                        meta: Dict) -> Optional[float]:
+def predict_profit_prob(
+    df: pd.DataFrame, models: Dict, scaler: StandardScaler, meta: Dict
+) -> Optional[float]:
     if models is None or scaler is None:
         return None
     row = df.iloc[-2]
     try:
         X = row[FEATURE_COLS].to_numpy(dtype=np.float64).reshape(1, -1)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logger.warning("Feature conversion failed: %s", e)
         return None
     if not np.isfinite(X).all():
+        logger.warning("NaN/Inf in features — skip prediction")
         return None
     Xs = scaler.transform(X)
     weights = meta.get("model_weights", {})
@@ -775,9 +835,10 @@ def predict_profit_prob(df: pd.DataFrame, models: Dict, scaler: StandardScaler,
 # =============================================================================
 # BACKTEST
 # =============================================================================
-def backtest(cv_preds, df, labels) -> Dict[str, Any]:
+def backtest(cv_preds, df: pd.DataFrame, labels: pd.Series) -> Dict[str, Any]:
     if not cv_preds:
         return {}
+
     valid = ~np.isnan(labels.values)
     vol = df["atr_pct"].values
     vol = np.where((vol < 1e-5) | ~np.isfinite(vol), 0.003, vol)
@@ -790,7 +851,8 @@ def backtest(cv_preds, df, labels) -> Dict[str, Any]:
     pnl_all = np.where(lab == 1, TP_MULT * v, -SL_MULT * v) - COST_BPS / 10000.0
     eq_p = np.cumprod(1 + pnl_all)
     primary_m = {
-        "n": int(len(pnl_all)), "win": float((lab == 1).mean()),
+        "n": int(len(pnl_all)),
+        "win": float((lab == 1).mean()),
         "ret": float(eq_p[-1] - 1),
         "sharpe": float(pnl_all.mean() / pnl_all.std()) if pnl_all.std() > 0 else 0.0,
     }
@@ -803,7 +865,8 @@ def backtest(cv_preds, df, labels) -> Dict[str, Any]:
         peak = np.maximum.accumulate(eq)
         dd = (eq - peak) / peak
         ml_m = {
-            "n": int(mask.sum()), "win": float((pnl_ml > 0).mean()),
+            "n": int(mask.sum()),
+            "win": float((pnl_ml > 0).mean()),
             "ret": float(eq[-1] - 1),
             "sharpe": float(pnl_ml.mean() / pnl_ml.std()) if pnl_ml.std() > 0 else 0.0,
             "max_dd": float(dd.min()),
@@ -813,17 +876,19 @@ def backtest(cv_preds, df, labels) -> Dict[str, Any]:
 
     logger.info("═══ BACKTEST ═══")
     logger.info("PRIMARY-ONLY: n=%d | win=%.1f%% | ret=%+.2f%% | sharpe=%.2f",
-                primary_m["n"], primary_m["win"] * 100, primary_m["ret"] * 100, primary_m["sharpe"])
+                primary_m["n"], primary_m["win"] * 100,
+                primary_m["ret"] * 100, primary_m["sharpe"])
     if ml_m:
         logger.info("ML-FILTERED : n=%d | win=%.1f%% | ret=%+.2f%% | dd=%.2f%% | sharpe=%.2f | pf=%.2f",
                     ml_m["n"], ml_m["win"] * 100, ml_m["ret"] * 100,
                     ml_m["max_dd"] * 100, ml_m["sharpe"], ml_m["pf"])
-        logger.info("ML edge vs primary: %+.2f%%", (ml_m["ret"] - primary_m["ret"]) * 100)
+        logger.info("ML edge vs primary: %+.2f%%",
+                    (ml_m["ret"] - primary_m["ret"]) * 100)
 
     return {"primary_only": primary_m, "ml_filtered": ml_m}
 
 # =============================================================================
-# RISK ENGINE (Path C: instrument-aware)
+# RISK ENGINE
 # =============================================================================
 class RiskEngine:
     def __init__(self, balance: float, risk_pct: float, cfg: Dict):
@@ -850,22 +915,23 @@ class RiskEngine:
         if self.halted:
             return True
         if dd >= MAX_DRAWDOWN_PCT:
-            logger.critical("CB: drawdown %.2f%%", dd * 100); self.halted = True
+            logger.critical("CB: drawdown %.2f%%", dd * 100)
+            self.halted = True
         elif dl >= MAX_DAILY_LOSS_PCT:
-            logger.critical("CB: daily loss %.2f%%", dl * 100); self.halted = True
+            logger.critical("CB: daily loss %.2f%%", dl * 100)
+            self.halted = True
         elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            logger.critical("CB: %d consecutive losses", self.consecutive_losses); self.halted = True
+            logger.critical("CB: %d consecutive losses", self.consecutive_losses)
+            self.halted = True
         return self.halted
 
     def position_size(self, atr: float, hurst: float) -> float:
-        """Rumus generic: lot = risk_money / (stop_distance_price × contract_size)."""
         risk_money = self.balance * self.risk_pct
         stop_dist = ATR_MULT_SL * max(atr, self.cfg["tick_size"] * 10)
         loss_per_lot = stop_dist * self.cfg["contract_size"]
         if loss_per_lot <= 0:
             return 0.0
         lot = math.floor((risk_money / loss_per_lot) / self.cfg["min_lot"]) * self.cfg["min_lot"]
-
         if HURST_MODE == "SCALE":
             if hurst < 0.45:
                 lot *= 0.5
@@ -907,7 +973,9 @@ def save_state(state: Dict[str, Any], etag: Optional[str]) -> bool:
     h = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     if etag:
         h["If-Match"] = etag
-    payload = {"files": {"bot_state.json": {"content": json.dumps(state, indent=2, default=str)}}}
+    payload = {"files": {"bot_state.json": {
+        "content": json.dumps(state, indent=2, default=str)
+    }}}
     r = http.request("PATCH", url, headers=h, json=payload)
     if r.status_code == 412:
         logger.warning("Gist ETag mismatch")
@@ -933,7 +1001,8 @@ def send_tg(msg: str) -> bool:
                 ra = int(r.json().get("parameters", {}).get("retry_after", 5))
             except Exception:
                 pass
-            time.sleep(ra + 1); continue
+            time.sleep(ra + 1)
+            continue
         time.sleep(2 ** a)
     return False
 
@@ -941,10 +1010,10 @@ def send_tg(msg: str) -> bool:
 # MAIN
 # =============================================================================
 def main():
-    logger.info("═══ %s BOT v9.0 | INSTRUMENT=%s | PRIMARY_TF=%s ═══",
-                INSTRUMENT, INSTRUMENT, PRIMARY_TF)
-    logger.info("Paths: A(MultiTF)=%s | B(FRED=%s ETF=%s) | C(Instrument=%s) | D(Refined=%s Calib=%s)",
-                MULTI_TF, ENABLE_FRED, ENABLE_ETF_FLOW, INSTRUMENT, REFINED_PRIMARY, CALIBRATE)
+    logger.info("═══ %s BOT v9.1 | TF=%s ═══", INSTRUMENT, PRIMARY_TF)
+    logger.info("Paths: A(MultiTF=%s) B(FRED=%s ETF=%s DXY=%s) C(%s) D(Refined=%s)",
+                MULTI_TF, ENABLE_FRED, ENABLE_ETF_FLOW, ENABLE_DXY,
+                INSTRUMENT, REFINED_PRIMARY)
 
     missing = [n for n, v in [
         ("TWELVEDATA_API_KEY", TWELVE_DATA_KEY),
@@ -961,8 +1030,7 @@ def main():
     content = state.get("content") or {}
     risk = RiskEngine(
         balance=float(content.get("balance", ACCOUNT_BALANCE)),
-        risk_pct=RISK_PCT,
-        cfg=CFG,
+        risk_pct=RISK_PCT, cfg=CFG,
     )
     risk.halted = bool(content.get("halted", False))
     risk.daily_pnl = float(content.get("daily_pnl", 0.0))
@@ -970,14 +1038,14 @@ def main():
     risk.peak_equity = float(content.get("peak_equity", risk.balance))
 
     if risk.check_circuit_breaker(risk.balance):
-        send_tg("🚨 <b>CIRCUIT BREAKER</b> — halted")
+        send_tg("🚨 <b>CIRCUIT BREAKER</b>")
         return
 
     # DATA
     try:
         mtf = fetch_multi_tf_ohlcv()
         primary_df = mtf[PRIMARY_TF].copy()
-        dxy = fetch_dxy(primary_df["datetime"]) if ENABLE_FRED or MULTI_TF else None
+        dxy = fetch_dxy()
         etf = fetch_etf_flow()
         fred = fetch_fred()
     except Exception as e:
@@ -1000,15 +1068,16 @@ def main():
         send_tg(
             f"🛑 <b>GATE 1 FAILED</b> [{INSTRUMENT} {PRIMARY_TF}]\n"
             f"EV net: {ev['ev_net']:+.6f}\n"
-            f"Win: {ev['win_rate']:.2%} | BE: {ev['breakeven']:.2%} | Edge: {ev['edge_pp']:+.2f}pp\n"
-            f"Primary bars: {ev['n_primary']}"
+            f"Win: {ev['win_rate']:.2%} | BE: {ev['breakeven']:.2%} | "
+            f"Edge: {ev['edge_pp']:+.2f}pp\n"
+            f"Primary: {ev['n_primary']}"
         )
         return
 
     # TRAIN
     models, scaler, meta = train_meta_model(df, primary, labels)
     if models is None:
-        send_tg("⚠️ Training failed")
+        send_tg("⚠️ Training failed — insufficient data")
         return
 
     bt = backtest(meta.get("cv_predictions", []), df, labels)
@@ -1016,12 +1085,14 @@ def main():
     if not meta.get("gate2_passed", False):
         send_tg(
             f"🛑 <b>GATE 2 FAILED</b>\n"
-            f"Best: {meta.get('best_model_acc', 0):.4f} | Random: {meta.get('random_acc', 0):.4f}"
+            f"Best: {meta.get('best_model_acc', 0):.4f} | "
+            f"Random: {meta.get('random_acc', 0):.4f}"
         )
         return
 
     # GATE 3: Hurst
-    hurst = float(df["hurst_100"].iloc[-2]) if not pd.isna(df["hurst_100"].iloc[-2]) else 0.5
+    hurst_val = df["hurst_100"].iloc[-2]
+    hurst = 0.5 if pd.isna(hurst_val) else float(hurst_val)
     if HURST_MODE == "VETO" and hurst < HURST_MIN:
         logger.info("VETO: Hurst %.3f < %.2f", hurst, HURST_MIN)
         send_tg(f"🚫 <b>VETO</b> — Hurst {hurst:.3f} < {HURST_MIN}")
@@ -1029,10 +1100,11 @@ def main():
 
     # GATE 4: Session
     if not int(df["in_session"].iloc[-2]):
-        logger.info("Outside session (%d-%d UTC)", CFG["session_start_utc"], CFG["session_end_utc"])
+        logger.info("Outside session (%d-%d UTC)",
+                    CFG["session_start"], CFG["session_end"])
         return
 
-    # GATE 5: Primary at current bar
+    # GATE 5: Current primary
     cur_p = int(primary.iloc[-2])
     if cur_p == 0:
         logger.info("No primary at current bar — HOLD")
@@ -1043,7 +1115,7 @@ def main():
     # GATE 6: p_profit vs dynamic threshold
     p_profit = predict_profit_prob(df, models, scaler, meta)
     if p_profit is None:
-        send_tg("⚠️ Prediction failed (NaN)")
+        send_tg("⚠️ Prediction failed")
         return
 
     cur_vol = float(df["atr_pct"].iloc[-2])
@@ -1054,7 +1126,7 @@ def main():
     threshold = breakeven + TRADE_MARGIN
 
     logger.info("═══ DECISION ═══")
-    logger.info("Primary=%+d | p_profit=%.4f | threshold=%.4f | Hurst=%.3f",
+    logger.info("Primary=%+d | p_profit=%.4f | thr=%.4f | Hurst=%.3f",
                 cur_p, p_profit, threshold, hurst)
 
     if p_profit < threshold:
@@ -1084,7 +1156,7 @@ def main():
         f"━━━━━━━━━━━━━━━\n"
         f"p_profit: {p_profit:.2%} > {threshold:.2%}\n"
         f"Hurst: {hurst:.3f} | ATR: {atr:.4f}\n"
-        f"HTF score: {int(df['htf_score'].iloc[-2])}\n"
+        f"HTF: {int(df['htf_score'].iloc[-2])}\n"
         f"EV net: {ev['ev_net']:+.6f}\n"
     )
     if bt.get("ml_filtered", {}).get("n", 0) > 0:
@@ -1099,11 +1171,13 @@ def main():
     new_state = {
         "instrument": INSTRUMENT, "primary_tf": PRIMARY_TF,
         "balance": risk.balance, "halted": risk.halted,
-        "daily_pnl": risk.daily_pnl, "consecutive_losses": risk.consecutive_losses,
+        "daily_pnl": risk.daily_pnl,
+        "consecutive_losses": risk.consecutive_losses,
         "peak_equity": risk.peak_equity,
         "last_signal": cur_p, "last_p_profit": p_profit,
         "last_threshold": threshold, "last_ev_net": ev["ev_net"],
-        "last_backtest": bt, "last_update": datetime.now(timezone.utc).isoformat(),
+        "last_backtest": bt,
+        "last_update": datetime.now(timezone.utc).isoformat(),
     }
     for _ in range(2):
         if save_state(new_state, state.get("etag")):
