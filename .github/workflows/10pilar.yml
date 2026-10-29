@@ -18,11 +18,11 @@ on:
         type: choice
         options: ["1h", "4h"]
       threshold:
-        description: "Voting threshold (2.0=agresif, 4.0=normal, 6.0=konservatif)"
+        description: "Voting threshold"
         required: false
-        default: "4.0"
+        default: "3.5"
         type: choice
-        options: ["2.0", "3.0", "4.0", "5.0", "6.0"]
+        options: ["2.5", "3.0", "3.5", "4.0", "5.0"]
 
 concurrency:
   group: xauusd-voting
@@ -52,7 +52,7 @@ jobs:
           SYMBOL: "XAU/USD"
           TF: ${{ github.event.inputs.tf || '1h' }}
           OUTPUT_SIZE: "5000"
-          THRESHOLD: ${{ github.event.inputs.threshold || '4.0' }}
+          THRESHOLD: ${{ github.event.inputs.threshold || '3.5' }}
 
           ACCOUNT_BALANCE: "10000"
           RISK_PCT: "0.003"
