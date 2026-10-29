@@ -2,21 +2,21 @@ name: XAUUSD Bot
 
 on:
   schedule:
-    - cron: "5 * * * *"   # tiap jam
+    - cron: "5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
         description: "1=live signal, 0=backtest"
         required: false
-        default: "1"
+        default: "0"
         type: choice
         options: ["1", "0"]
       strategy:
         description: "Strategy"
         required: false
-        default: "mean_rev"
+        default: "trend"
         type: choice
-        options: ["mean_rev", "trend", "breakout"]
+        options: ["trend", "mean_rev", "breakout"]
 
 concurrency:
   group: xauusd-bot
@@ -44,15 +44,14 @@ jobs:
 
           SYMBOL: "XAU/USD"
           TF: "4h"
-          OUTPUT_SIZE: "1000"
-          STRATEGY: ${{ github.event.inputs.strategy || 'trend' }}
+          OUTPUT_SIZE: "3000"                # ← lebih banyak data historis
+          STRATEGY: ${{ github.event.inputs.strategy || 'trend' }}   # ← default trend
 
           ACCOUNT_BALANCE: "10000"
           RISK_PCT: "0.003"
 
-          # Mode: 1=live (kirim sinyal), 0=backtest (test historis)
-          LIVE_MODE: ${{ github.event.inputs.mode || '1' }}
+          LIVE_MODE: ${{ github.event.inputs.mode || '0' }}
           BACKTEST_MODE: ${{ github.event.inputs.mode == '0' && '1' || '0' }}
-          BACKTEST_DAYS: "90"
+          BACKTEST_DAYS: "180"               # ← test 6 bulan
           NOTIFY_HOLD: "0"
         run: python xauusd_bot.py
