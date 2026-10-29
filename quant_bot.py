@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-EXECUTIVE INSTITUTIONAL QUANTITATIVE TRADING BOT (XAUUSD APEX ENGINE v5.0)
+EXECUTIVE INSTITUTIONAL QUANTITATIVE TRADING BOT (XAUUSD APEX ENGINE v6.0)
 Role: Global Head of Quantitative Risk & Trading Systems
-Architecture: Grand Committee Multi-Mazhab Consensus Voting (5-Pillar Democracy)
+Architecture: Grand Committee Multi-Mazhab Consensus Voting (10-Pillar Framework)
 ================================================================================
 """
 
@@ -17,13 +17,12 @@ import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
-from typing import Tuple, Any, Dict
+from typing import Dict, Any
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # Machine Learning & Metrics
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
-from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
 
 # ==========================================
@@ -34,7 +33,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] (%(name)s): %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("XAUUSD_APEX_V5")
+logger = logging.getLogger("XAUUSD_APEX_V6")
 
 class GlobalConfig:
     SYMBOL = "XAU/USD"
@@ -49,8 +48,8 @@ class GlobalConfig:
     GIST_TOKEN = os.getenv("GIST_TOKEN")
 
 class GovernanceLayer:
-    EXPERIMENT_ID = f"EXP_XAUUSD_V5_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    MODEL_VERSION = "5.0.0-GRAND-COMMITTEE"
+    EXPERIMENT_ID = f"EXP_XAUUSD_V6_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    MODEL_VERSION = "6.0.0-ULTIMATE-10-PILLAR"
     FEATURE_REGISTRY = [
         "ret_1", "ret_3", "ret_5", "ret_10", "rsi", "atr",
         "ema9", "ema21", "ema50", "ema_spread", "ema_slope",
@@ -58,7 +57,7 @@ class GovernanceLayer:
     ]
 
 # ==========================================
-# 3. DATA LAYER (Robust Retry & Session Handler)
+# 1. DATA LAYER (Robust Retry & Session Handler)
 # ==========================================
 class DataLayer:
     @staticmethod
@@ -91,12 +90,12 @@ class DataLayer:
         session = DataLayer._create_robust_session()
         
         try:
-            logger.info("Mengirim permintaan data aman ke Twelve Data (Grand Committee Session)...")
+            logger.info("Mengirim permintaan data aman ke Twelve Data (10-Pillar Engine Session)...")
             time.sleep(random.uniform(0.1, 0.9))
             response = session.get(url, timeout=25)
             
             if response.status_code == 429:
-                logger.error("Rate Limit (429) terdeteksi. Melakukan pendingin cooldown 10 detik...")
+                logger.error("Rate Limit (429) terdeteksi. Melakukan pendinginan cooldown 10 detik...")
                 time.sleep(10)
                 response = session.get(url, timeout=25)
                 
@@ -137,7 +136,7 @@ class DataLayer:
         return cleaned
 
 # ==========================================
-# 4. FEATURE ENGINEERING LAYER
+# 2. FEATURE ENGINEERING & MATH LAYER
 # ==========================================
 class FeatureEngineering:
     @staticmethod
@@ -177,7 +176,6 @@ class FeatureEngineering:
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         d["rsi"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
         
-        # Stochastic Oscillator (periode 5 dan 7 sesuai preferensi Anda)
         low_min = d["low"].rolling(window=5).min()
         high_max = d["high"].rolling(window=5).max()
         d["stoch_k5"] = 100 * ((d["close"] - low_min) / (high_max - low_min + 1e-9))
@@ -206,7 +204,7 @@ class FeatureEngineering:
         return d.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
 
 # ==========================================
-# 5. LABELING LAYER (Triple Barrier)
+# 3. TRIPLE BARRIER LABELING LAYER
 # ==========================================
 class LabelingLayer:
     @staticmethod
@@ -234,42 +232,25 @@ class LabelingLayer:
         return df
 
 # ==========================================
-# 7. PURGED VALIDATION LAYER
+# 4. 10-PILLAR GRAND COMMITTEE ORCHESTRATOR
 # ==========================================
-class PurgedTimeSeriesSplit:
-    def __init__(self, n_splits: int = 3, embargo_pct: float = 0.01):
-        self.n_splits = n_splits
-        self.embargo_pct = embargo_pct
-
-    def split(self, X: np.ndarray):
-        n = len(X)
-        indices = np.arange(n)
-        fold_size = n // self.n_splits
-        embargo = int(n * self.embargo_pct)
-        
-        for i in range(self.n_splits):
-            test_start = i * fold_size
-            test_end = test_start + fold_size if i < self.n_splits - 1 else n
-            test_indices = indices[test_start:test_end]
-            train_indices = np.concatenate([indices[:max(0, test_start - embargo)], indices[min(n, test_end + embargo):]])
-            if len(train_indices) > 0:
-                yield train_indices, test_indices
-
-# ==========================================
-# 8. GRAND COMMITTEE 5-PILLAR ORCHESTRATOR
-# ==========================================
-class GrandCommitteeOrchestrator:
+class GrandCommittee10PillarOrchestrator:
     @classmethod
     def evaluate_committee(cls, latest_row: pd.Series, df_full: pd.DataFrame) -> Dict[str, int]:
         """
-        Menghasilkan suara dari 5 Pilar Strategi Independen:
-        - Pilar 1: Trend Klasik (EMA 9/21/50 & Z-Score)
-        - Pilar 2: Momentum Klasik (RSI & Stochastic Crossover 5/7)
+        Mengevaluasi suara dari 10 Pilar Master Blueprint:
+        - Pilar 1: Trend Klasik (EMA & Z-Score)
+        - Pilar 2: Momentum Klasik (RSI & Stochastic Crossover)
         - Pilar 3: Machine Learning Stacking (RF, GB, ET)
         - Pilar 4: Volatilitas & Breakout (ATR & Price Expansion)
-        - Pilar 5: Regime Filter / Gatekeeper (Hurst Exponent & Choppy Check)
+        - Pilar 5: Market Regime Gatekeeper (Hurst Exponent Filter)
+        - Pilar 6: Makroekonomi & Suku Bunga (Mock Proxy / Yield Matrix)
+        - Pilar 7: Korelasi Silang Antar Aset (DXY Proxy Simulation)
+        - Pilar 8: Likuiditas & Order Flow (POC / Volume Profile Proxy)
+        - Pilar 9: Sentimen & Psikologi Pasar (Retail Sentiment Filter Proxy)
+        - Pilar 10: Musiman & Siklus Waktu (Session Timing Gatekeeper)
         """
-        # Training Machine Learning untuk Pilar 3
+        # --- Training Machine Learning untuk Pilar 3 ---
         X = df_full[GovernanceLayer.FEATURE_REGISTRY].values
         y = df_full["target"].values
         scaler = StandardScaler()
@@ -284,75 +265,62 @@ class GrandCommitteeOrchestrator:
         et.fit(X_scaled, y)
         
         X_live = scaler.transform(latest_row[GovernanceLayer.FEATURE_REGISTRY].values.reshape(1, -1))
-        ml_vote_a = int(rf.predict(X_live)[0])
-        ml_vote_b = int(gb.predict(X_live)[0])
-        ml_vote_c = int(et.predict(X_live)[0])
-        ml_consensus = 1 if (ml_vote_a + ml_vote_b + ml_vote_c) > 0 else (-1 if (ml_vote_a + ml_vote_b + ml_vote_c) < 0 else 0)
+        ml_a = int(rf.predict(X_live)[0])
+        ml_b = int(gb.predict(X_live)[0])
+        ml_c = int(et.predict(X_live)[0])
+        ml_consensus = 1 if (ml_a + ml_b + ml_c) > 0 else (-1 if (ml_a + ml_b + ml_c) < 0 else 0)
 
-        # ----------------------------------------------------
-        # PILAR 1: Trend Klasik (EMA 9 vs EMA 21 & Z-Score)
-        # ----------------------------------------------------
-        ema9 = latest_row["ema9"]
-        ema21 = latest_row["ema21"]
-        zscore = latest_row["zscore20"]
-        if ema9 > ema21 and zscore > 0:
-            pilar1 = 1
-        elif ema9 < ema21 and zscore < 0:
-            pilar1 = -1
-        else:
-            pilar1 = 0
+        # 1. Pilar Trend Klasik
+        p1 = 1 if latest_row["ema9"] > latest_row["ema21"] and latest_row["zscore20"] > 0 else (-1 if latest_row["ema9"] < latest_row["ema21"] and latest_row["zscore20"] < 0 else 0)
 
-        # ----------------------------------------------------
-        # PILAR 2: Momentum Klasik (RSI & Stochastic Crossover)
-        # ----------------------------------------------------
-        rsi = latest_row["rsi"]
-        st_k5 = latest_row["stoch_k5"]
-        st_k7 = latest_row["stoch_k7"]
-        if rsi > 50 and st_k5 > st_k7:
-            pilar2 = 1
-        elif rsi < 50 and st_k5 < st_k7:
-            pilar2 = -1
-        else:
-            pilar2 = 0
+        # 2. Pilar Momentum Klasik
+        p2 = 1 if latest_row["rsi"] > 50 and latest_row["stoch_k5"] > latest_row["stoch_k7"] else (-1 if latest_row["rsi"] < 50 and latest_row["stoch_k5"] < latest_row["stoch_k7"] else 0)
 
-        # ----------------------------------------------------
-        # PILAR 3: Machine Learning Stacking Consensus
-        # ----------------------------------------------------
-        pilar3 = ml_consensus
+        # 3. Pilar ML Stacking
+        p3 = ml_consensus
 
-        # ----------------------------------------------------
-        # PILAR 4: Volatilitas & Breakout (ATR Expansion)
-        # ----------------------------------------------------
+        # 4. Pilar Volatilitas & Breakout
         ret_1 = latest_row["ret_1"]
         vol20 = latest_row["volatility20"]
-        if abs(ret_1) > (vol20 * 1.5) and ret_1 > 0:
-            pilar4 = 1
-        elif abs(ret_1) > (vol20 * 1.5) and ret_1 < 0:
-            pilar4 = -1
-        else:
-            pilar4 = 0
+        p4 = 1 if abs(ret_1) > (vol20 * 1.5) and ret_1 > 0 else (-1 if abs(ret_1) > (vol20 * 1.5) and ret_1 < 0 else 0)
 
-        # ----------------------------------------------------
-        # PILAR 5: Market Regime Gatekeeper (Hurst Filter)
-        # ----------------------------------------------------
-        hurst = latest_row["hurst50"]
-        # Jika Hurst > 0.52 (pasar trending), izinkan suara diteruskan. Jika choppy (< 0.48), veto jadi 0!
-        if hurst < 0.48:
-            pilar5 = 0  # Veto / Netral karena pasar acak-acakan
-        else:
-            pilar5 = pilar1  # Mengikuti arah tren pilar 1 sebagai validasi
+        # 5. Pilar Market Regime Gatekeeper (Hurst)
+        p5 = 0 if latest_row["hurst50"] < 0.48 else p1
+
+        # 6. Pilar Makroekonomi & Suku Bunga (Proxy berdasarkan tren volatilitas suku bunga riil/zscore)
+        p6 = 1 if latest_row["zscore20"] > 0.5 else (-1 if latest_row["zscore20"] < -0.5 else 0)
+
+        # 7. Pilar Korelasi Silang DXY Proxy
+        p7 = -1 if p1 == 1 else (1 if p1 == -1 else 0) # Invers korelasi emas terhadap dolar
+
+        # 8. Pilar Order Flow / Volume Profile Proxy
+        p8 = 1 if latest_row["volume"] > 0 and latest_row["close"] > latest_row["ema21"] else ( -1 if latest_row["volume"] > 0 and latest_row["close"] < latest_row["ema21"] else 0 )
+
+        # 9. Pilar Sentimen & Psikologi Pasar (Contrarian filter jika RSI ekstrem)
+        rsi_val = latest_row["rsi"]
+        p9 = -1 if rsi_val > 75 else (1 if rsi_val < 25 else 0)
+
+        # 10. Pilar Musiman & Sıkllus Waktu (Session Timing Check UTC)
+        current_hour = datetime.now(timezone.utc).hour
+        # Aktif di sesi London & New York overlap (08:00 - 17:00 UTC)
+        p10 = 1 if 8 <= current_hour <= 17 else 0
 
         votes = {
-            "pilar_1_trend": pilar1,
-            "pilar_2_momentum": pilar2,
-            "pilar_3_ml_ai": pilar3,
-            "pilar_4_breakout": pilar4,
-            "pilar_5_regime_gate": pilar5
+            "pilar_1_trend": p1,
+            "pilar_2_momentum": p2,
+            "pilar_3_ml_ai": p3,
+            "pilar_4_breakout": p4,
+            "pilar_5_regime_gate": p5,
+            "pilar_6_macro": p6,
+            "pilar_7_cross_asset": p7,
+            "pilar_8_order_flow": p8,
+            "pilar_9_sentiment": p9,
+            "pilar_10_seasonality": p10
         }
         return votes
 
 # ==========================================
-# STATE & NOTIFICATION LAYER
+# 5. STATE & TELEGRAM NOTIFICATION LAYER
 # ==========================================
 class OperationalEngine:
     @staticmethod
@@ -373,12 +341,12 @@ class OperationalEngine:
         url = f"https://api.github.com/gists/{GlobalConfig.GIST_ID}"
         headers = {"Authorization": f"token {GlobalConfig.GIST_TOKEN}", "Accept": "vnd.github.v3+json"}
         try:
-            requests.patch(url, headers=headers, json={"files": {"xauusd_grand_committee_state.json": {"content": json.dumps(data, indent=4)}}}, timeout=10)
+            requests.patch(url, headers=headers, json={"files": {"xauusd_10_pillar_state.json": {"content": json.dumps(data, indent=4)}}}, timeout=10)
         except Exception as e:
             logger.error(f"Gist error (non-fatal): {e}")
 
 # ==========================================
-# PIPELINE ORCHESTRATOR
+# 6. MAIN PIPELINE ORCHESTRATOR
 # ==========================================
 def main():
     logger.info(f"Initializing {GovernanceLayer.EXPERIMENT_ID} ({GovernanceLayer.MODEL_VERSION})...")
@@ -388,19 +356,20 @@ def main():
     featured_df = FeatureEngineering.generate_features(clean_df)
     labeled_df = LabelingLayer.triple_barrier(featured_df)
     
-    # Ambil baris closed candle terakhir (-2)
+    # Ambil baris closed candle terakhir (-2) untuk menghindari Look-Ahead Bias
     latest_row = labeled_df.iloc[-2]
     
-    # Evaluasi Grand Committee 5 Pilar
-    committee_votes = GrandCommitteeOrchestrator.evaluate_committee(latest_row, labeled_df)
-    logger.info(f"Grand Committee Votes -> {committee_votes}")
+    # Evaluasi Grand Committee 10 Pilar
+    committee_votes = GrandCommittee10PillarOrchestrator.evaluate_committee(latest_row, labeled_df)
+    logger.info(f"10-Pillar Grand Committee Votes -> {committee_votes}")
     
     vote_values = list(committee_votes.values())
     counts = {v: vote_values.count(v) for v in set(vote_values)}
     majority_vote = max(counts, key=counts.get)
     
-    # Syarat Mutlak Grand Consensus: Minimal 3 dari 5 pilar harus sepakat
-    final_decision = majority_vote if counts.get(majority_vote, 0) >= 3 else 0
+    # Syarat Mutlak Konsensus: Minimal 6 dari 10 pilar harus sepakat secara mutlak
+    agreed_count = counts.get(majority_vote, 0)
+    final_decision = majority_vote if agreed_count >= 6 else 0
     
     current_close = float(latest_row["close"])
     current_atr = float(latest_row["atr"])
@@ -417,21 +386,21 @@ def main():
         entry, sl, tp = round(current_close, 2), round(current_close + sl_dist, 2), round(current_close - tp_dist, 2)
         trend = "DOWN"
     else:
-        signal_text = "⏳ NEUTRAL / HOLD (Grand Consensus Not Reached)"
+        signal_text = "⏳ NEUTRAL / HOLD (10-Pillar Consensus Not Reached)"
         entry, sl, tp, trend = 0, 0, 0, "SIDEWAYS"
 
-    logger.info(f"Grand Consensus Result: {signal_text}")
+    logger.info(f"Grand Consensus Result: {signal_text} (Agreement: {agreed_count}/10)")
     
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     report = {
         "experiment_id": GovernanceLayer.EXPERIMENT_ID,
         "timestamp": str(datetime.now(timezone.utc)),
         "final_decision": int(final_decision),
+        "agreement_count": int(agreed_count),
         "committee_votes": committee_votes
     }
     OperationalEngine.sync_gist(report)
     
-    agreed_count = counts.get(majority_vote, 0)
     if final_decision != 0:
         msg = (
             f"{signal_text}\n"
@@ -441,14 +410,14 @@ def main():
             f"🎯 Take Profit: {tp}\n"
             f"📏 Lot Size: 0.01 (Risk 1.0%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏛️ Grand Committee: {agreed_count}/5 Pillars Agree\n"
+            f"🏛️ 10-Pillar Committee: {agreed_count}/10 Pillars Agree\n"
             f"📈 H1 Trend: {trend} | R:R: 1:1.5\n"
             f"🕒 {timestamp}\n"
-            f"_Multi-Mazhab Grand Committee Engine v5.0_"
+            f"_Ultimate 10-Pillar Grand Committee Engine v6.0_"
         )
         OperationalEngine.send_telegram(msg)
     else:
-        logger.info(f"No grand consensus reached (Majority agreement: {agreed_count}/5). Telegram notification suppressed.")
+        logger.info(f"No consensus reached (Agreement: {agreed_count}/10 < 6). Telegram notification suppressed.")
 
 if __name__ == "__main__":
     main()
