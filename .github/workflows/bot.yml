@@ -44,8 +44,8 @@ jobs:
 
           SYMBOL: "XAU/USD"
           TF: "4h"
-          OUTPUT_SIZE: "500"
-          STRATEGY: ${{ github.event.inputs.strategy || 'mean_rev' }}
+          OUTPUT_SIZE: "1000"
+          STRATEGY: ${{ github.event.inputs.strategy || 'trend' }}
 
           ACCOUNT_BALANCE: "10000"
           RISK_PCT: "0.003"
