@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-.env
-*.csv
-V36_QUANT_EXECUTION_REPORT.json
-*.log
-.ipynb_checkpoints/
