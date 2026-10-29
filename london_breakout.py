@@ -1,22 +1,14 @@
 """
-XAUUSD LONDON RANGE BREAKOUT v1.0
+XAUUSD LONDON RANGE BREAKOUT v1.3 — FINAL
 ================================================================
-Strategi: London Range Breakout (XAUUSD)
-Backtest 3.7 tahun real tick: PF 1.38, DD 17.3%, OOS 2026 PF 1.61
-
-Aturan:
-  1. Range Asia: 03:00-08:00 UTC (configurable)
-  2. Breakout: first 1H close outside range after 08:00 UTC
-  3. Entry window: 08:00-10:00 UTC (2 jam setelah breakout)
-  4. SL: sisi berlawanan range, capped 0.6% dari entry
-  5. TP: 2.5R, BE trigger: 1.5R
-  6. Force close: 21:00 UTC
-  7. Filter: range 0.30%-1.60% dari harga
-  8. Max 1 trade per hari
-
-Sumber data: Twelve Data OHLCV 1H (UTC)
-Notifikasi: Telegram
-State: GitHub Gist (ETag-safe)
+Fitur:
+  - London Range Breakout (backtest 3.7 tahun: PF 1.38, OOS 2026 PF 1.61)
+  - BACKTEST_MODE=1 → langsung test historis, tidak nunggu jam 08:00 UTC
+  - BACKTEST_MODE=0 → live mode (cron tiap jam)
+  - Idempotent signal detection (tidak fire duplikat meskipun state gagal)
+  - Gist error handling dengan diagnostik lengkap (404/401/403/412)
+  - Circuit breaker: DD 15%, daily loss 2%, 4 consecutive losses
+  - Telegram notifikasi untuk signal + outcome + backtest summary
 ================================================================
 """
 from __future__ import annotations
@@ -27,16 +19,13 @@ import time
 import json
 import math
 import logging
-from datetime import datetime, timezone, timedelta, date as date_cls
-from typing import Optional, Tuple, Dict, Any, List
+from datetime import datetime, timezone, date as date_cls
+from typing import Optional, Dict, Any
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import requests
 
-# =============================================================================
-# LOGGING
-# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -52,48 +41,34 @@ TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
 GIST_ID         = os.getenv("GIST_ID")
 GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 
-# Instrument
 SYMBOL         = os.getenv("SYMBOL", "XAU/USD")
 INTERVAL       = "1h"
 OUTPUT_SIZE    = int(os.getenv("OUTPUT_SIZE", "500"))
-CONTRACT_SIZE  = 100     # XAUUSD: 100 oz per lot
-TICK_SIZE      = 0.01
+CONTRACT_SIZE  = 100
 MIN_LOT        = 0.01
 MAX_LOT        = 5.0
-SPREAD_BUFFER  = float(os.getenv("SPREAD_BUFFER", "0.30"))
-SLIPPAGE_BUFFER = float(os.getenv("SLIPPAGE_BUFFER", "0.15"))
 
-# Timing (server time = UTC by default; ubah SERVER_TZ_OFFSET jika broker GMT+2/3)
-SERVER_TZ_OFFSET   = int(os.getenv("SERVER_TZ_OFFSET", "0"))
-ASIA_START_SERVER  = int(os.getenv("ASIA_START_HOUR", "3"))
-ASIA_END_SERVER    = int(os.getenv("ASIA_END_HOUR", "8"))
-ENTRY_HOUR_SERVER  = int(os.getenv("ENTRY_HOUR", "8"))
-CLOSE_HOUR_SERVER  = int(os.getenv("CLOSE_HOUR", "21"))
-MAX_ENTRY_DELAY_HRS = int(os.getenv("MAX_ENTRY_DELAY_HRS", "2"))
+SERVER_TZ_OFFSET = int(os.getenv("SERVER_TZ_OFFSET", "0"))
+ASIA_START_UTC   = (int(os.getenv("ASIA_START_HOUR", "3")) - SERVER_TZ_OFFSET) % 24
+ASIA_END_UTC     = (int(os.getenv("ASIA_END_HOUR", "8")) - SERVER_TZ_OFFSET) % 24
+ENTRY_HOUR_UTC   = (int(os.getenv("ENTRY_HOUR", "8")) - SERVER_TZ_OFFSET) % 24
+CLOSE_HOUR_UTC   = (int(os.getenv("CLOSE_HOUR", "21")) - SERVER_TZ_OFFSET) % 24
 
-# Convert server → UTC
-def to_utc(server_hour: int) -> int:
-    return (server_hour - SERVER_TZ_OFFSET) % 24
-
-ASIA_START_UTC = to_utc(ASIA_START_SERVER)
-ASIA_END_UTC   = to_utc(ASIA_END_SERVER)
-ENTRY_HOUR_UTC = to_utc(ENTRY_HOUR_SERVER)
-CLOSE_HOUR_UTC = to_utc(CLOSE_HOUR_SERVER)
-
-# Filter range
-RANGE_MIN_PCT = float(os.getenv("RANGE_MIN_PCT", "0.0030"))   # 0.30%
-RANGE_MAX_PCT = float(os.getenv("RANGE_MAX_PCT", "0.0160"))   # 1.60%
-SL_MAX_PCT    = float(os.getenv("SL_MAX_PCT", "0.0060"))      # 0.60%
+RANGE_MIN_PCT = float(os.getenv("RANGE_MIN_PCT", "0.0030"))
+RANGE_MAX_PCT = float(os.getenv("RANGE_MAX_PCT", "0.0160"))
+SL_MAX_PCT    = float(os.getenv("SL_MAX_PCT", "0.0060"))
 TP_R          = float(os.getenv("TP_R", "2.5"))
 BE_R          = float(os.getenv("BE_R", "1.5"))
 
-# Risk
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000"))
-RISK_PCT        = float(os.getenv("RISK_PCT", "0.003"))       # 0.3% default
+RISK_PCT        = float(os.getenv("RISK_PCT", "0.003"))
 MAX_DAILY_LOSS_PCT     = 0.02
 MAX_DRAWDOWN_PCT       = 0.15
 MAX_CONSECUTIVE_LOSSES = 4
 NOTIFY_HOLD = os.getenv("NOTIFY_HOLD", "0") == "1"
+
+BACKTEST_MODE = os.getenv("BACKTEST_MODE", "0") == "1"
+BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "14"))
 
 # =============================================================================
 # HTTP
@@ -132,7 +107,7 @@ class ResilientSession:
 http = ResilientSession()
 
 # =============================================================================
-# DATA FETCH
+# DATA
 # =============================================================================
 def fetch_ohlcv() -> pd.DataFrame:
     url = "https://api.twelvedata.com/time_series"
@@ -147,7 +122,6 @@ def fetch_ohlcv() -> pd.DataFrame:
     values = data.get("values")
     if not values:
         raise RuntimeError("TD empty")
-
     df = pd.DataFrame(values)
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.set_index("datetime").sort_index()
@@ -156,195 +130,233 @@ def fetch_ohlcv() -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"])
     now = pd.Timestamp.now(tz="UTC")
-    df = df[df.index <= now]
-    df = df.reset_index()
-    logger.info("Fetched %d bars | last: %s", len(df), df["datetime"].iloc[-1])
+    df = df[df.index <= now].reset_index()
+    logger.info("Fetched %d bars | %s → %s", len(df),
+                df["datetime"].iloc[0], df["datetime"].iloc[-1])
     return df
 
 # =============================================================================
-# RANGE & BREAKOUT
+# CORE LOGIC
 # =============================================================================
 def compute_asia_range(df: pd.DataFrame, trade_date: date_cls) -> Optional[Dict[str, Any]]:
-    """Range Asia untuk trade_date (UTC). Return None jika data tidak cukup."""
-    today_bars = df[df["datetime"].dt.date == trade_date]
-    if len(today_bars) == 0:
+    today = df[df["datetime"].dt.date == trade_date]
+    if len(today) == 0:
         return None
-
-    asia_mask = (
-        (today_bars["datetime"].dt.hour >= ASIA_START_UTC) &
-        (today_bars["datetime"].dt.hour < ASIA_END_UTC)
-    )
-    asia = today_bars[asia_mask]
+    m = (today["datetime"].dt.hour >= ASIA_START_UTC) & \
+        (today["datetime"].dt.hour < ASIA_END_UTC)
+    asia = today[m]
     hours_needed = (ASIA_END_UTC - ASIA_START_UTC) % 24
     if len(asia) < max(3, hours_needed - 1):
-        logger.info("Asia range incomplete: %d/%d bars", len(asia), hours_needed)
         return None
-
-    asia_high = float(asia["high"].max())
-    asia_low = float(asia["low"].min())
-    asia_close = float(asia["close"].iloc[-1])
-    range_abs = asia_high - asia_low
-    range_pct = range_abs / asia_close if asia_close > 0 else 0
-
-    logger.info("Asia range [%02d-%02d UTC]: H=%.2f L=%.2f (%.3f%%)",
-                ASIA_START_UTC, ASIA_END_UTC, asia_high, asia_low, range_pct * 100)
-
-    if range_pct < RANGE_MIN_PCT:
-        logger.info("SKIP: range too narrow (%.3f%% < %.3f%%)",
-                    range_pct * 100, RANGE_MIN_PCT * 100)
+    hi = float(asia["high"].max())
+    lo = float(asia["low"].min())
+    cl = float(asia["close"].iloc[-1])
+    rng = (hi - lo) / cl if cl > 0 else 0
+    if rng < RANGE_MIN_PCT or rng > RANGE_MAX_PCT:
         return None
-    if range_pct > RANGE_MAX_PCT:
-        logger.info("SKIP: range too wide (%.3f%% > %.3f%%)",
-                    range_pct * 100, RANGE_MAX_PCT * 100)
-        return None
-
-    return {
-        "high": asia_high, "low": asia_low, "close": asia_close,
-        "range_pct": range_pct, "bars": len(asia),
-    }
+    return {"high": hi, "low": lo, "range_pct": rng, "bars": len(asia)}
 
 
 def detect_breakout(df: pd.DataFrame, trade_date: date_cls,
-                    asia_high: float, asia_low: float) -> Optional[Dict[str, Any]]:
-    """Cari bar pertama setelah ENTRY_HOUR_UTC dengan close di luar range."""
-    today_bars = df[df["datetime"].dt.date == trade_date]
-    if len(today_bars) == 0:
+                    hi: float, lo: float) -> Optional[Dict[str, Any]]:
+    today = df[df["datetime"].dt.date == trade_date].sort_values("datetime")
+    if len(today) == 0:
         return None
-
-    entry_mask = (today_bars["datetime"].dt.hour >= ENTRY_HOUR_UTC) & \
-                 (today_bars["datetime"].dt.hour < CLOSE_HOUR_UTC)
-    after = today_bars[entry_mask].sort_values("datetime")
-
+    after = today[today["datetime"].dt.hour >= ENTRY_HOUR_UTC]
     if len(after) == 0:
-        logger.info("No bars yet in entry window (>=%02d UTC)", ENTRY_HOUR_UTC)
         return None
-
     for _, row in after.iterrows():
-        close = float(row["close"])
-        if close > asia_high:
-            return {"direction": "BUY", "entry": close,
-                    "bar_time": row["datetime"], "asia_high": asia_high,
-                    "asia_low": asia_low}
-        if close < asia_low:
-            return {"direction": "SELL", "entry": close,
-                    "bar_time": row["datetime"], "asia_high": asia_high,
-                    "asia_low": asia_low}
-
-    logger.info("No breakout yet (price still inside range)")
+        c = float(row["close"])
+        if c > hi:
+            return {"direction": "BUY", "entry": c,
+                    "bar_time": row["datetime"],
+                    "asia_high": hi, "asia_low": lo}
+        if c < lo:
+            return {"direction": "SELL", "entry": c,
+                    "bar_time": row["datetime"],
+                    "asia_high": hi, "asia_low": lo}
     return None
 
 
 def compute_sl_tp(direction: str, entry: float,
-                  asia_high: float, asia_low: float) -> Dict[str, float]:
-    """SL = sisi berlawanan range, capped SL_MAX_PCT. TP=2.5R, BE=1.5R."""
-    if direction == "BUY":
-        raw_sl_distance = entry - asia_low
-    else:
-        raw_sl_distance = asia_high - entry
-
-    capped_sl = entry * SL_MAX_PCT
-    sl_distance = min(raw_sl_distance, capped_sl)
-    if sl_distance <= 0:
-        sl_distance = entry * 0.001  # minimum 0.1%
-
-    if direction == "BUY":
-        sl = entry - sl_distance
-        tp = entry + TP_R * sl_distance
-        be = entry + BE_R * sl_distance
-    else:
-        sl = entry + sl_distance
-        tp = entry - TP_R * sl_distance
-        be = entry - BE_R * sl_distance
-
-    return {
-        "sl": round(sl, 2), "tp": round(tp, 2),
-        "be_trigger": round(be, 2),
-        "sl_distance": round(sl_distance, 2),
-        "sl_pct": round(sl_distance / entry * 100, 3),
-        "capped": raw_sl_distance > capped_sl,
-    }
-
-# =============================================================================
-# POSITION SIZE
-# =============================================================================
-def position_size(entry: float, sl: float, balance: float) -> float:
-    risk_money = balance * RISK_PCT
-    sl_dist = abs(entry - sl)
+                  hi: float, lo: float) -> Dict[str, Any]:
+    raw = (entry - lo) if direction == "BUY" else (hi - entry)
+    cap = entry * SL_MAX_PCT
+    sl_dist = min(raw, cap)
     if sl_dist <= 0:
+        sl_dist = entry * 0.001
+    if direction == "BUY":
+        return {"sl": round(entry - sl_dist, 2),
+                "tp": round(entry + TP_R * sl_dist, 2),
+                "be_trigger": round(entry + BE_R * sl_dist, 2),
+                "sl_dist": round(sl_dist, 2),
+                "sl_pct": round(sl_dist / entry * 100, 3),
+                "capped": raw > cap}
+    return {"sl": round(entry + sl_dist, 2),
+            "tp": round(entry - TP_R * sl_dist, 2),
+            "be_trigger": round(entry - BE_R * sl_dist, 2),
+            "sl_dist": round(sl_dist, 2),
+            "sl_pct": round(sl_dist / entry * 100, 3),
+            "capped": raw > cap}
+
+
+def simulate_outcome(df: pd.DataFrame, trade_date: date_cls,
+                     breakout: Dict[str, Any],
+                     sltp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Simulasi outcome trade pada data historis."""
+    direction = breakout["direction"]
+    entry = breakout["entry"]
+    sl = sltp["sl"]
+    tp = sltp["tp"]
+    be_t = sltp["be_trigger"]
+    be_hit = False
+
+    after = df[(df["datetime"] > breakout["bar_time"]) &
+               (df["datetime"].dt.date == trade_date)].sort_values("datetime")
+    for _, row in after.iterrows():
+        h = float(row["high"])
+        l = float(row["low"])
+        bt = row["datetime"]
+
+        if not be_hit:
+            if (direction == "BUY" and h >= be_t) or \
+               (direction == "SELL" and l <= be_t):
+                be_hit = True
+                sl = entry
+
+        sl_hit = (direction == "BUY" and l <= sl) or \
+                 (direction == "SELL" and h >= sl)
+        if sl_hit:
+            return {"outcome": "BE" if be_hit and sl == entry else "SL",
+                    "exit": sl, "be_hit": be_hit}
+
+        tp_hit = (direction == "BUY" and h >= tp) or \
+                 (direction == "SELL" and l <= tp)
+        if tp_hit:
+            return {"outcome": "TP", "exit": tp, "be_hit": be_hit}
+
+        if bt.hour >= CLOSE_HOUR_UTC:
+            return {"outcome": "TIMEOUT",
+                    "exit": float(row["close"]), "be_hit": be_hit}
+    return None
+
+
+def position_size(entry: float, sl: float, balance: float) -> float:
+    risk = balance * RISK_PCT
+    dist = abs(entry - sl)
+    if dist <= 0:
         return 0.0
-    loss_per_lot = sl_dist * CONTRACT_SIZE
-    if loss_per_lot <= 0:
+    per_lot = dist * CONTRACT_SIZE
+    if per_lot <= 0:
         return 0.0
-    lot = math.floor((risk_money / loss_per_lot) / MIN_LOT) * MIN_LOT
+    lot = math.floor((risk / per_lot) / MIN_LOT) * MIN_LOT
     return max(min(lot, MAX_LOT), 0.0)
 
 # =============================================================================
-# TRADE MONITORING
+# BACKTEST
 # =============================================================================
-def check_trade_outcome(df: pd.DataFrame, trade: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Cek apakah trade hit BE, SL, TP, atau timeout.
-    Return dict outcome atau None jika masih berjalan.
-    """
-    direction = trade["direction"]
-    entry = trade["entry"]
-    sl = trade["sl"]
-    tp = trade["tp"]
-    be_trigger = trade["be_trigger"]
-    be_hit = trade.get("be_hit", False)
-    opened_at = pd.Timestamp(trade["opened_at"])
+def backtest_recent(df: pd.DataFrame, n_days: int = 14) -> None:
+    logger.info("═══ BACKTEST MODE — %d hari terakhir ═══", n_days)
+    all_dates = sorted(df["datetime"].dt.date.unique())
+    recent = all_dates[-n_days:]
 
-    # Bars setelah entry
-    after = df[df["datetime"] > opened_at].sort_values("datetime")
-    if len(after) == 0:
-        return None
+    trades = []
+    balance = ACCOUNT_BALANCE
 
-    for _, row in after.iterrows():
-        high = float(row["high"])
-        low = float(row["low"])
-        bar_time = row["datetime"]
+    logger.info("%-12s | %-5s | %-8s | %-6s | %-8s | %-5s | %s",
+                "Date", "Dir", "Entry", "SL%", "Range%", "BE", "Outcome")
+    logger.info("-" * 85)
 
-        # Cek BE trigger dulu
-        if not be_hit:
-            if (direction == "BUY" and high >= be_trigger) or \
-               (direction == "SELL" and low <= be_trigger):
-                be_hit = True
-                sl = entry  # move SL to BE
-                logger.info("BE trigger hit at %s — SL moved to %.2f", bar_time, entry)
+    for d in recent:
+        asia = compute_asia_range(df, d)
+        if asia is None:
+            logger.info("%-12s | SKIP (range filter)", d)
+            continue
+        br = detect_breakout(df, d, asia["high"], asia["low"])
+        if br is None:
+            logger.info("%-12s | SKIP (no breakout)", d)
+            continue
+        sltp = compute_sl_tp(br["direction"], br["entry"],
+                             asia["high"], asia["low"])
+        outcome = simulate_outcome(df, d, br, sltp)
+        if outcome is None:
+            logger.info("%-12s | %-5s | %-8.2f | %-6.2f | %-8.3f | OPEN",
+                        d, br["direction"], br["entry"],
+                        sltp["sl_pct"], asia["range_pct"] * 100)
+            continue
 
-        # Cek SL (pessimistic: SL first if both hit in same bar)
-        sl_hit = (direction == "BUY" and low <= sl) or \
-                 (direction == "SELL" and high >= sl)
-        if sl_hit:
-            return {"outcome": "BE" if be_hit and sl == entry else "SL",
-                    "exit_price": sl, "exit_time": str(bar_time),
-                    "be_hit": be_hit}
+        lot = position_size(br["entry"], sltp["sl"], balance)
+        pnl = ((outcome["exit"] - br["entry"]) if br["direction"] == "BUY"
+               else (br["entry"] - outcome["exit"])) * lot * CONTRACT_SIZE
+        balance += pnl
+        be_str = "yes" if outcome["be_hit"] else "no"
 
-        # Cek TP
-        tp_hit = (direction == "BUY" and high >= tp) or \
-                 (direction == "SELL" and low <= tp)
-        if tp_hit:
-            return {"outcome": "TP", "exit_price": tp,
-                    "exit_time": str(bar_time), "be_hit": be_hit}
+        logger.info("%-12s | %-5s | %-8.2f | %-6.2f | %-8.3f | %-5s | %s PnL=$%+.2f",
+                    d, br["direction"], br["entry"], sltp["sl_pct"],
+                    asia["range_pct"] * 100, be_str, outcome["outcome"], pnl)
 
-        # Cek timeout: bar hour >= CLOSE_HOUR_UTC
-        if bar_time.hour >= CLOSE_HOUR_UTC:
-            exit_px = float(row["close"])
-            return {"outcome": "TIMEOUT", "exit_price": exit_px,
-                    "exit_time": str(bar_time), "be_hit": be_hit}
+        trades.append({"date": str(d), "direction": br["direction"],
+                       "outcome": outcome["outcome"], "pnl": pnl,
+                       "range_pct": asia["range_pct"], "be_hit": outcome["be_hit"]})
 
-    return None
+    if not trades:
+        logger.warning("No trades in %d days — range filter atau tidak ada breakout", n_days)
+        send_tg(f"📊 <b>BACKTEST</b> ({n_days} hari)\n0 trade — filter terlalu ketat atau tidak ada breakout")
+        return
+
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] < 0]
+    total_pnl = sum(t["pnl"] for t in trades)
+    gross_w = sum(t["pnl"] for t in wins)
+    gross_l = abs(sum(t["pnl"] for t in losses))
+    pf = gross_w / gross_l if gross_l > 0 else float('inf')
+
+    tp = sum(1 for t in trades if t["outcome"] == "TP")
+    sl = sum(1 for t in trades if t["outcome"] == "SL")
+    be = sum(1 for t in trades if t["outcome"] == "BE")
+    to = sum(1 for t in trades if t["outcome"] == "TIMEOUT")
+    wr = 100 * len(wins) / len(trades)
+
+    logger.info("-" * 85)
+    logger.info("═══ SUMMARY ═══")
+    logger.info("Trades: %d | Win: %d | Loss: %d", len(trades), len(wins), len(losses))
+    logger.info("TP=%d SL=%d BE=%d TIMEOUT=%d", tp, sl, be, to)
+    logger.info("Win rate: %.1f%%", wr)
+    logger.info("Total PnL: $%+.2f | Balance: $%.2f → $%.2f",
+                total_pnl, ACCOUNT_BALANCE, balance)
+    logger.info("Profit Factor: %.2f", pf)
+
+    send_tg(
+        f"📊 <b>BACKTEST London BO — {n_days} hari</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Trades: {len(trades)} (TP={tp} SL={sl} BE={be} TO={to})\n"
+        f"Win rate: {wr:.1f}%\n"
+        f"PnL: <b>${total_pnl:+.2f}</b>\n"
+        f"Balance: ${ACCOUNT_BALANCE:.2f} → ${balance:.2f}\n"
+        f"<b>Profit Factor: {pf:.2f}</b>"
+    )
 
 # =============================================================================
-# STATE
+# STATE (Gist with full diagnostics)
 # =============================================================================
 def load_state() -> Dict[str, Any]:
     url = f"https://api.github.com/gists/{GIST_ID}"
     h = {"Authorization": f"token {GITHUB_TOKEN}",
          "Accept": "application/vnd.github+json"}
-    r = http.request("GET", url, headers=h)
-    if r.status_code != 200:
+    try:
+        r = http.request("GET", url, headers=h)
+    except RuntimeError as e:
+        logger.error("Gist GET exception: %s", e)
         return {"etag": None, "content": {}}
+
+    if r.status_code != 200:
+        logger.warning("Gist GET status=%d body=%s", r.status_code, r.text[:150])
+        if r.status_code == 404:
+            logger.error("→ GIST_ID tidak ditemukan. Verifikasi secret GIST_ID")
+        elif r.status_code in (401, 403):
+            logger.error("→ GIST_TOKEN invalid / tanpa scope 'gist'. Buat PAT baru")
+        return {"etag": None, "content": {}}
+
     content = {}
     for name, f in r.json().get("files", {}).items():
         if name.endswith(".json"):
@@ -358,18 +370,43 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any], etag: Optional[str]) -> bool:
     url = f"https://api.github.com/gists/{GIST_ID}"
+    payload = {"files": {"london_state.json": {
+        "content": json.dumps(state, indent=2, default=str)}}}
+
     h = {"Authorization": f"token {GITHUB_TOKEN}",
          "Accept": "application/vnd.github+json"}
     if etag:
         h["If-Match"] = etag
-    payload = {"files": {"london_state.json": {
-        "content": json.dumps(state, indent=2, default=str)
-    }}}
-    r = http.request("PATCH", url, headers=h, json=payload)
-    if r.status_code == 412:
-        logger.warning("Gist ETag mismatch")
+
+    try:
+        r = http.request("PATCH", url, headers=h, json=payload)
+    except RuntimeError as e:
+        logger.error("Gist PATCH exception: %s", e)
         return False
-    return r.status_code in (200, 201)
+
+    if r.status_code in (200, 201):
+        logger.info("Gist saved OK")
+        return True
+
+    if r.status_code == 412:
+        logger.warning("Gist 412 — retry tanpa If-Match")
+        h.pop("If-Match", None)
+        try:
+            r = http.request("PATCH", url, headers=h, json=payload)
+        except RuntimeError as e:
+            logger.error("Gist PATCH retry exception: %s", e)
+            return False
+        if r.status_code in (200, 201):
+            logger.info("Gist saved (tanpa If-Match)")
+            return True
+
+    logger.error("Gist PATCH failed: status=%d body=%s",
+                 r.status_code, r.text[:200])
+    if r.status_code == 404:
+        logger.error("→ GIST_ID tidak ditemukan. Cek secret GIST_ID")
+    elif r.status_code in (401, 403):
+        logger.error("→ Token tanpa akses. Cek scope 'gist' pada GIST_TOKEN")
+    return False
 
 # =============================================================================
 # TELEGRAM
@@ -398,73 +435,88 @@ def send_tg(msg: str) -> bool:
     return False
 
 # =============================================================================
-# CIRCUIT BREAKER
+# RISK
 # =============================================================================
 def check_circuit_breaker(state: Dict[str, Any]) -> bool:
-    balance = state.get("balance", ACCOUNT_BALANCE)
-    peak = state.get("peak_equity", balance)
-    daily_pnl = state.get("daily_pnl", 0.0)
-    consecutive = state.get("consecutive_losses", 0)
-    halted = state.get("halted", False)
-
-    if halted:
+    bal = state.get("balance", ACCOUNT_BALANCE)
+    peak = state.get("peak_equity", bal)
+    daily = state.get("daily_pnl", 0.0)
+    consec = state.get("consecutive_losses", 0)
+    if state.get("halted", False):
         return True
-
-    peak = max(peak, balance)
+    peak = max(peak, bal)
     state["peak_equity"] = peak
-    dd = (peak - balance) / max(peak, 1e-9)
-    daily_loss = -daily_pnl / balance if daily_pnl < 0 else 0.0
-
+    dd = (peak - bal) / max(peak, 1e-9)
+    dl = -daily / bal if daily < 0 else 0.0
     if dd >= MAX_DRAWDOWN_PCT:
-        logger.critical("CB: drawdown %.2f%% >= %.2f%%", dd * 100, MAX_DRAWDOWN_PCT * 100)
+        logger.critical("CB: drawdown %.2f%%", dd * 100)
         state["halted"] = True
         return True
-    if daily_loss >= MAX_DAILY_LOSS_PCT:
-        logger.critical("CB: daily loss %.2f%% >= %.2f%%", daily_loss * 100, MAX_DAILY_LOSS_PCT * 100)
+    if dl >= MAX_DAILY_LOSS_PCT:
+        logger.critical("CB: daily loss %.2f%%", dl * 100)
         state["halted"] = True
         return True
-    if consecutive >= MAX_CONSECUTIVE_LOSSES:
-        logger.critical("CB: %d consecutive losses", consecutive)
+    if consec >= MAX_CONSECUTIVE_LOSSES:
+        logger.critical("CB: %d consecutive losses", consec)
         state["halted"] = True
         return True
-
     return False
 
-# =============================================================================
-# UPDATE BALANCE / PNL
-# =============================================================================
-def record_trade_outcome(state: Dict[str, Any], trade: Dict[str, Any],
-                         outcome: Dict[str, Any]) -> float:
-    entry = trade["entry"]
-    exit_px = outcome["exit_price"]
+
+def check_trade_outcome(df: pd.DataFrame, trade: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     direction = trade["direction"]
-    lot = trade.get("lot", 0.01)
+    entry = trade["entry"]
+    sl = trade["sl"]
+    tp = trade["tp"]
+    be_t = trade["be_trigger"]
+    be_hit = trade.get("be_hit", False)
+    opened = pd.Timestamp(trade["opened_at"])
 
-    if direction == "BUY":
-        pnl_per_unit = exit_px - entry
-    else:
-        pnl_per_unit = entry - exit_px
+    after = df[df["datetime"] > opened].sort_values("datetime")
+    for _, row in after.iterrows():
+        h = float(row["high"])
+        l = float(row["low"])
+        bt = row["datetime"]
 
-    pnl_usd = pnl_per_unit * lot * CONTRACT_SIZE
-    state["balance"] = state.get("balance", ACCOUNT_BALANCE) + pnl_usd
-    state["daily_pnl"] = state.get("daily_pnl", 0.0) + pnl_usd
+        if not be_hit:
+            if (direction == "BUY" and h >= be_t) or \
+               (direction == "SELL" and l <= be_t):
+                be_hit = True
+                sl = entry
 
-    if outcome["outcome"] == "SL":
-        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
-    elif outcome["outcome"] == "TP":
-        state["consecutive_losses"] = 0
+        sl_hit = (direction == "BUY" and l <= sl) or \
+                 (direction == "SELL" and h >= sl)
+        if sl_hit:
+            return {"outcome": "BE" if be_hit and sl == entry else "SL",
+                    "exit_price": sl, "be_hit": be_hit}
 
-    logger.info("Trade outcome: %s | PnL: $%+.2f | Balance: $%.2f",
-                outcome["outcome"], pnl_usd, state["balance"])
-    return pnl_usd
+        tp_hit = (direction == "BUY" and h >= tp) or \
+                 (direction == "SELL" and l <= tp)
+        if tp_hit:
+            return {"outcome": "TP", "exit_price": tp, "be_hit": be_hit}
+
+        if bt.hour >= CLOSE_HOUR_UTC:
+            return {"outcome": "TIMEOUT",
+                    "exit_price": float(row["close"]), "be_hit": be_hit}
+    return None
 
 # =============================================================================
 # MAIN
 # =============================================================================
 def main():
-    logger.info("═══ LONDON BO v1.0 | %s | server_offset=%d ═══",
-                SYMBOL, SERVER_TZ_OFFSET)
-    logger.info("Asia: %02d-%02d UTC | Entry: %02d UTC | Close: %02d UTC",
+    logger.info("═══ LONDON BO v1.3 | %s | BACKTEST=%s ═══",
+                SYMBOL, BACKTEST_MODE)
+
+    if BACKTEST_MODE:
+        try:
+            df = fetch_ohlcv()
+        except Exception as e:
+            logger.error("Data failed: %s", e)
+            return
+        backtest_recent(df, BACKTEST_DAYS)
+        return
+
+    logger.info("Asia %02d-%02d UTC | Entry %02d UTC | Close %02d UTC",
                 ASIA_START_UTC, ASIA_END_UTC, ENTRY_HOUR_UTC, CLOSE_HOUR_UTC)
 
     missing = [n for n, v in [
@@ -486,125 +538,114 @@ def main():
     state.setdefault("consecutive_losses", 0)
     state.setdefault("halted", False)
     state.setdefault("active_trade", None)
-    state.setdefault("signaled_dates", [])
 
     if check_circuit_breaker(state):
-        send_tg("🚨 <b>CIRCUIT BREAKER ACTIVE</b>\nBot halted. Manual review required.")
+        send_tg("🚨 <b>CIRCUIT BREAKER</b> — bot halted")
         return
 
     try:
         df = fetch_ohlcv()
     except Exception as e:
-        logger.exception("Data fetch failed")
-        send_tg(f"⚠️ Data error: {e}")
+        logger.error("Data failed: %s", e)
+        send_tg(f"⚠️ Data: {e}")
         return
 
-    now_utc = datetime.now(timezone.utc)
-    today = now_utc.date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     today_str = str(today)
 
-    # ===== PHASE 1: Manage existing trade =====
+    # ==== PHASE 1: Monitor existing trade ====
     trade = state.get("active_trade")
     if trade:
         if trade.get("trade_date") != today_str:
-            logger.info("Closing stale trade from %s at market", trade.get("trade_date"))
-            outcome = {"outcome": "TIMEOUT", "exit_price": trade["entry"],
-                       "exit_time": str(now_utc), "be_hit": trade.get("be_hit", False)}
-            record_trade_outcome(state, trade, outcome)
-            send_tg(f"⏰ Stale trade closed at market\n{trade['direction']} entry {trade['entry']}")
+            logger.info("Closing stale trade from %s", trade.get("trade_date"))
             state["active_trade"] = None
         else:
             outcome = check_trade_outcome(df, trade)
             if outcome:
-                pnl = record_trade_outcome(state, trade, outcome)
+                entry = trade["entry"]
+                exit_px = outcome["exit_price"]
+                lot = trade.get("lot", 0.01)
+                pnl = ((exit_px - entry) if trade["direction"] == "BUY"
+                       else (entry - exit_px)) * lot * CONTRACT_SIZE
+                state["balance"] = state.get("balance", ACCOUNT_BALANCE) + pnl
+                state["daily_pnl"] = state.get("daily_pnl", 0.0) + pnl
+                if outcome["outcome"] == "SL":
+                    state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                elif outcome["outcome"] == "TP":
+                    state["consecutive_losses"] = 0
                 emoji = {"TP": "✅", "SL": "❌", "BE": "⚖️", "TIMEOUT": "⏰"}[outcome["outcome"]]
                 send_tg(
-                    f"{emoji} <b>{outcome['outcome']}</b> — {trade['direction']} XAUUSD\n"
-                    f"Entry: {trade['entry']:.2f} → Exit: {outcome['exit_price']:.2f}\n"
-                    f"PnL: <b>${pnl:+.2f}</b>\n"
-                    f"BE hit: {outcome['be_hit']}\n"
-                    f"Balance: ${state['balance']:.2f}"
+                    f"{emoji} <b>{outcome['outcome']}</b> — {trade['direction']} {SYMBOL}\n"
+                    f"Entry {entry:.2f} → Exit {exit_px:.2f}\n"
+                    f"PnL <b>${pnl:+.2f}</b> | Balance ${state['balance']:.2f}"
                 )
                 state["active_trade"] = None
             else:
-                logger.info("Trade active: %s entry %.2f sl %.2f tp %.2f be_hit=%s",
-                            trade["direction"], trade["entry"], trade["sl"],
-                            trade["tp"], trade.get("be_hit", False))
+                logger.info("Trade active: %s @ %.2f", trade["direction"], trade["entry"])
 
-    # ===== PHASE 2: Look for new signal =====
-    if state.get("active_trade") is None and today_str not in state.get("signaled_dates", []):
-        # Cek window entry
-        in_window = (ENTRY_HOUR_UTC <= now_utc.hour <= ENTRY_HOUR_UTC + MAX_ENTRY_DELAY_HRS)
-        if not in_window:
-            logger.info("Outside entry window (%02d-%02d UTC), current hour=%d",
-                        ENTRY_HOUR_UTC, ENTRY_HOUR_UTC + MAX_ENTRY_DELAY_HRS, now_utc.hour)
-        else:
-            asia = compute_asia_range(df, today)
-            if asia is None:
-                logger.info("No valid asia range — skip")
-            else:
-                breakout = detect_breakout(df, today, asia["high"], asia["low"])
-                if breakout:
-                    sltp = compute_sl_tp(breakout["direction"], breakout["entry"],
-                                          asia["high"], asia["low"])
-                    lot = position_size(breakout["entry"], sltp["sl"], state["balance"])
-
-                    if lot < MIN_LOT:
-                        logger.warning("Lot size %.4f below min %.2f — skip", lot, MIN_LOT)
+    # ==== PHASE 2: Signal detection (idempotent) ====
+    if state.get("active_trade") is None:
+        asia = compute_asia_range(df, today)
+        if asia:
+            br = detect_breakout(df, today, asia["high"], asia["low"])
+            if br:
+                last_closed = df.iloc[-1]
+                if br["bar_time"] != last_closed["datetime"]:
+                    logger.info("Breakout bar %s is not last closed — skip (idempotent)",
+                                br["bar_time"])
+                else:
+                    age_min = (now - br["bar_time"].to_pydatetime()).total_seconds() / 60
+                    if age_min > 90:
+                        logger.info("Breakout bar is %.0f min old — stale, skip", age_min)
                     else:
-                        trade_record = {
-                            "direction": breakout["direction"],
-                            "entry": breakout["entry"],
-                            "sl": sltp["sl"],
-                            "tp": sltp["tp"],
-                            "be_trigger": sltp["be_trigger"],
-                            "be_hit": False,
-                            "lot": lot,
-                            "opened_at": str(now_utc),
-                            "trade_date": today_str,
-                            "asia_high": asia["high"],
-                            "asia_low": asia["low"],
-                        }
-                        state["active_trade"] = trade_record
-                        state["signaled_dates"] = (state.get("signaled_dates", []) + [today_str])[-30:]
+                        sltp = compute_sl_tp(br["direction"], br["entry"],
+                                             asia["high"], asia["low"])
+                        lot = position_size(br["entry"], sltp["sl"], state["balance"])
+                        if lot < MIN_LOT:
+                            logger.warning("Lot %.4f < min — skip", lot)
+                        else:
+                            state["active_trade"] = {
+                                "direction": br["direction"],
+                                "entry": br["entry"],
+                                "sl": sltp["sl"],
+                                "tp": sltp["tp"],
+                                "be_trigger": sltp["be_trigger"],
+                                "be_hit": False,
+                                "lot": lot,
+                                "opened_at": str(now),
+                                "trade_date": today_str,
+                                "asia_high": asia["high"],
+                                "asia_low": asia["low"],
+                            }
+                            emoji = "🟢" if br["direction"] == "BUY" else "🔴"
+                            send_tg(
+                                f"{emoji} <b>{br['direction']}</b> {SYMBOL} — LONDON BO\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"Asia range: {asia['low']:.2f}—{asia['high']:.2f} "
+                                f"({asia['range_pct']*100:.2f}%)\n"
+                                f"Entry: <code>{br['entry']:.2f}</code>\n"
+                                f"SL: <code>{sltp['sl']:.2f}</code> ({sltp['sl_pct']:.2f}%)\n"
+                                f"TP: <code>{sltp['tp']:.2f}</code>\n"
+                                f"BE: <code>{sltp['be_trigger']:.2f}</code>\n"
+                                f"Lot: <code>{lot}</code>\n"
+                                f"Close by {CLOSE_HOUR_UTC:02d}:00 UTC\n"
+                                f"Balance ${state['balance']:.2f}"
+                            )
+                            logger.info("SIGNAL: %s @ %.2f lot=%.2f",
+                                        br["direction"], br["entry"], lot)
 
-                        dir_emoji = "🟢" if breakout["direction"] == "BUY" else "🔴"
-                        msg = (
-                            f"{dir_emoji} <b>{breakout['direction']}</b> XAUUSD — LONDON BO\n"
-                            f"━━━━━━━━━━━━━━━\n"
-                            f"Asia range: {asia['low']:.2f} — {asia['high']:.2f} ({asia['range_pct']*100:.2f}%)\n"
-                            f"Entry: <code>{breakout['entry']:.2f}</code>\n"
-                            f"SL: <code>{sltp['sl']:.2f}</code> ({sltp['sl_pct']:.2f}%)\n"
-                            f"TP: <code>{sltp['tp']:.2f}</code>\n"
-                            f"BE trigger: <code>{sltp['be_trigger']:.2f}</code>\n"
-                            f"Lot: <code>{lot}</code>\n"
-                            f"Risk: ${state['balance'] * RISK_PCT:.2f}\n"
-                            f"━━━━━━━━━━━━━━━\n"
-                            f"Close by: {CLOSE_HOUR_UTC:02d}:00 UTC\n"
-                            f"Balance: ${state['balance']:.2f}"
-                        )
-                        send_tg(msg)
-                        logger.info("SIGNAL FIRED: %s @ %.2f, lot=%.2f",
-                                    breakout["direction"], breakout["entry"], lot)
-
-    # ===== PHASE 3: Close reminder at 21:00 =====
-    if state.get("active_trade") and now_utc.hour == CLOSE_HOUR_UTC:
-        t = state["active_trade"]
-        send_tg(
-            f"⏰ <b>CLOSE REMINDER</b>\n"
-            f"{t['direction']} XAUUSD still open\n"
-            f"Entry: {t['entry']:.2f} | SL: {t['sl']:.2f} | TP: {t['tp']:.2f}\n"
-            f"Close at market now (21:00 UTC rule)"
-        )
-
-    # ===== Save =====
-    state["last_update"] = now_utc.isoformat()
+    # ==== PHASE 3: Save ====
+    state["last_update"] = now.isoformat()
+    saved = False
     for _ in range(2):
         if save_state(state, s.get("etag")):
+            saved = True
             break
         s = load_state()
-        if _ == 1:
-            logger.error("State save failed after retry")
+    if not saved:
+        logger.warning("⚠️ State NOT saved — signal tetap jalan via idempotent detection")
+        logger.warning("⚠️ Live monitoring mungkin miss — verifikasi GIST_ID + GIST_TOKEN")
 
     logger.info("═══ COMPLETE ═══")
 
