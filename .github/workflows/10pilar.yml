@@ -1,10 +1,31 @@
-name: XAUUSD Quant Bot v9.0
+name: XAUUSD Voting Bot
+
 on:
   schedule:
-    - cron: "5 */4 * * *"   # setiap 4 jam (aligned dengan PRIMARY_TF=4h)
+    - cron: "5 * * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "1=live signal, 0=backtest"
+        required: false
+        default: "1"
+        type: choice
+        options: ["1", "0"]
+      tf:
+        description: "Timeframe"
+        required: false
+        default: "1h"
+        type: choice
+        options: ["1h", "4h"]
+      threshold:
+        description: "Voting threshold (2.0=agresif, 4.0=normal, 6.0=konservatif)"
+        required: false
+        default: "4.0"
+        type: choice
+        options: ["2.0", "3.0", "4.0", "5.0", "6.0"]
+
 concurrency:
-  group: bot-v9
+  group: xauusd-voting
   cancel-in-progress: false
 
 jobs:
@@ -17,23 +38,27 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements.txt
-      - name: Run bot
+      - name: Install dependencies
+        run: pip install numpy pandas requests
+
+      - name: Run Voting Bot
         env:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+
+          SYMBOL: "XAU/USD"
+          TF: ${{ github.event.inputs.tf || '1h' }}
+          OUTPUT_SIZE: "5000"
+          THRESHOLD: ${{ github.event.inputs.threshold || '4.0' }}
+
           ACCOUNT_BALANCE: "10000"
-          RISK_PCT: "0.01"
-          # Path toggles (ubah untuk eksperimen):
-          INSTRUMENT: "XAU/USD"
-          PRIMARY_TF: "4h"
-          MULTI_TF: "1"
-          ENABLE_FRED: "1"
-          ENABLE_ETF_FLOW: "1"
-          REFINED_PRIMARY: "1"
-          CALIBRATE: "1"
-          HURST_MODE: "VETO"
-        run: python 10pilar.py
+          RISK_PCT: "0.003"
+
+          LIVE_MODE: ${{ github.event.inputs.mode == '0' && '0' || '1' }}
+          BACKTEST_MODE: ${{ github.event.inputs.mode == '0' && '1' || '0' }}
+          BACKTEST_DAYS: "90"
+          NOTIFY_HOLD: "0"
+        run: python xauusd_voting_bot.py
