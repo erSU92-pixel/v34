@@ -1,0 +1,36 @@
+name: XAUUSD London Breakout
+on:
+  schedule:
+    - cron: "5 * * * *"   # tiap jam menit ke-5 (bar 1H sudah closed)
+  workflow_dispatch:
+
+concurrency:
+  group: london-bo
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run bot
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          # Risiko (default 0.3% — JANGAN naikkan sebelum 3 bulan konsisten)
+          ACCOUNT_BALANCE: "10000"
+          RISK_PCT: "0.003"
+          # Timing (ubah jika broker GMT+2/3)
+          SERVER_TZ_OFFSET: "0"
+          # Opsional: NOTIFY_HOLD=1 untuk debugging
+          NOTIFY_HOLD: "0"
+        run: python london_breakout.py
