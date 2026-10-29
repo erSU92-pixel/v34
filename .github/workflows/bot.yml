@@ -8,7 +8,7 @@ on:
       mode:
         description: "1=live signal, 0=backtest"
         required: false
-        default: "0"
+        default: "1"
         type: choice
         options: ["1", "0"]
       strategy:
@@ -44,14 +44,15 @@ jobs:
 
           SYMBOL: "XAU/USD"
           TF: "4h"
-          OUTPUT_SIZE: "3000"                # ← lebih banyak data historis
-          STRATEGY: ${{ github.event.inputs.strategy || 'trend' }}   # ← default trend
+          OUTPUT_SIZE: "1000"
+          STRATEGY: ${{ github.event.inputs.strategy || 'trend' }}
 
           ACCOUNT_BALANCE: "10000"
           RISK_PCT: "0.003"
 
-          LIVE_MODE: ${{ github.event.inputs.mode || '0' }}
+          # Default LIVE — kirim sinyal ke Telegram
+          LIVE_MODE: ${{ github.event.inputs.mode == '0' && '0' || '1' }}
           BACKTEST_MODE: ${{ github.event.inputs.mode == '0' && '1' || '0' }}
-          BACKTEST_DAYS: "180"               # ← test 6 bulan
+          BACKTEST_DAYS: "180"
           NOTIFY_HOLD: "0"
         run: python xauusd_bot.py
