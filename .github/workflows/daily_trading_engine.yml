@@ -3,14 +3,19 @@ name: Institutional 18-Pillar 24/5 Engine
 on:
   schedule:
     # Berjalan otomatis setiap 15 menit dari hari Senin sampai Jumat (24/5)
-    # Sabtu dan Minggu otomatis libur total
     - cron: '*/15 * * * 1-5'
     
-  workflow_dispatch: # Memungkinkan tombol 'Run workflow' manual kapan saja di tab Actions
+  workflow_dispatch: # Tombol eksekusi manual kapan saja di tab Actions
+
+# BLOK IZIN TULIS (PENTING untuk mengatasi error 403)
+permissions:
+  contents: write
 
 jobs:
   run-18-pillar-engine:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Repository
