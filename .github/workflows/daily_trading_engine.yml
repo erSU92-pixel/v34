@@ -1,0 +1,43 @@
+name: Institutional 18-Pillar 24/5 Engine
+
+on:
+  schedule:
+    # Berjalan otomatis setiap 15 menit dari hari Senin sampai Jumat (24/5)
+    # Sabtu dan Minggu otomatis libur total
+    - cron: '*/15 * * * 1-5'
+    
+  workflow_dispatch: # Memungkinkan tombol 'Run workflow' manual kapan saja di tab Actions
+
+jobs:
+  run-18-pillar-engine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests matplotlib
+
+      - name: Run 18-Pillar Engine & Telegram Dispatcher
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python main.py
+
+      - name: Commit and Push Updated Signal State
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add signal_state.json
+          git commit -m "chore: update signal state [skip ci]" || echo "No changes to commit"
+          git push
