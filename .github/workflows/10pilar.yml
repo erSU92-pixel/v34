@@ -1,31 +1,23 @@
-name: 10pilar
-
+name: XAUUSD Quant Bot v9.0
 on:
   schedule:
-    - cron: "5 * * * *"   # setiap jam pada menit ke-5 (bar 1H sudah closed)
-  workflow_dispatch:       # manual trigger
-
+    - cron: "5 */4 * * *"   # setiap 4 jam (aligned dengan PRIMARY_TF=4h)
+  workflow_dispatch:
 concurrency:
-  group: xauusd-bot
-  cancel-in-progress: false   # jangan batalkan run yang sedang berjalan
+  group: bot-v9
+  cancel-in-progress: false
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
-      - name: Install dependencies
-        run: |
-          pip install numpy pandas scikit-learn scipy requests
-
+      - run: pip install -r requirements.txt
       - name: Run bot
         env:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
@@ -35,4 +27,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
           ACCOUNT_BALANCE: "10000"
           RISK_PCT: "0.01"
+          # Path toggles (ubah untuk eksperimen):
+          INSTRUMENT: "XAU/USD"
+          PRIMARY_TF: "4h"
+          MULTI_TF: "1"
+          ENABLE_FRED: "1"
+          ENABLE_ETF_FLOW: "1"
+          REFINED_PRIMARY: "1"
+          CALIBRATE: "1"
+          HURST_MODE: "VETO"
         run: python 10pilar.py
