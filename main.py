@@ -1,353 +1,551 @@
 import os
+import re
 import json
+import time
 import logging
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sklearn.ensemble import RandomForestClassifier
 
-# --- KONFIGURASI LOGGING ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] [ApexUltimateEngine] - %(message)s'
-)
-
-# --- KONFIGURASI STATE & FILE PERSISTENSI ---
+# ============================================================
+# CONFIG (APEX OVERLORD v3.1 - MULTI-FEED & RISK MGMT)
+# ============================================================
 STATE_FILE = "signal_state.json"
 REPORT_JSON = "xauusd_apex_report.json"
-TRADES_CSV = "xauusd_apex_trades.csv"
+COOLDOWN_MINUTES = 60
+MIN_BARS_M5 = 60
+MIN_BARS_H1 = 60
+M5_OUTPUTSIZE = 250
+H1_OUTPUTSIZE = 100
+BLOCK_ON_H1_FAILURE = False
+REPORT_MAX_ENTRIES = 500
 
-def load_persistent_state():
-    """Memuat state genetik dengan pemulihan otomatis jika file json corrupt/kosong."""
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                content = f.read().strip()
-                if not content:
-                    raise ValueError("File state kosong")
-                return json.loads(content)
-        except Exception as e:
-            logging.warning(f"State direset otomatis ke default dengan aman: {e}")
-    
-    return {
-        "generation": 1,
-        "pillar_weights": {
-            "trend": 1.0,
-            "momentum": 1.0,
-            "volatility": 1.0,
-            "ml_gate": 1.5
-        },
+# Pengaturan Manajemen Risiko Akun (Bisa disesuaikan dengan akun Cent/Standard Anda)
+ACCOUNT_BALANCE_USD = 10000.0  # Contoh: Saldo akun $10,000 (atau sesuaikan dengan akun Anda)
+RISK_PERCENTAGE = 1.0          # Risiko 1% per transaksi
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [ApexOverlord] - %(message)s",
+)
+
+# ============================================================
+# HELPERS & SECURITY
+# ============================================================
+def _redact(text: str) -> str:
+    """Mask API keys and bot tokens from any string."""
+    text = re.sub(r"apikey=[^&\s'\"]+", "apikey=***", text)
+    text = re.sub(r"/bot[^/\s'\"]+/", "/bot***/", text)
+    return text
+
+
+class DataFetchError(Exception):
+    pass
+
+
+# ============================================================
+# PERSISTENT STATE
+# ============================================================
+def load_state() -> dict:
+    default = {
+        "run_count": 0,
         "last_signal_type": "NEUTRAL",
-        "last_signal_timestamp": ""
+        "last_signal_timestamp": "",
     }
+    if not os.path.exists(STATE_FILE):
+        return default
+    try:
+        with open(STATE_FILE, "r") as f:
+            content = f.read().strip()
+            if not content:
+                raise ValueError("empty state file")
+            data = json.loads(content)
+            return {**default, **data}
+    except Exception as e:
+        logging.warning(f"State reset to default: {_redact(str(e))}")
+        return default
 
-def save_persistent_state(state_data):
-    """Menyimpan state genetik terbaru agar evolusi terus berlanjut secara rekursif."""
+
+def save_state(state: dict) -> None:
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(state_data, f, indent=4)
+            json.dump(state, f, indent=2)
     except Exception as e:
-        logging.error(f"Gagal menyimpan state: {e}")
+        logging.error(f"Save state failed: {_redact(str(e))}")
 
-# --- MODUL 1: MULTI-TIMEFRAME DATA FEEDS (M5 & H1) ---
-def fetch_xauusd_data():
-    """Menarik data live M5 XAUUSD dengan proteksi total terhadap struktur API."""
-    api_key = os.getenv("TWELVEDATA_API_KEY", "demo")
-    symbol = "XAU/USD"
-    url_m5 = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={api_key}"
-    
+
+def append_report(report: dict, path: str = REPORT_JSON, max_entries: int = REPORT_MAX_ENTRIES) -> None:
+    history = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                content = f.read().strip()
+                if content:
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        history = data
+                    elif isinstance(data, dict):
+                        history = [data]
+        except Exception:
+            history = []
+    history.append(report)
+    history = history[-max_entries:]
     try:
-        response = requests.get(url_m5, timeout=10)
-        data = response.json()
-        
-        if "values" in data and isinstance(data["values"], list) and len(data["values"]) > 0:
-            df = pd.DataFrame(data["values"])
-            df = df.iloc[::-1].reset_index(drop=True)
-            
-            for col in ['open', 'high', 'low', 'close']:
-                if col in df.columns:
-                    df[col] = df[col].astype(float)
-            df['volume'] = 100.0
-            logging.info("Berhasil menarik data M5 dari Twelve Data.")
-            return df
-        else:
-            logging.warning("Respon M5 Twelve Data kosong, menggunakan fallback.")
-            return generate_fallback_data()
+        with open(path, "w") as f:
+            json.dump(history, f, indent=2)
     except Exception as e:
-        logging.error(f"Koneksi M5 Twelve Data gagal: {e}. Menggunakan fallback.")
-        return generate_fallback_data()
+        logging.error(f"Save report failed: {_redact(str(e))}")
 
-def fetch_xauusd_h1_data():
-    """Menarik data H1 untuk Multi-Timeframe Trend Confluence."""
-    api_key = os.getenv("TWELVEDATA_API_KEY", "demo")
-    symbol = "XAU/USD"
-    url_h1 = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1h&outputsize=50&apikey={api_key}"
+
+# ============================================================
+# MULTI-SOURCE DATA REDUNDANCY (ANTI-FAILOVER CASCADE)
+# ============================================================
+def fetch_ohlcv_twelvedata(interval: str, outputsize: int) -> pd.DataFrame:
+    api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+    if not api_key or api_key == "demo":
+        raise DataFetchError("TWELVEDATA_API_KEY missing or demo")
+
+    url = (
+        "https://api.twelvedata.com/time_series"
+        f"?symbol=XAU/USD&interval={interval}&outputsize={outputsize}&apikey={api_key}"
+    )
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") == "error":
+        raise DataFetchError(f"TwelveData API error: {data.get('message', 'unknown')}")
+    values = data.get("values")
+    if not isinstance(values, list) or len(values) == 0:
+        raise DataFetchError("TwelveData empty values array")
+
+    df = pd.DataFrame(values).iloc[::-1].reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["volume"] = pd.to_numeric(df.get("volume", np.nan), errors="coerce")
+    return df
+
+
+def fetch_ohlcv_goldapi(interval: str) -> pd.DataFrame:
+    """Sumber cadangan alternatif gratis (Gold-API / Spot Feed)."""
+    # Menggunakan endpoint publik cadangan jika Twelve Data ngadat
+    url = "https://www.gold-api.com/api/XAU/USD"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    res = r.json()
+    price = float(res.get("price", 0))
+    if price <= 0:
+        raise DataFetchError("Gold-API invalid price")
     
-    try:
-        response = requests.get(url_h1, timeout=10)
-        data = response.json()
-        
-        if "values" in data and isinstance(data["values"], list) and len(data["values"]) > 0:
-            df = pd.DataFrame(data["values"])
-            df = df.iloc[::-1].reset_index(drop=True)
-            for col in ['open', 'high', 'low', 'close']:
-                if col in df.columns:
-                    df[col] = df[col].astype(float)
-            return df
-    except Exception as e:
-        logging.warning(f"Gagal mengambil data H1 Confluence: {e}")
-    return None
-
-def generate_fallback_data():
-    np.random.seed(42)
-    base_price = 2650.0
-    prices = base_price + np.cumsum(np.random.normal(0, 0.8, 100))
+    # Membuat dataframe sintetis berbasis tick real-time jika sumber primer putus total
+    now = datetime.now(timezone.utc)
+    dates = pd.date_range(end=now, periods=100, freq=interval)
     df = pd.DataFrame({
-        'datetime': pd.date_range(end=datetime.now(), periods=100, freq='5min'),
-        'open': prices + np.random.uniform(-0.2, 0.2, 100),
-        'high': prices + np.abs(np.random.normal(0.5, 0.2, 100)),
-        'low': prices - np.abs(np.random.normal(0.5, 0.2, 100)),
-        'close': prices,
-        'volume': 100.0
+        "datetime": dates,
+        "open": price + np.random.normal(0, 0.5, 100),
+        "high": price + 1.0,
+        "low": price - 1.0,
+        "close": price + np.random.normal(0, 0.5, 100),
+        "volume": 100.0
     })
     return df
 
-# --- MODUL 2: ADAPTIVE REGIME & NEWS/ANOMALY SHIELD ---
-def detect_market_regime(df: pd.DataFrame) -> dict:
-    high = df['high']
-    low = df['low']
-    
-    atr_short = (high - low).rolling(14).mean().iloc[-1]
-    atr_long = (high - low).rolling(50).mean().iloc[-1]
-    vol_ratio = atr_short / (atr_long if atr_long > 0 else 1.0)
-    
-    # Perisai Berita / Anomali Lonjakan Ekstrem
-    if vol_ratio > 2.5:
-        return {
-            "mode": "HIGH_IMPACT_NEWS_ANOMALY",
-            "threshold": 99, # Blokir total sinyal saat berita liar
-            "desc": "Anomali Volatilitas Ekstrem (Berita High-Impact / Slippage Risk)"
-        }
-    elif vol_ratio > 1.25:
-        return {
-            "mode": "HIGH_VOLATILITY_TREND",
-            "threshold": 11,
-            "desc": "Trending Kuat / Dorongan Volatilitas Tinggi"
-        }
-    elif vol_ratio < 0.85:
-        return {
-            "mode": "CHOPPY_SIDEWAYS",
-            "threshold": 14,
-            "desc": "Sideways / Pasar Sepi (Noise Tinggi)"
-        }
-    else:
-        return {
-            "mode": "NORMAL_MARKET",
-            "threshold": 12,
-            "desc": "Kondisi Normal Seimbang"
-        }
 
-# --- MODUL 3: 19-PILLAR ENGINE + MULTI-TF CONFLUENCE + ML ---
-def run_19_pillar_analysis(df: pd.DataFrame, h1_df: pd.DataFrame = None):
-    close = df['close']
-    
-    ema9 = close.ewm(span=9).mean()
-    ema21 = close.ewm(span=21).mean()
-    ema50 = close.ewm(span=50).mean()
-    sma200 = close.rolling(200).mean() if len(df) >= 200 else close.rolling(len(df)).mean()
-    
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    
+def fetch_ohlcv(interval: str, outputsize: int) -> pd.DataFrame:
+    """Sistem Failover Otomatis: Coba Twelve Data dulu, jika gagal pindah ke Cadangan."""
+    try:
+        logging.info(f"Mencoba menarik data {interval} dari Primary Source (Twelve Data)...")
+        return fetch_ohlcv_twelvedata(interval, outputsize)
+    except Exception as e:
+        logging.warning(f"Primary Source gagal ({_redact(str(e))}). Mengalihkan ke Secondary Feed...")
+        try:
+            return fetch_ohlcv_goldapi(interval)
+        except Exception as e2:
+            raise DataFetchError(f"Semua sumber data gagal total. Error: {_redact(str(e2))}")
+
+
+def validate_ohlcv(df: pd.DataFrame, min_bars: int) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        raise ValueError("no data returned")
+
+    df = df.dropna(subset=["open", "high", "low", "close"]).copy()
+    if len(df) < min_bars:
+        raise ValueError(f"insufficient bars: {len(df)} < {min_bars}")
+
+    prices = df[["open", "high", "low", "close"]]
+    if (prices <= 0).any().any():
+        raise ValueError("non-positive price detected")
+    if (df["high"] < df["low"]).any():
+        raise ValueError("high < low")
+    if (df["high"] < df[["open", "close"]].max(axis=1)).any():
+        raise ValueError("high < max(open, close)")
+    if (df["low"] > df[["open", "close"]].min(axis=1)).any():
+        raise ValueError("low > min(open, close)")
+
+    pct = df["close"].pct_change().abs()
+    if (pct > 0.15).any():
+        idx = pct[pct > 0.15].index[0]
+        raise ValueError(f"extreme spike {pct[idx] * 100:.1f}% at bar {idx}")
+
+    return df.reset_index(drop=True)
+
+
+# ============================================================
+# MARKET HOURS & MACRO NEWS WINDOW SHIELD
+# ============================================================
+def is_market_open(now_utc: datetime) -> bool:
+    wd = now_utc.weekday()
+    h = now_utc.hour
+    if wd == 5:
+        return False
+    if wd == 6:
+        return h >= 22
+    if wd == 4:
+        return h < 21
+    return True
+
+
+def is_macro_news_window(now_utc: datetime) -> bool:
+    h = now_utc.hour
+    m = now_utc.minute
+    if h == 12 or (h == 13 and m <= 45):
+        return True
+    if h == 18 or (h == 19 and m <= 30):
+        return True
+    return False
+
+
+# ============================================================
+# REGIME DETECTION
+# ============================================================
+def _true_range(df: pd.DataFrame) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev = close.shift(1)
+    return pd.concat(
+        [high - low, (high - prev).abs(), (low - prev).abs()], axis=1
+    ).max(axis=1)
+
+
+def detect_regime(df: pd.DataFrame) -> dict:
+    tr = _true_range(df)
+    atr_short = tr.rolling(14).mean().iloc[-1]
+    atr_long = tr.rolling(50).mean().iloc[-1]
+    vol_ratio = float(atr_short / atr_long) if atr_long > 0 else 1.0
+
+    if vol_ratio > 2.2:
+        return {"mode": "HIGH_IMPACT_NEWS_ANOMALY", "threshold": 99, "vol_ratio": round(vol_ratio, 2)}
+    if vol_ratio > 1.25:
+        return {"mode": "HIGH_VOLATILITY_TREND", "threshold": 11, "vol_ratio": round(vol_ratio, 2)}
+    if vol_ratio < 0.85:
+        return {"mode": "CHOPPY_SIDEWAYS", "threshold": 14, "vol_ratio": round(vol_ratio, 2)}
+    return {"mode": "NORMAL_MARKET", "threshold": 12, "vol_ratio": round(vol_ratio, 2)}
+
+
+# ============================================================
+# 18-PILLAR ANALYSIS + H1 CONFLUENCE
+# ============================================================
+def run_pillar_analysis(df: pd.DataFrame, h1_df: pd.DataFrame = None) -> tuple:
+    close = df["close"].astype(float)
+
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    sma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
+
     scores = []
     scores.append(1 if close.iloc[-1] > ema50.iloc[-1] else -1)
     scores.append(1 if ema9.iloc[-1] > ema21.iloc[-1] else -1)
-    scores.append(1 if close.iloc[-1] > sma200.iloc[-1] else -1)
-    
-    r_val = rsi.iloc[-1]
-    scores.append(1 if r_val < 40 else (-1 if r_val > 60 else 0))
-    scores.append(1 if 30 < r_val < 50 else (-1 if 50 < r_val < 70 else 0))
-    scores.append(1 if r_val < 35 else (-1 if r_val > 65 else 0))
-    
+    scores.append(0 if np.isnan(sma200) else (1 if close.iloc[-1] > sma200 else -1))
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + gain / (loss + 1e-9)))
+    r = float(rsi.iloc[-1])
+
+    scores.append(1 if r < 40 else (-1 if r > 60 else 0))
+    scores.append(1 if 30 < r < 50 else (-1 if 50 < r < 70 else 0))
+    scores.append(1 if r < 35 else (-1 if r > 65 else 0))
+
     for i in range(1, 13):
-        shift_val = close.iloc[-1] - close.iloc[-1 - i]
-        scores.append(1 if shift_val > 0 else -1)
-        
-    total_technical_score = sum(scores)
-    
-    # Konfirmasi Multi-Timeframe H1 Confluence Filter
+        scores.append(1 if (close.iloc[-1] - close.iloc[-1 - i]) > 0 else -1)
+
+    total = sum(scores)
+
     h1_trend = "NEUTRAL"
-    if h1_df is not None and len(h1_df) > 20:
-        h1_ema50 = h1_df['close'].ewm(span=50).mean().iloc[-1]
-        h1_close = h1_df['close'].iloc[-1]
-        h1_trend = "BULLISH" if h1_close > h1_ema50 else "BEARISH"
-        
-        # Penalti atau Bonus konfluensi H1
-        if h1_trend == "BULLISH" and total_technical_score > 0:
-            total_technical_score += 2 # Konfirmasi searah tren besar
-        elif h1_trend == "BEARISH" and total_technical_score < 0:
-            total_technical_score -= 2
-            
-    try:
-        df['target'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
-        feature_cols = ['open', 'high', 'low', 'close', 'volume']
-        X = df[feature_cols].iloc[:-1]
-        y = df['target'].iloc[:-1]
-        
-        clf = RandomForestClassifier(n_estimators=50, random_state=42)
-        clf.fit(X, y)
-        
-        latest_features = df[feature_cols].tail(1)
-        ml_prediction = clf.predict(latest_features)[0]
-        ml_prob = np.max(clf.predict_proba(latest_features))
-    except Exception:
-        ml_prediction = 1
-        ml_prob = 0.65
-        
-    return total_technical_score, ml_prediction, ml_prob, h1_trend
+    if h1_df is not None and len(h1_df) >= 50:
+        h1_close = h1_df["close"].astype(float)
+        h1_ema50 = h1_close.ewm(span=50, adjust=False).mean()
+        h1_trend = "BULLISH" if h1_close.iloc[-1] > h1_ema50.iloc[-1] else "BEARISH"
+        if h1_trend == "BULLISH" and total > 0:
+            total += 2
+        elif h1_trend == "BEARISH" and total < 0:
+            total -= 2
 
-# --- MODUL 4: DYNAMIC TP/SL AUTO-CALCULATOR ---
-def calculate_dynamic_tpsl(df: pd.DataFrame, signal_type: str):
-    """Menghitung SL & TP otomatis berbasis Average True Range (ATR)."""
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    
-    atr = (high - low).rolling(14).mean().iloc[-1]
-    current_price = close.iloc[-1]
-    
-    # Rasio Risk to Reward 1:2 (SL = 1.5 ATR, TP = 3.0 ATR)
-    if signal_type == "BUY":
-        sl = round(current_price - (atr * 1.5), 2)
-        tp = round(current_price + (atr * 3.0), 2)
-    elif signal_type == "SELL":
-        sl = round(current_price + (atr * 1.5), 2)
-        tp = round(current_price - (atr * 3.0), 2)
-    else:
-        sl, tp = 0.0, 0.0
-        
-    return sl, tp, round(atr, 2)
+    return total, h1_trend
 
-# --- MODUL 5: TELEGRAM DISPATCHER ---
-def send_telegram_alert(message: str):
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
-    if not token or not chat_id:
-        logging.warning("Kredensial Telegram belum diatur.")
-        return
-        
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    
+
+# ============================================================
+# ML GATE
+# ============================================================
+def build_ml_gate(df: pd.DataFrame) -> dict:
     try:
-        requests.post(url, json=payload, timeout=10)
-        logging.info("Notifikasi Telegram terkirim.")
+        d = df.copy().reset_index(drop=True)
+        d["ret1"] = d["close"].pct_change()
+        d["ret3"] = d["close"].pct_change(3)
+        d["ema9"] = d["close"].ewm(span=9, adjust=False).mean()
+        d["ema21"] = d["close"].ewm(span=21, adjust=False).mean()
+        d["dist_ema9"] = (d["close"] - d["ema9"]) / (d["ema9"] + 1e-9)
+        d["dist_ema21"] = (d["close"] - d["ema21"]) / (d["ema21"] + 1e-9)
+
+        delta = d["close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        d["rsi"] = 100 - (100 / (1 + gain / (loss + 1e-9)))
+
+        tr = _true_range(d)
+        d["atr_pct"] = tr.rolling(14).mean() / (d["close"] + 1e-9)
+
+        d["target"] = (d["close"].shift(-1) > d["close"]).astype(float)
+        d.loc[d.index[-1], "target"] = np.nan
+
+        feats = ["ret1", "ret3", "dist_ema9", "dist_ema21", "rsi", "atr_pct"]
+        train = d.dropna(subset=feats + ["target"])
+
+        if len(train) < 60:
+            return {"valid": False, "reason": f"insufficient_samples({len(train)})"}
+
+        X = train[feats].values
+        y = train["target"].astype(int).values
+
+        split = int(len(train) * 0.7)
+        X_tr, X_te = X[:split], X[split:]
+        y_tr, y_te = y[:split], y[split:]
+
+        clf = RandomForestClassifier(
+            n_estimators=100, max_depth=4, min_samples_leaf=10, random_state=42
+        )
+        clf.fit(X_tr, y_tr)
+        acc = float(clf.score(X_te, y_te))
+        baseline = float(max(y_tr.mean(), 1 - y_tr.mean()))
+
+        latest_feats = d[feats].iloc[-1:].values
+        if np.isnan(latest_feats).any():
+            return {"valid": False, "reason": "latest_features_nan"}
+
+        pred = int(clf.predict(latest_feats)[0])
+        prob = float(np.max(clf.predict_proba(latest_feats)))
+
+        valid = acc > max(0.55, baseline + 0.03)
+        return {"valid": valid, "test_acc": round(acc, 4), "baseline": round(baseline, 4), "pred": pred, "prob": round(prob, 4)}
     except Exception as e:
-        logging.error(f"Gagal mengirim Telegram: {e}")
+        return {"valid": False, "reason": _redact(str(e))}
 
-# --- EKSEKUSI UTAMA (MAIN PIPELINE) ---
-def main():
-    logging.info("Memulai Eksekusi Apex Ultimate Engine v2.0 (Full Advanced Upgrades)...")
-    
-    state = load_persistent_state()
-    state["generation"] += 1
-    
-    for key in state["pillar_weights"]:
-        mutation = np.random.normal(0, 0.02)
-        state["pillar_weights"][key] = round(max(0.5, min(2.0, state["pillar_weights"][key] + mutation)), 4)
-        
-    logging.info(f"[Genetic Evolution Gen-{state['generation']}] Mutasi DNA Berhasil Diterapkan.")
 
-    # 1. Tarik Data M5 & H1
-    df = fetch_xauusd_data()
-    df_closed = df.iloc[:-1].reset_index(drop=True)
-    h1_df = fetch_xauusd_h1_data()
+# ============================================================
+# DYNAMIC TP/SL & LOT CALCULATOR (MANAJEMEN RISIKO)
+# ============================================================
+def calculate_dynamic_tpsl_and_lot(df: pd.DataFrame, signal_type: str) -> tuple:
+    tr = _true_range(df)
+    atr_val = float(tr.rolling(14).mean().iloc[-1])
+    price = float(df["close"].iloc[-1])
+
+    if signal_type == "BUY":
+        sl = round(price - atr_val * 1.5, 2)
+        tp = round(price + atr_val * 3.0, 2)
+    elif signal_type == "SELL":
+        sl = round(price + atr_val * 1.5, 2)
+        tp = round(price - atr_val * 3.0, 2)
+    else:
+        return 0.0, 0.0, 0.0, 0.0
+
+    # Hitung Jarak SL dalam Pips (Untuk XAUUSD, 1 pip = $1.00 per unit atau standar contract size)
+    sl_distance_pips = abs(price - sl)
     
-    # 2. Deteksi Regime & News Shield
-    regime = detect_market_regime(df_closed)
-    logging.info(f"Market Regime Terdeteksi: {regime['mode']} | Ambang Batas: {regime['threshold']}")
+    # Formula Kalkulator Lot: (Saldo * Risiko %) / (Jarak SL dalam Pips * Nilai Pip per Lot Standard $10)
+    # Untuk XAUUSD standar, 1 lot = 100 oz. Risiko dolar per pip = Lot * 10.
+    risk_amount_usd = ACCOUNT_BALANCE_USD * (RISK_PERCENTAGE / 100.0)
+    dollar_per_pip_per_lot = 10.0  # Standar kontrak Gold MT5
     
-    # Jika terdeteksi anomali berita ekstrem, hentikan bot langsung demi keselamatan
-    if regime['mode'] == "HIGH_IMPACT_NEWS_ANOMALY":
-        logging.warning("🚨 ANOMALI BERITA TERDETEKSI! Bot mengamankan diri & memblokir seluruh sinyal.")
+    recommended_lot = risk_amount_usd / (sl_distance_pips * dollar_per_pip_per_lot)
+    recommended_lot = round(max(0.01, min(5.0, recommended_lot)), 2)  # Batasi min 0.01 lot
+
+    return sl, tp, round(atr_val, 2), recommended_lot
+
+
+# ============================================================
+# TELEGRAM DISPATCHER
+# ============================================================
+def send_telegram(message: str) -> bool:
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
+        logging.warning("Telegram credentials missing — skip")
+        return False
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        logging.info("Telegram sent successfully")
+        return True
+    except Exception as e:
+        logging.error(f"Telegram failed: {_redact(str(e))}")
+        return False
+
+
+# ============================================================
+# COOLDOWN GUARD
+# ============================================================
+def should_notify(state: dict, signal_type: str, now_utc: datetime) -> bool:
+    if signal_type == "NEUTRAL":
+        return False
+    if state.get("last_signal_type") != signal_type:
+        return True
+    last_ts = state.get("last_signal_timestamp", "")
+    if not last_ts:
+        return True
+    try:
+        last_dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return (now_utc - last_dt) >= timedelta(minutes=COOLDOWN_MINUTES)
+    except Exception:
+        return True
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def main() -> None:
+    now_utc = datetime.now(timezone.utc)
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    state = load_state()
+    state["run_count"] = int(state.get("run_count", 0)) + 1
+    logging.info(f"=== Apex Overlord v3.1 Run #{state['run_count']} @ {now_str} UTC ===")
+
+    if not is_market_open(now_utc):
+        logging.info("Market closed — skipping cycle.")
+        save_state(state)
         return
 
-    # 3. Analisis 19 Pilar + H1 Confluence + ML
-    tech_score, ml_pred, ml_prob, h1_trend = run_19_pillar_analysis(df_closed, h1_df)
-    
-    # 4. Evaluasi Sinyal
+    if is_macro_news_window(now_utc):
+        logging.warning("🚨 Jendela Rilis Berita Makro — Sinyal ditahan demi keamanan.")
+        save_state(state)
+        return
+
+    # Tarik Data M5 (Dilengkapi Multi-Source Failover)
+    try:
+        df_m5_raw = fetch_ohlcv("5min", M5_OUTPUTSIZE)
+        df_m5 = validate_ohlcv(df_m5_raw, MIN_BARS_M5)
+    except Exception as e:
+        reason = _redact(str(e))
+        logging.error(f"M5 fetch/validate failed: {reason}")
+        send_telegram(
+            f"⚠️ *APEX OVERLORD FAILURE*\n"
+            f"Semua sumber data M5 gagal. Signal *BLOCKED*.\n"
+            f"Reason: `{reason}`"
+        )
+        save_state(state)
+        return
+
+    df_closed = df_m5.iloc[:-1].reset_index(drop=True)
+
+    # Tarik Data H1
+    h1_df = None
+    h1_status = "unavailable"
+    try:
+        h1_raw = fetch_ohlcv("1h", H1_OUTPUTSIZE)
+        h1_df = validate_ohlcv(h1_raw, MIN_BARS_H1)
+        h1_status = "ok"
+    except Exception as e:
+        logging.warning(f"H1 unavailable: {_redact(str(e))}")
+
+    regime = detect_regime(df_closed)
+    logging.info(f"Regime: {regime['mode']} (vol_ratio={regime['vol_ratio']})")
+
+    if regime["mode"] == "HIGH_IMPACT_NEWS_ANOMALY":
+        logging.warning("🚨 News anomaly detected by ATR — all signals blocked.")
+        save_state(state)
+        return
+
+    tech_score, h1_trend = run_pillar_analysis(df_closed, h1_df)
+    ml_result = build_ml_gate(df_closed)
+
+    threshold = regime["threshold"]
+    ml_ok = ml_result.get("valid", False)
+    ml_pred = ml_result.get("pred")
+    ml_prob = ml_result.get("prob", 0.0)
+
     signal_type = "NEUTRAL"
-    threshold = regime['threshold']
-    
-    if tech_score >= threshold and ml_pred == 1 and ml_prob >= 0.60:
-        signal_type = "BUY"
-    elif tech_score <= -threshold and ml_pred == 0 and ml_prob >= 0.60:
-        signal_type = "SELL"
-    else:
-        signal_type = "NEUTRAL"
-        
-    # 5. Cooldown Guard
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    last_signal = state.get("last_signal_type", "NEUTRAL")
-    
-    is_valid_to_notify = True
-    if signal_type == last_signal and signal_type != "NEUTRAL":
-        logging.info("Sinyal sama dengan siklus sebelumnya. Ditahan (Cooldown Guard).")
-        is_valid_to_notify = False
-    
+    if tech_score >= threshold:
+        if not ml_ok or (ml_pred == 1 and ml_prob >= 0.60):
+            signal_type = "BUY"
+    elif tech_score <= -threshold:
+        if not ml_ok or (ml_pred == 0 and ml_prob >= 0.60):
+            signal_type = "SELL"
+
+    notify = should_notify(state, signal_type, now_utc)
+
     if signal_type != "NEUTRAL":
         state["last_signal_type"] = signal_type
         state["last_signal_timestamp"] = now_str
-        
-    save_persistent_state(state)
-    
-    # 6. Hitung Dynamic TP/SL Berbasis ATR
-    sl, tp, atr_val = calculate_dynamic_tpsl(df_closed, signal_type)
-    current_price = df_closed['close'].iloc[-1]
+    save_state(state)
 
-    # 7. Simpan Laporan JSON
+    # Hitung TP/SL & Dynamic Lot Otomatis
+    sl, tp, atr_val, suggested_lot = calculate_dynamic_tpsl_and_lot(df_closed, signal_type)
+    current_price = float(df_closed["close"].iloc[-1])
+
     report = {
         "timestamp": now_str,
-        "generation": state["generation"],
+        "run_count": state["run_count"],
         "regime_mode": regime["mode"],
+        "vol_ratio": regime["vol_ratio"],
+        "h1_status": h1_status,
         "h1_trend": h1_trend,
         "technical_score": tech_score,
-        "ml_probability": float(ml_prob),
+        "threshold": threshold,
+        "ml_valid": ml_ok,
+        "ml_probability": ml_prob,
         "final_signal": signal_type,
+        "entry_price": current_price,
         "recommended_sl": sl,
-        "recommended_tp": tp
+        "recommended_tp": tp,
+        "suggested_lot": suggested_lot,
+        "atr": atr_val,
+        "notify_sent": bool(notify and signal_type != "NEUTRAL"),
     }
-    with open(REPORT_JSON, "w") as f:
-        json.dump(report, f, indent=4)
+    append_report(report)
 
-    # 8. Kirim Telegram dengan Detail Lengkap
-    if signal_type != "NEUTRAL" and is_valid_to_notify:
+    if signal_type != "NEUTRAL" and notify:
+        h1_display = f"{h1_trend} ({h1_status})"
+        ml_display = f"Active (Acc: `{ml_result.get('test_acc')}`)" if ml_ok else "Disabled"
+
         msg = (
-            f"🚀 *APEX QUANT ULTIMATE v2.0* 🚀\n\n"
-            f"📊 *Asset:* XAUUSD (M5 + H1 Confluence)\n"
+            f"👑 *APEX OVERLORD v3.1* 👑\n\n"
+            f"📊 *Asset:* XAUUSD (Multi-Feed & Risk Managed)\n"
             f"🎯 *Signal:* *{signal_type}*\n"
-            f"📌 *Entry Price:* `{current_price}`\n"
-            f"🛑 *Stop Loss (SL):* `{sl}`\n"
-            f"✅ *Take Profit (TP):* `{tp}`\n\n"
+            f"📌 *Entry:* `{current_price}`\n"
+            f"🛑 *SL:* `{sl}` | ✅ *TP:* `{tp}`\n"
+            f"📐 *Recommended Lot:* `{suggested_lot} Lot` _(Risk {RISK_PERCENTAGE}% of ${ACCOUNT_BALANCE_USD})_\n\n"
             f"🧠 *Regime:* `{regime['mode']}`\n"
-            f"📈 *H1 Trend:* `{h1_trend}`\n"
-            f"⚖️ *Tech Score:* `{tech_score}` (Threshold: {threshold})\n"
-            f"🤖 *ML Confidence:* `{ml_prob * 100:.1f}%`\n"
-            f"📐 *ATR Volatility:* `{atr_val}`\n"
-            f"🧬 *Genetic Gen:* `Gen-{state['generation']}`\n"
+            f"📈 *H1 Trend:* `{h1_display}`\n"
+            f"⚖️ *Tech Score:* `{tech_score}` / th `{threshold}`\n"
+            f"🤖 *ML Gate:* {ml_display}\n"
+            f"🔄 *Run:* `#{state['run_count']}`\n"
             f"⏰ *Time:* `{now_str} UTC`\n\n"
-            f"_Eksekusi manual via MT5 Mobile._"
+            f"_Manual execution via MT5 Mobile._"
         )
-        send_telegram_alert(msg)
+        send_telegram(msg)
     else:
-        logging.info(f"Sinyal saat ini: {signal_type}. Tidak ada notifikasi dikirim (Steril dari Noise).")
+        logging.info(f"Signal: {signal_type} | notify={notify} — no dispatch")
 
-    logging.info("Pipeline Apex Ultimate v2.0 Berhasil Dieksekusi Sempurna.")
+    logging.info("=== Overlord v3.1 Cycle Complete ===")
+
 
 if __name__ == "__main__":
     main()
