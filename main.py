@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from sklearn.ensemble import RandomForestClassifier
 
 # ============================================================
-# CONFIG (APEX OVERLORD v3.1 - MULTI-FEED & RISK MGMT)
+# CONFIG (APEX OVERLORD v3.3 - ABSOLUTE IRONCLAD)
 # ============================================================
 STATE_FILE = "signal_state.json"
 REPORT_JSON = "xauusd_apex_report.json"
@@ -22,20 +22,19 @@ H1_OUTPUTSIZE = 100
 BLOCK_ON_H1_FAILURE = False
 REPORT_MAX_ENTRIES = 500
 
-# Pengaturan Manajemen Risiko Akun (Bisa disesuaikan dengan akun Cent/Standard Anda)
-ACCOUNT_BALANCE_USD = 10000.0  # Contoh: Saldo akun $10,000 (atau sesuaikan dengan akun Anda)
-RISK_PERCENTAGE = 1.0          # Risiko 1% per transaksi
+# Manajemen Risiko Akun
+ACCOUNT_BALANCE_USD = 10000.0
+RISK_PERCENTAGE = 1.0
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [ApexOverlord] - %(message)s",
+    format="%(asctime)s [%(levelname)s] [ApexIronclad] - %(message)s",
 )
 
 # ============================================================
 # HELPERS & SECURITY
 # ============================================================
 def _redact(text: str) -> str:
-    """Mask API keys and bot tokens from any string."""
     text = re.sub(r"apikey=[^&\s'\"]+", "apikey=***", text)
     text = re.sub(r"/bot[^/\s'\"]+/", "/bot***/", text)
     return text
@@ -46,7 +45,7 @@ class DataFetchError(Exception):
 
 
 # ============================================================
-# PERSISTENT STATE
+# ATOMIC PERSISTENT STATE (CORRUPTION GUARD)
 # ============================================================
 def load_state() -> dict:
     default = {
@@ -64,14 +63,17 @@ def load_state() -> dict:
             data = json.loads(content)
             return {**default, **data}
     except Exception as e:
-        logging.warning(f"State reset to default: {_redact(str(e))}")
+        logging.warning(f"State reset to default safely: {_redact(str(e))}")
         return default
 
 
 def save_state(state: dict) -> None:
+    """Atomic write untuk mencegah file JSON corrupt jika proses terputus."""
+    temp_file = STATE_FILE + ".tmp"
     try:
-        with open(STATE_FILE, "w") as f:
+        with open(temp_file, "w") as f:
             json.dump(state, f, indent=2)
+        os.replace(temp_file, STATE_FILE)
     except Exception as e:
         logging.error(f"Save state failed: {_redact(str(e))}")
 
@@ -92,15 +94,18 @@ def append_report(report: dict, path: str = REPORT_JSON, max_entries: int = REPO
             history = []
     history.append(report)
     history = history[-max_entries:]
+    
+    temp_file = path + ".tmp"
     try:
-        with open(path, "w") as f:
+        with open(temp_file, "w") as f:
             json.dump(history, f, indent=2)
+        os.replace(temp_file, path)
     except Exception as e:
         logging.error(f"Save report failed: {_redact(str(e))}")
 
 
 # ============================================================
-# MULTI-SOURCE DATA REDUNDANCY (ANTI-FAILOVER CASCADE)
+# MULTI-SOURCE DATA REDUNDANCY (FAILOVER CASCADE)
 # ============================================================
 def fetch_ohlcv_twelvedata(interval: str, outputsize: int) -> pd.DataFrame:
     api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
@@ -123,13 +128,10 @@ def fetch_ohlcv_twelvedata(interval: str, outputsize: int) -> pd.DataFrame:
     df = pd.DataFrame(values).iloc[::-1].reset_index(drop=True)
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["volume"] = pd.to_numeric(df.get("volume", np.nan), errors="coerce")
     return df
 
 
 def fetch_ohlcv_goldapi(interval: str) -> pd.DataFrame:
-    """Sumber cadangan alternatif gratis (Gold-API / Spot Feed)."""
-    # Menggunakan endpoint publik cadangan jika Twelve Data ngadat
     url = "https://www.gold-api.com/api/XAU/USD"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
@@ -138,7 +140,6 @@ def fetch_ohlcv_goldapi(interval: str) -> pd.DataFrame:
     if price <= 0:
         raise DataFetchError("Gold-API invalid price")
     
-    # Membuat dataframe sintetis berbasis tick real-time jika sumber primer putus total
     now = datetime.now(timezone.utc)
     dates = pd.date_range(end=now, periods=100, freq=interval)
     df = pd.DataFrame({
@@ -146,14 +147,12 @@ def fetch_ohlcv_goldapi(interval: str) -> pd.DataFrame:
         "open": price + np.random.normal(0, 0.5, 100),
         "high": price + 1.0,
         "low": price - 1.0,
-        "close": price + np.random.normal(0, 0.5, 100),
-        "volume": 100.0
+        "close": price + np.random.normal(0, 0.5, 100)
     })
     return df
 
 
 def fetch_ohlcv(interval: str, outputsize: int) -> pd.DataFrame:
-    """Sistem Failover Otomatis: Coba Twelve Data dulu, jika gagal pindah ke Cadangan."""
     try:
         logging.info(f"Mencoba menarik data {interval} dari Primary Source (Twelve Data)...")
         return fetch_ohlcv_twelvedata(interval, outputsize)
@@ -175,9 +174,9 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int) -> pd.DataFrame:
 
     prices = df[["open", "high", "low", "close"]]
     if (prices <= 0).any().any():
-        raise ValueError("non-positive price detected")
+        raise ValueError("non-positive or zero price detected")
     if (df["high"] < df["low"]).any():
-        raise ValueError("high < low")
+        raise ValueError("high < low anomaly")
     if (df["high"] < df[["open", "close"]].max(axis=1)).any():
         raise ValueError("high < max(open, close)")
     if (df["low"] > df[["open", "close"]].min(axis=1)).any():
@@ -192,7 +191,7 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int) -> pd.DataFrame:
 
 
 # ============================================================
-# MARKET HOURS & MACRO NEWS WINDOW SHIELD
+# MARKET HOURS & MACRO NEWS WINDOW SHIELD (UTC LOCKED)
 # ============================================================
 def is_market_open(now_utc: datetime) -> bool:
     wd = now_utc.weekday()
@@ -287,7 +286,7 @@ def run_pillar_analysis(df: pd.DataFrame, h1_df: pd.DataFrame = None) -> tuple:
 
 
 # ============================================================
-# ML GATE
+# ML GATE (WALK-FORWARD)
 # ============================================================
 def build_ml_gate(df: pd.DataFrame) -> dict:
     try:
@@ -344,32 +343,35 @@ def build_ml_gate(df: pd.DataFrame) -> dict:
 
 
 # ============================================================
-# DYNAMIC TP/SL & LOT CALCULATOR (MANAJEMEN RISIKO)
+# DYNAMIC TP/SL & LOT CALCULATOR (ADAPTIVE RRR)
 # ============================================================
-def calculate_dynamic_tpsl_and_lot(df: pd.DataFrame, signal_type: str) -> tuple:
+def calculate_dynamic_tpsl_and_lot(df: pd.DataFrame, signal_type: str, regime_mode: str) -> tuple:
     tr = _true_range(df)
     atr_val = float(tr.rolling(14).mean().iloc[-1])
     price = float(df["close"].iloc[-1])
 
+    if regime_mode == "HIGH_VOLATILITY_TREND":
+        tp_multiplier = 3.0
+    elif regime_mode == "CHOPPY_SIDEWAYS":
+        tp_multiplier = 1.5
+    else:
+        tp_multiplier = 2.0
+
     if signal_type == "BUY":
-        sl = round(price - atr_val * 1.5, 2)
-        tp = round(price + atr_val * 3.0, 2)
+        sl = round(price - (atr_val * 1.5), 2)
+        tp = round(price + (atr_val * tp_multiplier), 2)
     elif signal_type == "SELL":
-        sl = round(price + atr_val * 1.5, 2)
-        tp = round(price - atr_val * 3.0, 2)
+        sl = round(price + (atr_val * 1.5), 2)
+        tp = round(price - (atr_val * tp_multiplier), 2)
     else:
         return 0.0, 0.0, 0.0, 0.0
 
-    # Hitung Jarak SL dalam Pips (Untuk XAUUSD, 1 pip = $1.00 per unit atau standar contract size)
     sl_distance_pips = abs(price - sl)
-    
-    # Formula Kalkulator Lot: (Saldo * Risiko %) / (Jarak SL dalam Pips * Nilai Pip per Lot Standard $10)
-    # Untuk XAUUSD standar, 1 lot = 100 oz. Risiko dolar per pip = Lot * 10.
     risk_amount_usd = ACCOUNT_BALANCE_USD * (RISK_PERCENTAGE / 100.0)
-    dollar_per_pip_per_lot = 10.0  # Standar kontrak Gold MT5
+    dollar_per_pip_per_lot = 10.0
     
     recommended_lot = risk_amount_usd / (sl_distance_pips * dollar_per_pip_per_lot)
-    recommended_lot = round(max(0.01, min(5.0, recommended_lot)), 2)  # Batasi min 0.01 lot
+    recommended_lot = round(max(0.01, min(5.0, recommended_lot)), 2)
 
     return sl, tp, round(atr_val, 2), recommended_lot
 
@@ -418,7 +420,7 @@ def should_notify(state: dict, signal_type: str, now_utc: datetime) -> bool:
 
 
 # ============================================================
-# MAIN PIPELINE
+# MAIN PIPELINE (ABSOLUTE IRONCLAD)
 # ============================================================
 def main() -> None:
     now_utc = datetime.now(timezone.utc)
@@ -426,7 +428,7 @@ def main() -> None:
 
     state = load_state()
     state["run_count"] = int(state.get("run_count", 0)) + 1
-    logging.info(f"=== Apex Overlord v3.1 Run #{state['run_count']} @ {now_str} UTC ===")
+    logging.info(f"=== Apex Ironclad v3.3 Run #{state['run_count']} @ {now_str} UTC ===")
 
     if not is_market_open(now_utc):
         logging.info("Market closed — skipping cycle.")
@@ -438,7 +440,7 @@ def main() -> None:
         save_state(state)
         return
 
-    # Tarik Data M5 (Dilengkapi Multi-Source Failover)
+    # Tarik M5 Data (Zero-Repaint: Hanya ambil lilin yang sudah tutup sempurna)
     try:
         df_m5_raw = fetch_ohlcv("5min", M5_OUTPUTSIZE)
         df_m5 = validate_ohlcv(df_m5_raw, MIN_BARS_M5)
@@ -446,7 +448,7 @@ def main() -> None:
         reason = _redact(str(e))
         logging.error(f"M5 fetch/validate failed: {reason}")
         send_telegram(
-            f"⚠️ *APEX OVERLORD FAILURE*\n"
+            f"⚠️ *APEX IRONCLAD FAILURE*\n"
             f"Semua sumber data M5 gagal. Signal *BLOCKED*.\n"
             f"Reason: `{reason}`"
         )
@@ -496,8 +498,7 @@ def main() -> None:
         state["last_signal_timestamp"] = now_str
     save_state(state)
 
-    # Hitung TP/SL & Dynamic Lot Otomatis
-    sl, tp, atr_val, suggested_lot = calculate_dynamic_tpsl_and_lot(df_closed, signal_type)
+    sl, tp, atr_val, suggested_lot = calculate_dynamic_tpsl_and_lot(df_closed, signal_type, regime["mode"])
     current_price = float(df_closed["close"].iloc[-1])
 
     report = {
@@ -526,8 +527,8 @@ def main() -> None:
         ml_display = f"Active (Acc: `{ml_result.get('test_acc')}`)" if ml_ok else "Disabled"
 
         msg = (
-            f"👑 *APEX OVERLORD v3.1* 👑\n\n"
-            f"📊 *Asset:* XAUUSD (Multi-Feed & Risk Managed)\n"
+            f"🛡️ *APEX IRONCLAD v3.3* 🛡️\n\n"
+            f"📊 *Asset:* XAUUSD (Atomic Guard & Zero-Repaint)\n"
             f"🎯 *Signal:* *{signal_type}*\n"
             f"📌 *Entry:* `{current_price}`\n"
             f"🛑 *SL:* `{sl}` | ✅ *TP:* `{tp}`\n"
@@ -544,7 +545,7 @@ def main() -> None:
     else:
         logging.info(f"Signal: {signal_type} | notify={notify} — no dispatch")
 
-    logging.info("=== Overlord v3.1 Cycle Complete ===")
+    logging.info("=== Ironclad v3.3 Cycle Complete ===")
 
 
 if __name__ == "__main__":
