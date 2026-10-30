@@ -1,10 +1,10 @@
 {
-    "generation": 3,
+    "generation": 4,
     "pillar_weights": {
-        "trend": 1.0385,
-        "momentum": 1.0247,
-        "volatility": 1.0142,
-        "ml_gate": 1.5073
+        "trend": 1.0361,
+        "momentum": 1.0266,
+        "volatility": 1.0186,
+        "ml_gate": 1.5166
     },
     "last_signal_type": "NEUTRAL",
     "last_signal_timestamp": ""
