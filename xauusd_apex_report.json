@@ -1,0 +1,17 @@
+[
+  {
+    "timestamp": "2026-10-30 06:32:43",
+    "run_count": 5,
+    "regime": "NORMAL",
+    "h1": "BEARISH",
+    "dxy": "BULLISH",
+    "adx": 29.12,
+    "tech": -3,
+    "signal": "NEUTRAL",
+    "entry": 3991.37164,
+    "sl": 0.0,
+    "tp": 0.0,
+    "be": 0.0,
+    "lot": 0.0
+  }
+]
