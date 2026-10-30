@@ -1,10 +1,10 @@
 {
     "last_signal": "NEUTRAL",
     "last_candle_time": "2026-10-30 10:55:00",
-    "generation": 3,
+    "generation": 4,
     "pillar_weights": {
-        "momentum": 1.039257428360086,
-        "trend": 0.9635536027366374,
-        "volatility": 1.0
+        "momentum": 1.0131,
+        "trend": 1.001,
+        "volatility": 1.0193
     }
 }
