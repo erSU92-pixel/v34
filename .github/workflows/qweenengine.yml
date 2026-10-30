@@ -1,0 +1,59 @@
+name: Institutional Engine v3.0
+
+on:
+  schedule:
+    - cron: '*/15 * * * 0-5'
+  workflow_dispatch:
+
+concurrency:
+  group: institutional-engine-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+          
+      - run: pip install -r requirements.txt
+
+      - name: Run Live Engine
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          ACCOUNT_BALANCE: ${{ secrets.ACCOUNT_BALANCE }}
+          RISK_PERCENT: ${{ secrets.RISK_PERCENT }}
+        run: python bot.py
+
+      - name: Safe Sync, Commit, and Push State
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          
+          if ! git pull origin main --rebase --autostash; then 
+            git rebase --abort; exit 1; 
+          fi
+          
+          FILES=""
+          [ -f signal_state.json ] && FILES="$FILES signal_state.json"
+          [ -f xauusd_apex_report.json ] && FILES="$FILES xauusd_apex_report.json"
+          
+          if [ -n "$FILES" ]; then
+            git add $FILES
+            git commit -m "chore: update engine state v3 [skip ci]" || echo "No changes"
+            git push origin main
+          fi
