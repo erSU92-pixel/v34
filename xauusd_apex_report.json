@@ -13,5 +13,20 @@
     "tp": 0.0,
     "be": 0.0,
     "lot": 0.0
+  },
+  {
+    "timestamp": "2026-10-30 13:38:39",
+    "run_count": 10,
+    "regime": "TREND",
+    "h1": "BEARISH",
+    "dxy": "BEARISH",
+    "adx": 38.0,
+    "tech": -13,
+    "signal": "NEUTRAL",
+    "entry": 3931.82544,
+    "sl": 0.0,
+    "tp": 0.0,
+    "be": 0.0,
+    "lot": 0.0
   }
 ]
