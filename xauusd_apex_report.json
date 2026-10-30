@@ -1,0 +1,22 @@
+[
+  {
+    "timestamp": "2026-10-30 02:06:52",
+    "run_count": 1,
+    "regime_mode": "HIGH_VOLATILITY_TREND",
+    "vol_ratio": 1.48,
+    "h1_status": "ok",
+    "h1_trend": "BEARISH",
+    "technical_score": 10,
+    "threshold": 11,
+    "ml_valid": true,
+    "ml_test_acc": 0.5634,
+    "ml_baseline": 0.5031,
+    "ml_probability": 0.7278,
+    "final_signal": "NEUTRAL",
+    "entry_price": 4010.66828,
+    "recommended_sl": 0.0,
+    "recommended_tp": 0.0,
+    "atr": 6.69,
+    "notify_sent": false
+  }
+]
