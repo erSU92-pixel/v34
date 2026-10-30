@@ -4,6 +4,7 @@
     "generation": 4,
     "pillar_weights": {
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
         "momentum": 1.0131,
         "trend": 1.001,
         "volatility": 1.0193
@@ -11,6 +12,11 @@
         "momentum": 1.0077,
         "trend": 0.9978,
         "volatility": 1.0006
+>>>>>>> Stashed changes
+=======
+        "momentum": 1.0381,
+        "trend": 0.9622,
+        "volatility": 1.0042
 >>>>>>> Stashed changes
     }
 }
