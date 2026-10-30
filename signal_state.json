@@ -1,12 +1,12 @@
 {
-  "run_count": 1,
-  "last_signal_type": "NEUTRAL",
-  "last_signal_timestamp": "",
-  "generation": 4,
-  "pillar_weights": {
-    "trend": 1.0361,
-    "momentum": 1.0266,
-    "volatility": 1.0186,
-    "ml_gate": 1.5166
-  }
+    "run_count": 1,
+    "last_signal_type": "NEUTRAL",
+    "last_signal_timestamp": "",
+    "generation": 5,
+    "pillar_weights": {
+        "trend": 1.0647,
+        "momentum": 1.0371,
+        "volatility": 1.0245,
+        "ml_gate": 1.5133
+    }
 }
