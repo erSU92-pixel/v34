@@ -128,7 +128,7 @@ def main():
     if h1_trend == "BULLISH" and tech_score > 0: tech_score += 2
     if h1_trend == "BEARISH" and tech_score < 0: tech_score -= 2
 
-    # 4. DXY Filter
+    # 4. DXY Filter (UUP Proxy)
     dxy_close = df_dxy['close']
     dxy_ema50 = dxy_close.ewm(span=50, adjust=False).mean()
     dxy_trend = "BEARISH" if dxy_close.iloc[-1] < dxy_ema50.iloc[-1] else "BULLISH"
