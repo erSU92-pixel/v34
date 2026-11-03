@@ -103,5 +103,20 @@
     "tp": 0.0,
     "be": 0.0,
     "lot": 0.0
+  },
+  {
+    "timestamp": "2026-11-03 11:24:48",
+    "run_count": 26,
+    "regime": "NORMAL",
+    "h1": "BEARISH",
+    "dxy": "BULLISH",
+    "adx": 12.86,
+    "tech": 8,
+    "signal": "NEUTRAL",
+    "entry": 3907.10101,
+    "sl": 0.0,
+    "tp": 0.0,
+    "be": 0.0,
+    "lot": 0.0
   }
 ]
