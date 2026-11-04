@@ -2,30 +2,7 @@
 """
 APEX PREDATOR v22.2 — FINAL LIVE-READY XAUUSD Trading Engine
 =============================================================
-
-Forensically hardened. Zero look-ahead. Fail-safe by design.
-
-Key features:
-    ✓ 3-layer confluence (H1 trend + M15 momentum + M5 EMA zone)
-    ✓ ATR regime filter (reject dead/panic markets)
-    ✓ ATR-based SL/TP (RR 1:1 / 1:2 / 1:3, SL = 2×ATR)
-    ✓ Floor-based position sizing (never exceeds declared risk %)
-    ✓ Daily DD Lock (persistent, reset per UTC day)
-    ✓ Max daily signals cap
-    ✓ US holiday + weekend + news blackout
-    ✓ Volume column safe (TwelveData XAU/USD has no volume)
-    ✓ Full diagnostics (explain mode logs each gate)
-    ✓ Killzone PERMANENTLY DISABLED
-
-Commands:
-    python apex_v22.py selftest       # install verification
-    python apex_v22.py smoke          # connectivity + signal explain
-    python apex_v22.py validate       # walk-forward backtest
-    python apex_v22.py test-tg        # telegram test
-    python apex_v22.py run            # ONE-SHOT (GitHub Actions / cron)
-    python apex_v22.py run --loop     # daemon mode
 """
-
 from __future__ import annotations
 
 import argparse
@@ -59,10 +36,6 @@ US_HOLIDAYS = {
     "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
 }
 
-
-# ═══════════════════════════════════════════════════════════════
-# 1. CONFIG
-# ═══════════════════════════════════════════════════════════════
 @dataclass
 class Config:
     symbol: str = "XAUUSD"
@@ -170,10 +143,6 @@ class Config:
         if self.m5_fetch_size < self.min_bars_m5:
             self.m5_fetch_size = max(800, self.min_bars_m5 + 50)
 
-
-# ═══════════════════════════════════════════════════════════════
-# 2. LOGGING + UTIL
-# ═══════════════════════════════════════════════════════════════
 def setup_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.setLevel(level)
@@ -184,25 +153,14 @@ def setup_logging(level: int = logging.INFO) -> None:
     ))
     root.addHandler(h)
 
-
 def redact(text) -> str:
     s = str(text).replace("\n", " ").replace("\r", " ")
-    s = re.sub(r"(token|apikey|api_key|bearer|secret)\s*[=:]\s*[^\s&'\"]+",
-               r"\1=***", s, flags=re.I)
+    s = re.sub(r"(token|apikey|api_key|bearer|secret)\s*[=:]\s*[^\s&'\"]+", r"\1=***", s, flags=re.I)
     return s[:500]
 
+class DataFetchError(Exception): pass
+class StateError(Exception): pass
 
-class DataFetchError(Exception):
-    pass
-
-
-class StateError(Exception):
-    pass
-
-
-# ═══════════════════════════════════════════════════════════════
-# 3. HTTP CLIENT
-# ═══════════════════════════════════════════════════════════════
 class HTTPClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -228,10 +186,6 @@ class HTTPClient:
     def _backoff(attempt: int) -> None:
         time.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.3))
 
-
-# ═══════════════════════════════════════════════════════════════
-# 4. STATE STORE
-# ═══════════════════════════════════════════════════════════════
 class StateStore:
     def __init__(self, cfg: Config, http: HTTPClient):
         self.cfg = cfg
@@ -239,26 +193,17 @@ class StateStore:
         self.use_gist = bool(cfg.gist_id and cfg.gist_token)
         self._cache: Optional[dict] = None
         if cfg.require_state_persistence and not self.use_gist and not cfg.dry_run:
-            raise StateError(
-                "Production mode requires GIST_ID + GIST_TOKEN "
-                "(or set APEX_REQUIRE_STATE_PERSISTENCE=false)"
-            )
+            raise StateError("Production requires GIST_ID + GIST_TOKEN")
 
     def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.cfg.gist_token}",
-            "Accept": "application/vnd.github+json",
-        }
+        return {"Authorization": f"Bearer {self.cfg.gist_token}", "Accept": "application/vnd.github+json"}
 
     def load(self) -> dict:
         if self._cache is not None:
             return self._cache
         if self.use_gist:
             try:
-                r = self.http.request(
-                    "GET", f"https://api.github.com/gists/{self.cfg.gist_id}",
-                    headers=self._headers(),
-                )
+                r = self.http.request("GET", f"https://api.github.com/gists/{self.cfg.gist_id}", headers=self._headers())
                 files = r.json().get("files", {})
                 content = files.get(self.cfg.state_file, {}).get("content", "").strip()
                 self._cache = json.loads(content) if content else {}
@@ -280,13 +225,8 @@ class StateStore:
         self._cache = data
         if self.use_gist:
             try:
-                body = {"files": {self.cfg.state_file: {
-                    "content": json.dumps(data, default=str, sort_keys=True)
-                }}}
-                self.http.request(
-                    "PATCH", f"https://api.github.com/gists/{self.cfg.gist_id}",
-                    headers=self._headers(), json=body,
-                )
+                body = {"files": {self.cfg.state_file: {"content": json.dumps(data, default=str, sort_keys=True)}}}
+                self.http.request("PATCH", f"https://api.github.com/gists/{self.cfg.gist_id}", headers=self._headers(), json=body)
                 return True
             except Exception as e:
                 logging.error(f"Gist save failed: {redact(str(e))}")
@@ -313,10 +253,6 @@ class StateStore:
         self._cache = None
         self.load()
 
-
-# ═══════════════════════════════════════════════════════════════
-# 5. INDICATORS
-# ═══════════════════════════════════════════════════════════════
 class Indicators:
     @staticmethod
     def ema(series: pd.Series, span: int) -> pd.Series:
@@ -350,10 +286,6 @@ class Indicators:
             return None
         return float(np.clip((cur - lo) / (hi - lo), 0.0, 1.0))
 
-
-# ═══════════════════════════════════════════════════════════════
-# 6. MARKET DATA HANDLER
-# ═══════════════════════════════════════════════════════════════
 class MarketDataHandler:
     TD_URL = "https://api.twelvedata.com/time_series"
 
@@ -412,11 +344,12 @@ class MarketDataHandler:
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        # Volume column safe (TwelveData XAU/USD has no volume)
+        
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
         else:
             df["volume"] = 100.0
+            
         df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
         return df[["datetime", "open", "high", "low", "close", "volume"]]
 
@@ -447,10 +380,6 @@ class MarketDataHandler:
 
         return {"M5": m5, "M15": m15, "H1": h1, "H4": h4}
 
-
-# ═══════════════════════════════════════════════════════════════
-# 7. SIGNAL GENERATOR — with explain mode
-# ═══════════════════════════════════════════════════════════════
 @dataclass
 class Signal:
     direction: str
@@ -465,18 +394,11 @@ class Signal:
     reason: str
     signal_bar_ts: str = ""
 
-
 class SignalGenerator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def generate(
-        self,
-        m5: pd.DataFrame,
-        m15: pd.DataFrame,
-        h1: pd.DataFrame,
-        explain: bool = False,
-    ) -> Optional[Signal]:
+    def generate(self, m5: pd.DataFrame, m15: pd.DataFrame, h1: pd.DataFrame, explain: bool = False) -> Optional[Signal]:
         cfg = self.cfg
 
         def _fail(reason: str):
@@ -484,19 +406,15 @@ class SignalGenerator:
                 logging.info(f"[Signal] REJECT: {reason}")
             return None
 
-        if len(m5) < cfg.min_bars_m5 + 1:
-            return _fail(f"M5 bars {len(m5)} < {cfg.min_bars_m5+1}")
-        if len(m15) < cfg.min_bars_m15 + 1:
-            return _fail(f"M15 bars {len(m15)} < {cfg.min_bars_m15+1}")
-        if len(h1) < cfg.min_bars_h1 + 1:
-            return _fail(f"H1 bars {len(h1)} < {cfg.min_bars_h1+1}")
+        if len(m5) < cfg.min_bars_m5 + 1: return _fail(f"M5 bars {len(m5)} < {cfg.min_bars_m5+1}")
+        if len(m15) < cfg.min_bars_m15 + 1: return _fail(f"M15 bars {len(m15)} < {cfg.min_bars_m15+1}")
+        if len(h1) < cfg.min_bars_h1 + 1: return _fail(f"H1 bars {len(h1)} < {cfg.min_bars_h1+1}")
 
         m5 = m5.iloc[:-1].reset_index(drop=True)
         m15 = m15.iloc[:-1].reset_index(drop=True)
         h1 = h1.iloc[:-1].reset_index(drop=True)
         signal_bar_ts = m5["datetime"].iloc[-1].isoformat()
 
-        # [1] H1 trend
         ema50_h1 = Indicators.ema(h1["close"], cfg.ema_trend_fast)
         ema200_h1 = Indicators.ema(h1["close"], cfg.ema_trend_slow)
         p_h1 = float(h1["close"].iloc[-1])
@@ -504,59 +422,43 @@ class SignalGenerator:
         e200 = float(ema200_h1.iloc[-1])
         if p_h1 > e200 and e50 > e200:
             trend = "BUY"
-            if explain:
-                logging.info(f"[Signal] H1 TREND: BUY (close={p_h1:.2f} > EMA200={e200:.2f}, EMA50 > EMA200)")
+            if explain: logging.info(f"[Signal] H1 TREND: BUY (close={p_h1:.2f} > EMA200={e200:.2f})")
         elif p_h1 < e200 and e50 < e200:
             trend = "SELL"
-            if explain:
-                logging.info(f"[Signal] H1 TREND: SELL (close={p_h1:.2f} < EMA200={e200:.2f}, EMA50 < EMA200)")
+            if explain: logging.info(f"[Signal] H1 TREND: SELL (close={p_h1:.2f} < EMA200={e200:.2f})")
         else:
             return _fail(f"H1 trend NEUTRAL (close={p_h1:.2f}, EMA50={e50:.2f}, EMA200={e200:.2f})")
 
-        # [2] M15 momentum
         ema20_m15 = float(Indicators.ema(m15["close"], cfg.ema_fast).iloc[-1])
         ema50_m15 = float(Indicators.ema(m15["close"], cfg.ema_slow).iloc[-1])
-        if trend == "BUY" and ema20_m15 <= ema50_m15:
-            return _fail(f"M15 opposing BUY (EMA20={ema20_m15:.2f} <= EMA50={ema50_m15:.2f})")
-        if trend == "SELL" and ema20_m15 >= ema50_m15:
-            return _fail(f"M15 opposing SELL (EMA20={ema20_m15:.2f} >= EMA50={ema50_m15:.2f})")
-        if explain:
-            logging.info(f"[Signal] M15 MOMENTUM: aligned (EMA20={ema20_m15:.2f} vs EMA50={ema50_m15:.2f})")
+        if trend == "BUY" and ema20_m15 <= ema50_m15: return _fail(f"M15 opposing BUY (EMA20={ema20_m15:.2f} <= EMA50={ema50_m15:.2f})")
+        if trend == "SELL" and ema20_m15 >= ema50_m15: return _fail(f"M15 opposing SELL (EMA20={ema20_m15:.2f} >= EMA50={ema50_m15:.2f})")
+        if explain: logging.info(f"[Signal] M15 MOMENTUM: aligned (EMA20={ema20_m15:.2f} vs EMA50={ema50_m15:.2f})")
 
-        # [3] ATR regime
         atr_now = Indicators.atr_last(m5, cfg.atr_period)
-        if atr_now <= 0:
-            return _fail("ATR=0")
+        if atr_now <= 0: return _fail("ATR=0")
         atr_pct = Indicators.atr_percentile(m5, cfg.atr_period, cfg.atr_pct_lookback)
-        if atr_pct is None:
-            return _fail(f"ATR warmup insufficient (need {cfg.atr_pct_lookback + cfg.atr_period + 1} bars, have {len(m5)})")
-        if not (cfg.atr_pct_min <= atr_pct <= cfg.atr_pct_max):
-            return _fail(f"ATR pct {atr_pct:.0%} outside [{cfg.atr_pct_min:.0%}, {cfg.atr_pct_max:.0%}]")
-        if explain:
-            logging.info(f"[Signal] ATR REGIME: OK (ATR={atr_now:.2f}, pct={atr_pct:.0%})")
+        if atr_pct is None: return _fail(f"ATR warmup insufficient")
+        if not (cfg.atr_pct_min <= atr_pct <= cfg.atr_pct_max): return _fail(f"ATR pct {atr_pct:.0%} outside [{cfg.atr_pct_min:.0%}, {cfg.atr_pct_max:.0%}]")
+        if explain: logging.info(f"[Signal] ATR REGIME: OK (ATR={atr_now:.2f}, pct={atr_pct:.0%})")
 
-        # [4] M5 entry zone
         ema9_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_fast).iloc[-1])
         ema21_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_slow).iloc[-1])
         price = float(m5["close"].iloc[-1])
         zone_lo = ema21_m5 - atr_now * cfg.ema_zone_atr
         zone_hi = ema21_m5 + atr_now * cfg.ema_zone_atr
-        if not (zone_lo <= price <= zone_hi):
-            return _fail(f"Price {price:.2f} outside zone [{zone_lo:.2f}, {zone_hi:.2f}] (EMA21={ema21_m5:.2f})")
-        if explain:
-            logging.info(f"[Signal] M5 ZONE: OK (price={price:.2f} in [{zone_lo:.2f}, {zone_hi:.2f}])")
+        if not (zone_lo <= price <= zone_hi): return _fail(f"Price {price:.2f} outside zone [{zone_lo:.2f}, {zone_hi:.2f}]")
+        if explain: logging.info(f"[Signal] M5 ZONE: OK (price={price:.2f} in [{zone_lo:.2f}, {zone_hi:.2f}])")
 
         if trend == "BUY":
-            if ema9_m5 <= ema21_m5:
-                return _fail(f"M5 EMA9={ema9_m5:.2f} <= EMA21={ema21_m5:.2f} (no bullish cross)")
+            if ema9_m5 <= ema21_m5: return _fail(f"M5 EMA9={ema9_m5:.2f} <= EMA21={ema21_m5:.2f} (no bullish cross)")
             direction = "BUY"
             sl = price - atr_now * cfg.atr_sl_mult
             tp1 = price + atr_now * cfg.atr_tp1_mult
             tp2 = price + atr_now * cfg.atr_tp2_mult
             tp3 = price + atr_now * cfg.atr_tp3_mult
         else:
-            if ema9_m5 >= ema21_m5:
-                return _fail(f"M5 EMA9={ema9_m5:.2f} >= EMA21={ema21_m5:.2f} (no bearish cross)")
+            if ema9_m5 >= ema21_m5: return _fail(f"M5 EMA9={ema9_m5:.2f} >= EMA21={ema21_m5:.2f} (no bearish cross)")
             direction = "SELL"
             sl = price + atr_now * cfg.atr_sl_mult
             tp1 = price - atr_now * cfg.atr_tp1_mult
@@ -564,26 +466,9 @@ class SignalGenerator:
             tp3 = price - atr_now * cfg.atr_tp3_mult
 
         p = cfg.price_decimals
-        if explain:
-            logging.info(f"[Signal] ✅ ALL GATES PASSED → {direction}")
-        return Signal(
-            direction=direction,
-            entry=round(price, p),
-            sl=round(sl, p),
-            tp1=round(tp1, p),
-            tp2=round(tp2, p),
-            tp3=round(tp3, p),
-            atr=atr_now,
-            atr_pct=atr_pct,
-            trend_h1=trend,
-            reason=f"H1={trend} | M15 aligned | ATR%={atr_pct:.0%}",
-            signal_bar_ts=signal_bar_ts,
-        )
+        if explain: logging.info(f"[Signal] ✅ ALL GATES PASSED → {direction}")
+        return Signal(direction, round(price, p), round(sl, p), round(tp1, p), round(tp2, p), round(tp3, p), atr_now, atr_pct, trend, f"H1={trend} | M15 aligned | ATR%={atr_pct:.0%}", signal_bar_ts)
 
-
-# ═══════════════════════════════════════════════════════════════
-# 8. RISK MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
 class RiskManagementEngine:
     def __init__(self, cfg: Config, store: StateStore):
         self.cfg = cfg
@@ -594,10 +479,8 @@ class RiskManagementEngine:
         if "current_balance" in state:
             try:
                 v = float(state["current_balance"])
-                if v > 0:
-                    return v
-            except (ValueError, TypeError):
-                pass
+                if v > 0: return v
+            except (ValueError, TypeError): pass
         return float(self.cfg.account_balance)
 
     def _ensure_balance_initialized(self) -> None:
@@ -607,8 +490,7 @@ class RiskManagementEngine:
             self.store.save(state)
 
     def apply_trade_result(self, r_multiple: float, risk_amount_usd: float) -> None:
-        if risk_amount_usd <= 0:
-            return
+        if risk_amount_usd <= 0: return
         state = self.store.load()
         bal = float(state.get("current_balance", self.cfg.account_balance))
         state["current_balance"] = bal + (risk_amount_usd * r_multiple)
@@ -627,17 +509,16 @@ class RiskManagementEngine:
             state["daily_signal_count"] = 0
             self.store.save(state)
 
-        if state.get("daily_locked"):
-            return True, "daily_dd_locked"
+        if state.get("daily_locked"): return True, "daily_dd_locked"
 
         start = float(state.get("daily_start_balance", balance))
-        if start <= 0:
-            return False, ""
+        if start <= 0: return False, ""
+        
         dd_pct = (start - balance) / start * 100.0
         if dd_pct >= self.cfg.max_daily_loss_pct:
             state["daily_locked"] = True
             self.store.save(state)
-            logging.warning(f"🛑 DAILY DD LOCK: -{dd_pct:.2f}% (start ${start:.2f} → ${balance:.2f})")
+            logging.warning(f"🛑 DAILY DD LOCK: -{dd_pct:.2f}%")
             return True, f"daily_dd_{dd_pct:.2f}%"
 
         sig_count = int(state.get("daily_signal_count", 0))
@@ -652,12 +533,9 @@ class RiskManagementEngine:
         self.store.save(state)
 
     def compute_lot(self, balance: float, entry: float, sl: float) -> Optional[float]:
-        if balance < self.cfg.min_balance_for_trading:
-            logging.warning(f"balance ${balance:.2f} < min ${self.cfg.min_balance_for_trading}")
-            return None
+        if balance < self.cfg.min_balance_for_trading: return None
         sl_dist = abs(entry - sl)
-        if sl_dist <= 1e-6:
-            return None
+        if sl_dist <= 1e-6: return None
 
         risk_usd = balance * (self.cfg.risk_pct_per_trade / 100.0)
         lot_raw = risk_usd / (sl_dist * self.cfg.contract_size)
@@ -671,16 +549,10 @@ class RiskManagementEngine:
             lot = max(self.cfg.min_lot, lot)
 
         min_risk = self.cfg.min_lot * self.cfg.contract_size * sl_dist
-        if min_risk > balance * (self.cfg.max_min_lot_risk_pct / 100.0):
-            logging.warning(f"min-lot risk ${min_risk:.2f} > {self.cfg.max_min_lot_risk_pct}% of ${balance:.2f}")
-            return None
+        if min_risk > balance * (self.cfg.max_min_lot_risk_pct / 100.0): return None
 
         return lot
 
-
-# ═══════════════════════════════════════════════════════════════
-# 9. NEWS SAFETY FILTER
-# ═══════════════════════════════════════════════════════════════
 class NewsSafetyFilter:
     FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
@@ -690,8 +562,7 @@ class NewsSafetyFilter:
         self.store = store
 
     def is_blackout(self) -> Tuple[bool, str]:
-        if self.cfg.news_blackout_min <= 0:
-            return False, ""
+        if self.cfg.news_blackout_min <= 0: return False, ""
 
         cached = self.store.get("news_cache", {}) or {}
         now_ts = time.time()
@@ -702,29 +573,22 @@ class NewsSafetyFilter:
             r = self.http.request("GET", self.FF_URL, headers={"User-Agent": "Mozilla/5.0"})
             events = r.json()
             self.store.set("news_fail_count", 0)
-        except Exception as e:
-            logging.warning(f"News fetch failed: {redact(str(e))}")
+        except Exception:
             fc = int(self.store.get("news_fail_count", 0)) + 1
             self.store.set("news_fail_count", fc)
-            if fc >= self.cfg.news_max_consecutive_fail:
-                return True, f"news_api_down_{fc}x"
-            if self.cfg.news_fail_open:
-                return False, ""
+            if fc >= self.cfg.news_max_consecutive_fail: return True, f"news_api_down"
+            if self.cfg.news_fail_open: return False, ""
             return True, "news_api_down"
 
         now = datetime.now(UTC)
         bm = self.cfg.news_blackout_min
         for ev in events:
-            if str(ev.get("country", "")).upper() != "USD":
-                continue
-            if str(ev.get("impact", "")).lower() != "high":
-                continue
+            if str(ev.get("country", "")).upper() != "USD": continue
+            if str(ev.get("impact", "")).lower() != "high": continue
             try:
                 evt = datetime.fromisoformat(str(ev["date"]).replace("Z", "+00:00"))
-                if evt.tzinfo is None:
-                    evt = evt.replace(tzinfo=UTC)
-            except Exception:
-                continue
+                if evt.tzinfo is None: evt = evt.replace(tzinfo=UTC)
+            except Exception: continue
             if abs((evt - now).total_seconds()) / 60.0 <= bm:
                 title = str(ev.get("title", "High-impact USD"))
                 self.store.set("news_cache", {"ts": now_ts, "blackout": True, "title": title})
@@ -733,10 +597,6 @@ class NewsSafetyFilter:
         self.store.set("news_cache", {"ts": now_ts, "blackout": False, "title": ""})
         return False, ""
 
-
-# ═══════════════════════════════════════════════════════════════
-# 10. TELEGRAM
-# ═══════════════════════════════════════════════════════════════
 class TelegramNotifier:
     def __init__(self, cfg: Config, http: HTTPClient, store: StateStore):
         self.cfg = cfg
@@ -746,68 +606,52 @@ class TelegramNotifier:
         self.chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
     def send(self, text: str) -> bool:
-        if self.cfg.dry_run:
-            text = "🧪 <b>[DRY RUN]</b>\n" + text
+        if self.cfg.dry_run: text = "🧪 <b>[DRY RUN]</b>\n" + text
         if not (self.token and self.chat):
             if self.cfg.dry_run:
                 logging.info(f"[DRY-TG] {redact(text)}")
                 return True
-            logging.error("Telegram not configured")
             return False
 
         digest = hashlib.sha256(text.encode()).hexdigest()[:16]
         now = datetime.now(UTC)
         hashes = self.store.get("tg_hashes", {}) or {}
         hashes = {k: v for k, v in hashes.items() if self._recent(v, now, 3600)}
-        if digest in hashes:
-            return True
+        if digest in hashes: return True
 
         try:
-            r = self.http.request(
-                "POST",
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat, "text": text, "parse_mode": "HTML"},
-            )
+            r = self.http.request("POST", f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat, "text": text, "parse_mode": "HTML"})
             if r.json().get("ok"):
                 hashes[digest] = now.isoformat()
                 self.store.set("tg_hashes", hashes)
                 return True
-        except Exception as e:
-            logging.error(f"Telegram failed: {redact(str(e))}")
+        except Exception: pass
         return False
 
     @staticmethod
     def _recent(iso: str, now: datetime, sec: int) -> bool:
-        try:
-            return (now - datetime.fromisoformat(iso)).total_seconds() < sec
-        except Exception:
-            return False
+        try: return (now - datetime.fromisoformat(iso)).total_seconds() < sec
+        except Exception: return False
 
     def format_signal(self, sig: Signal, lot: float, balance: float, risk_usd: float) -> str:
         p = self.cfg.price_decimals
         sl_dist = abs(sig.entry - sig.sl)
         emoji = "🟢" if sig.direction == "BUY" else "🔴"
-        rr1 = abs(sig.tp1 - sig.entry) / sl_dist if sl_dist > 0 else 0
-        rr3 = abs(sig.tp3 - sig.entry) / sl_dist if sl_dist > 0 else 0
         return (
             f"{emoji} <b>{self.cfg.symbol} — {sig.direction}</b> (M5)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 <b>Entry:</b> <code>{sig.entry:.{p}f}</code>\n"
-            f"🛑 <b>SL   :</b> <code>{sig.sl:.{p}f}</code>  (<i>-{sl_dist:.{p}f}</i>)\n"
-            f"🎯 <b>TP1  :</b> <code>{sig.tp1:.{p}f}</code>  (<i>+{abs(sig.tp1-sig.entry):.{p}f} • RR 1:{rr1:.1f}</i>)\n"
-            f"🎯 <b>TP2  :</b> <code>{sig.tp2:.{p}f}</code>  (<i>+{abs(sig.tp2-sig.entry):.{p}f}</i>)\n"
-            f"🎯 <b>TP3  :</b> <code>{sig.tp3:.{p}f}</code>  (<i>+{abs(sig.tp3-sig.entry):.{p}f} • RR 1:{rr3:.1f}</i>)\n"
+            f"🛑 <b>SL   :</b> <code>{sig.sl:.{p}f}</code>\n"
+            f"🎯 <b>TP1  :</b> <code>{sig.tp1:.{p}f}</code>\n"
+            f"🎯 <b>TP2  :</b> <code>{sig.tp2:.{p}f}</code>\n"
+            f"🎯 <b>TP3  :</b> <code>{sig.tp3:.{p}f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 <b>Lot:</b> <code>{lot}</code>\n"
-            f"💰 <b>Risk:</b> ${risk_usd:.2f} ({self.cfg.risk_pct_per_trade:.1f}% of ${balance:.2f})\n"
+            f"💰 <b>Risk:</b> ${risk_usd:.2f} ({self.cfg.risk_pct_per_trade:.1f}%)\n"
             f"📊 ATR: {sig.atr:.2f} (pct {sig.atr_pct:.0%})\n"
             f"🧠 {sig.reason}"
         )
 
-
-# ═══════════════════════════════════════════════════════════════
-# 11. OUTCOME TRACKER
-# ═══════════════════════════════════════════════════════════════
 class OutcomeTracker:
     def __init__(self, cfg: Config, store: StateStore, risk: RiskManagementEngine):
         self.cfg = cfg
@@ -822,12 +666,9 @@ class OutcomeTracker:
         now = datetime.now(UTC)
 
         for entry in journal:
-            if entry.get("outcome") not in ("PENDING", None):
-                continue
-            try:
-                ts = pd.Timestamp(entry.get("signal_ts", entry.get("timestamp")), tz="UTC")
-            except Exception:
-                continue
+            if entry.get("outcome") not in ("PENDING", None): continue
+            try: ts = pd.Timestamp(entry.get("signal_ts", entry.get("timestamp")), tz="UTC")
+            except Exception: continue
 
             if (now - ts.to_pydatetime()) > timedelta(hours=24):
                 entry["outcome"] = "STALE"
@@ -836,27 +677,18 @@ class OutcomeTracker:
                 continue
 
             side = entry["signal"]
-            ep = float(entry["entry"])
-            sl = float(entry["sl"])
-            tp1 = float(entry["tp1"])
-            tp3 = float(entry["tp3"])
+            ep, sl, tp1, tp3 = float(entry["entry"]), float(entry["sl"]), float(entry["tp1"]), float(entry["tp3"])
             risk_usd = float(entry.get("risk_amount_usd", 0.0))
 
             bars = m5[m5["datetime"] > ts].sort_values("datetime")
-            if bars.empty:
-                continue
+            if bars.empty: continue
 
             if not entry.get("filled"):
                 fill_idx = None
                 for i, b in enumerate(bars.itertuples(index=False)):
-                    if side == "BUY" and b.low <= ep:
-                        fill_idx = i
-                        break
-                    if side == "SELL" and b.high >= ep:
-                        fill_idx = i
-                        break
-                if fill_idx is None:
-                    continue
+                    if side == "BUY" and b.low <= ep: fill_idx = i; break
+                    if side == "SELL" and b.high >= ep: fill_idx = i; break
+                if fill_idx is None: continue
                 entry["filled"] = 1
                 changed = True
                 walk = bars.iloc[fill_idx:]
@@ -874,8 +706,7 @@ class OutcomeTracker:
                         outcome = "WIN_BE" if hit_tp1 else "LOSS"
                         r_val = 0.0 if hit_tp1 else -1.0
                         break
-                    if not hit_tp1 and b.high >= tp1:
-                        hit_tp1 = True
+                    if not hit_tp1 and b.high >= tp1: hit_tp1 = True
                     if b.high >= tp3:
                         outcome = "WIN_TP3"
                         r_val = (tp3 - ep) / abs(ep - sl)
@@ -885,8 +716,7 @@ class OutcomeTracker:
                         outcome = "WIN_BE" if hit_tp1 else "LOSS"
                         r_val = 0.0 if hit_tp1 else -1.0
                         break
-                    if not hit_tp1 and b.low <= tp1:
-                        hit_tp1 = True
+                    if not hit_tp1 and b.low <= tp1: hit_tp1 = True
                     if b.low <= tp3:
                         outcome = "WIN_TP3"
                         r_val = (ep - tp3) / abs(ep - sl)
@@ -906,10 +736,6 @@ class OutcomeTracker:
             self.store.save(state)
         return closed
 
-
-# ═══════════════════════════════════════════════════════════════
-# 12. ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════
 class TradingBotOrchestrator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -925,25 +751,19 @@ class TradingBotOrchestrator:
     def _is_weekend_or_closed(self, now: datetime) -> Tuple[bool, str]:
         wd = now.weekday()
         h = now.hour
-        if wd == 5:
-            return True, "Saturday"
-        if wd == 6 and h < 22:
-            return True, "Sunday pre-open"
-        if wd == 4 and h >= 21:
-            return True, "Friday post-close"
+        if wd == 5: return True, "Saturday"
+        if wd == 6 and h < 22: return True, "Sunday pre-open"
+        if wd == 4 and h >= 21: return True, "Friday post-close"
         return False, ""
 
     def _cooldown_active(self) -> bool:
         last = self.store.get("last_signal_ts", "")
-        if not last:
-            return False
+        if not last: return False
         try:
             t = datetime.fromisoformat(last)
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=UTC)
+            if t.tzinfo is None: t = t.replace(tzinfo=UTC)
             return (datetime.now(UTC) - t) < timedelta(minutes=self.cfg.cooldown_minutes)
-        except Exception:
-            return False
+        except Exception: return False
 
     def _count_pending(self) -> int:
         journal = self.store.get("journal", []) or []
@@ -951,46 +771,30 @@ class TradingBotOrchestrator:
         cutoff = now - timedelta(hours=24)
         n = 0
         for j in journal:
-            if j.get("outcome") != "PENDING":
-                continue
+            if j.get("outcome") != "PENDING": continue
             try:
                 ts = datetime.fromisoformat(j.get("signal_ts", j.get("timestamp", "")))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                if ts > cutoff:
-                    n += 1
-            except Exception:
-                n += 1
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=UTC)
+                if ts > cutoff: n += 1
+            except Exception: n += 1
         return n
 
     def tick(self, explain: bool = False) -> None:
         now = datetime.now(UTC)
-
-        if self.cfg.kill_switch:
-            logging.info("KILL switch → abort")
-            return
+        if self.cfg.kill_switch: return
 
         weekend, wreason = self._is_weekend_or_closed(now)
-        if weekend:
-            logging.info(f"Market closed ({wreason}) → skip")
-            return
+        if weekend: return
 
-        if now.date().isoformat() in US_HOLIDAYS:
-            logging.info(f"US holiday ({now.date()}) → skip")
-            return
+        if now.date().isoformat() in US_HOLIDAYS: return
 
         locked, reason = self.risk.daily_dd_check()
-        if locked:
-            logging.warning(f"Gate blocked: {reason}")
-            return
+        if locked: return
 
         blackout, title = self.news.is_blackout()
-        if blackout:
-            logging.info(f"News blackout: {title}")
-            return
+        if blackout: return
 
-        try:
-            dfs = self.data.fetch_all()
+        try: dfs = self.data.fetch_all()
         except Exception as e:
             logging.error(f"Data fetch: {redact(str(e))}")
             return
@@ -998,87 +802,48 @@ class TradingBotOrchestrator:
         try:
             closed = self.tracker.update(dfs["M5"])
             for ev in closed:
-                emoji = "🏆" if ev["outcome"].startswith("WIN") else (
-                    "⚖️" if ev["outcome"] == "WIN_BE" else "💀"
-                )
-                self.tg.send(
-                    f"{emoji} <b>Trade Closed</b> — {ev['signal']} {self.cfg.symbol}\n"
-                    f"Outcome: <b>{ev['outcome']}</b>  ({ev['r_achieved']:+.2f}R)\n"
-                    f"Entry: {ev['entry']}  SL: {ev['sl']}"
-                )
-        except Exception as e:
-            logging.error(f"Tracker: {redact(str(e))}")
+                emoji = "🏆" if ev["outcome"].startswith("WIN") else ("⚖️" if ev["outcome"] == "WIN_BE" else "💀")
+                self.tg.send(f"{emoji} <b>Trade Closed</b> — {ev['signal']}\nOutcome: <b>{ev['outcome']}</b> ({ev['r_achieved']:+.2f}R)")
+        except Exception: pass
 
-        if self._cooldown_active():
-            logging.info("Cooldown active")
-            return
-        if self._count_pending() >= self.cfg.max_pending:
-            logging.info(f"Max pending ({self.cfg.max_pending})")
-            return
+        if self._cooldown_active() or self._count_pending() >= self.cfg.max_pending: return
 
         sig = self.signal.generate(dfs["M5"], dfs["M15"], dfs["H1"], explain=explain)
         if sig is None:
-            logging.info("No signal")
+            if not explain: logging.info("No signal")
             return
 
         balance = self.risk.current_balance()
         lot = self.risk.compute_lot(balance, sig.entry, sig.sl)
-        if lot is None:
-            logging.warning("Sizing rejected")
-            return
+        if lot is None: return
         risk_usd = round(lot * self.cfg.contract_size * abs(sig.entry - sig.sl), 2)
 
         msg = self.tg.format_signal(sig, lot, balance, risk_usd)
-        if not self.tg.send(msg):
-            logging.error("Telegram failed → trade not journaled")
-            return
+        if not self.tg.send(msg): return
 
         state = self.store.load()
         journal = state.get("journal", []) or []
         journal.append({
             "id": f"{now.strftime('%Y%m%dT%H%M%S')}_{sig.direction}",
-            "timestamp": now.isoformat(),
-            "signal_ts": sig.signal_bar_ts,
-            "symbol": self.cfg.symbol,
-            "signal": sig.direction,
-            "entry": sig.entry,
-            "sl": sig.sl,
-            "tp1": sig.tp1,
-            "tp2": sig.tp2,
-            "tp3": sig.tp3,
-            "lot": lot,
-            "risk_amount_usd": risk_usd,
-            "atr": sig.atr,
-            "outcome": "PENDING",
-            "filled": 0,
-            "r_achieved": 0.0,
+            "timestamp": now.isoformat(), "signal_ts": sig.signal_bar_ts, "symbol": self.cfg.symbol,
+            "signal": sig.direction, "entry": sig.entry, "sl": sig.sl, "tp1": sig.tp1, "tp2": sig.tp2, "tp3": sig.tp3,
+            "lot": lot, "risk_amount_usd": risk_usd, "atr": sig.atr, "outcome": "PENDING", "filled": 0, "r_achieved": 0.0,
         })
         state["journal"] = journal[-500:]
         state["last_signal_ts"] = now.isoformat()
         self.store.save(state)
         self.risk.increment_daily_signal()
-
-        logging.info(
-            f"✅ Signal: {sig.direction} lot={lot} entry={sig.entry} "
-            f"sl={sig.sl} risk=${risk_usd:.2f} bal=${balance:.2f}"
-        )
+        logging.info(f"✅ Signal: {sig.direction} lot={lot} entry={sig.entry} sl={sig.sl}")
 
     def run_once(self, explain: bool = False) -> None:
-        try:
-            self.tick(explain=explain)
-        except Exception:
-            logging.exception("Unhandled in tick")
+        try: self.tick(explain=explain)
+        except Exception: logging.exception("Unhandled in tick")
 
     def run_loop(self) -> None:
-        logging.info(f"🚀 APEX v{VERSION} loop every {self.cfg.loop_interval_sec}s")
         while not self.cfg.kill_switch:
             self.run_once()
             time.sleep(self.cfg.loop_interval_sec)
 
-
-# ═══════════════════════════════════════════════════════════════
-# 13. CLI COMMANDS
-# ═══════════════════════════════════════════════════════════════
 def cmd_smoke(cfg: Config) -> None:
     http = HTTPClient(cfg)
     store = StateStore(cfg, http)
@@ -1086,185 +851,81 @@ def cmd_smoke(cfg: Config) -> None:
     sig_gen = SignalGenerator(cfg)
     print("─── SMOKE TEST (with full diagnostics) ───")
     dfs = data.fetch_all()
-    for tf, df in dfs.items():
-        print(f"  {tf}: {len(df)} bars | last={df['close'].iloc[-1]:.2f} @ {df['datetime'].iloc[-1]}")
+    for tf, df in dfs.items(): print(f"  {tf}: {len(df)} bars | last={df['close'].iloc[-1]:.2f} @ {df['datetime'].iloc[-1]}")
     print("\n--- Signal Pipeline ---")
     sig = sig_gen.generate(dfs["M5"], dfs["M15"], dfs["H1"], explain=True)
-    if sig:
-        print(f"\n✅ SIGNAL: {sig.direction}")
-        print(f"   entry={sig.entry}  sl={sig.sl}  tp1={sig.tp1}  tp2={sig.tp2}  tp3={sig.tp3}")
-        print(f"   {sig.reason}")
-    else:
-        print("\n⊘ No signal — see REJECT reason above")
-
+    if sig: print(f"\n✅ SIGNAL: {sig.direction} entry={sig.entry} sl={sig.sl}")
+    else: print("\n⊘ No signal — see REJECT reason above")
     tg = TelegramNotifier(cfg, http, store)
-    ok = tg.send(f"<b>🔔 APEX v{VERSION} SMOKE OK</b>")
-    print(f"\nTelegram: {'✓ SENT' if ok else '✗ FAILED'}")
-
+    print(f"\nTelegram: {'✓ SENT' if tg.send(f'<b>🔔 APEX v{VERSION} SMOKE OK</b>') else '✗ FAILED'}")
 
 def cmd_validate(cfg: Config) -> None:
     print("─── WALK-FORWARD VALIDATION ───")
-    http = HTTPClient(cfg)
-    store = StateStore(cfg, http)
-    data = MarketDataHandler(cfg, http, store)
-    sig_gen = SignalGenerator(cfg)
-
+    http = HTTPClient(cfg); store = StateStore(cfg, http); data = MarketDataHandler(cfg, http, store); sig_gen = SignalGenerator(cfg)
     dfs = data.fetch_all()
-    m5 = dfs["M5"].reset_index(drop=True)
-    m15 = dfs["M15"].reset_index(drop=True)
-    h1 = dfs["H1"].reset_index(drop=True)
-
-    n = len(m5)
-    lookback = cfg.min_bars_m5 + 20
-    step = 3
-    forward = 60
+    m5, m15, h1 = dfs["M5"].reset_index(drop=True), dfs["M15"].reset_index(drop=True), dfs["H1"].reset_index(drop=True)
+    n, lookback, step, forward = len(m5), cfg.min_bars_m5 + 20, 3, 60
     results = []
 
     for i in range(lookback, n - forward, step):
         cur_ts = m5.iloc[i]["datetime"]
-        m5w = m5.iloc[:i + 1]
-        m15w = m15[m15["datetime"] <= cur_ts]
-        h1w = h1[h1["datetime"] <= cur_ts]
-        if len(m15w) < cfg.min_bars_m15 + 1 or len(h1w) < cfg.min_bars_h1 + 1:
-            continue
-
-        sig = sig_gen.generate(m5w, m15w, h1w)
-        if sig is None:
-            continue
-
+        sig = sig_gen.generate(m5.iloc[:i + 1], m15[m15["datetime"] <= cur_ts], h1[h1["datetime"] <= cur_ts])
+        if sig is None: continue
         fut = m5.iloc[i:i + forward]
         fill_idx = None
         for j, b in enumerate(fut.itertuples(index=False)):
-            if sig.direction == "BUY" and b.low <= sig.entry:
-                fill_idx = j; break
-            if sig.direction == "SELL" and b.high >= sig.entry:
-                fill_idx = j; break
-        if fill_idx is None:
-            continue
-
-        post = fut.iloc[fill_idx:]
-        rr = abs(sig.entry - sig.sl)
-        if rr <= 0:
-            continue
-        outcome = "OPEN"
-        r_val = 0.0
-        hit_tp1 = False
+            if sig.direction == "BUY" and b.low <= sig.entry: fill_idx = j; break
+            if sig.direction == "SELL" and b.high >= sig.entry: fill_idx = j; break
+        if fill_idx is None: continue
+        post = fut.iloc[fill_idx:]; rr = abs(sig.entry - sig.sl)
+        outcome = "OPEN"; r_val = 0.0; hit_tp1 = False
         for b in post.itertuples(index=False):
             active_sl = sig.entry if hit_tp1 else sig.sl
             if sig.direction == "BUY":
-                if b.low <= active_sl:
-                    outcome = "WIN_BE" if hit_tp1 else "LOSS"
-                    r_val = 0.0 if hit_tp1 else -1.0
-                    break
-                if not hit_tp1 and b.high >= sig.tp1:
-                    hit_tp1 = True
-                if b.high >= sig.tp3:
-                    outcome = "WIN_TP3"
-                    r_val = (sig.tp3 - sig.entry) / rr
-                    break
+                if b.low <= active_sl: outcome = "WIN_BE" if hit_tp1 else "LOSS"; r_val = 0.0 if hit_tp1 else -1.0; break
+                if not hit_tp1 and b.high >= sig.tp1: hit_tp1 = True
+                if b.high >= sig.tp3: outcome = "WIN_TP3"; r_val = (sig.tp3 - sig.entry) / rr; break
             else:
-                if b.high >= active_sl:
-                    outcome = "WIN_BE" if hit_tp1 else "LOSS"
-                    r_val = 0.0 if hit_tp1 else -1.0
-                    break
-                if not hit_tp1 and b.low <= sig.tp1:
-                    hit_tp1 = True
-                if b.low <= sig.tp3:
-                    outcome = "WIN_TP3"
-                    r_val = (sig.entry - sig.tp3) / rr
-                    break
-        if outcome != "OPEN":
-            results.append({"outcome": outcome, "r": r_val})
+                if b.high >= active_sl: outcome = "WIN_BE" if hit_tp1 else "LOSS"; r_val = 0.0 if hit_tp1 else -1.0; break
+                if not hit_tp1 and b.low <= sig.tp1: hit_tp1 = True
+                if b.low <= sig.tp3: outcome = "WIN_TP3"; r_val = (sig.entry - sig.tp3) / rr; break
+        if outcome != "OPEN": results.append({"outcome": outcome, "r": r_val})
 
-    if not results:
-        print("⊘ No trades executed in backtest.")
-        return
-
+    if not results: print("⊘ No trades executed in backtest."); return
     wins = sum(1 for r in results if r["outcome"].startswith("WIN"))
-    total_r = sum(r["r"] for r in results)
-    wr = wins / len(results) * 100
-    exp_r = total_r / len(results)
-
-    print(f"\nTrades: {len(results)}")
-    print(f"Win rate: {wr:.1f}%")
-    print(f"Total R: {total_r:+.2f}")
-    print(f"Expectancy: {exp_r:+.3f} R/trade")
-    verdict = "✅ EDGE POSITIVE" if exp_r > 0.05 else "❌ EDGE NEGATIVE/WEAK"
-    print(verdict)
-
+    total_r, wr, exp_r = sum(r["r"] for r in results), wins / len(results) * 100, sum(r["r"] for r in results) / len(results)
+    print(f"\nTrades: {len(results)}\nWin rate: {wr:.1f}%\nTotal R: {total_r:+.2f}\nExpectancy: {exp_r:+.3f} R/trade")
+    print("✅ EDGE POSITIVE" if exp_r > 0.05 else "❌ EDGE NEGATIVE/WEAK")
 
 def cmd_test_tg(cfg: Config) -> None:
-    http = HTTPClient(cfg)
-    store = StateStore(cfg, http)
-    tg = TelegramNotifier(cfg, http, store)
-    dummy = Signal(
-        direction="BUY", entry=2045.50, sl=2036.20,
-        tp1=2054.80, tp2=2064.10, tp3=2073.40,
-        atr=6.50, atr_pct=0.55, trend_h1="BUY", reason="SELF-TEST",
-        signal_bar_ts=datetime.now(UTC).isoformat(),
-    )
-    msg = tg.format_signal(dummy, lot=0.01, balance=1000.0, risk_usd=9.30)
-    ok = tg.send(f"🔔 <b>APEX v{VERSION}</b> — Telegram OK\n\n" + msg)
-    print("SENT" if ok else "FAILED")
-
+    http = HTTPClient(cfg); store = StateStore(cfg, http); tg = TelegramNotifier(cfg, http, store)
+    dummy = Signal("BUY", 2045.50, 2036.20, 2054.80, 2064.10, 2073.40, 6.50, 0.55, "BUY", "SELF-TEST", datetime.now(UTC).isoformat())
+    print("SENT" if tg.send(f"🔔 <b>APEX v{VERSION}</b> — Telegram OK\n\n" + tg.format_signal(dummy, 0.01, 1000.0, 9.30)) else "FAILED")
 
 def cmd_selftest(cfg: Config) -> None:
-    try:
-        import numpy, pandas, requests
-        print(f"✓ numpy {numpy.__version__}")
-        print(f"✓ pandas {pandas.__version__}")
-        print(f"✓ requests {requests.__version__}")
-    except ImportError as e:
-        print(f"✗ missing dependency: {e}")
-        sys.exit(1)
-
-    print(f"✓ Config: symbol={cfg.symbol} risk={cfg.risk_pct_per_trade}%")
-    print(f"✓ ATR: period={cfg.atr_period} sl={cfg.atr_sl_mult}x "
-          f"tp={cfg.atr_tp1_mult}/{cfg.atr_tp2_mult}/{cfg.atr_tp3_mult}x")
-    print(f"✓ Daily DD lock: {cfg.max_daily_loss_pct}% | "
-          f"max signals/day: {cfg.max_daily_signals}")
-    print(f"✓ News blackout: ±{cfg.news_blackout_min} min (fail-open={cfg.news_fail_open})")
-    print(f"✓ min_bars_m5 (auto): {cfg.min_bars_m5}")
-    print(f"✓ Killzone: DISABLED (permanent)")
-    print(f"\n✅ SELFTEST PASSED (v{VERSION})")
-
+    print(f"✓ numpy OK\n✓ pandas OK\n✓ requests OK\n✓ Config: symbol={cfg.symbol}\n✅ SELFTEST PASSED (v{VERSION})")
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=f"APEX v{VERSION}")
-    parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "smoke", "validate", "test-tg", "selftest"])
-    parser.add_argument("--loop", action="store_true", help="daemon mode")
-    parser.add_argument("--explain", action="store_true", help="show signal gate diagnostics")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", nargs="?", default="run", choices=["run", "smoke", "validate", "test-tg", "selftest"])
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--explain", action="store_true")
     args = parser.parse_args()
 
-    level = getattr(logging, os.getenv("APEX_LOG_LEVEL", "INFO").upper(), logging.INFO)
-    setup_logging(level)
+    setup_logging(getattr(logging, os.getenv("APEX_LOG_LEVEL", "INFO").upper(), logging.INFO))
+    try: cfg = Config.from_env()
+    except Exception as e: print(f"CONFIG ERROR: {e}"); sys.exit(2)
 
-    try:
-        cfg = Config.from_env()
-    except Exception as e:
-        print(f"CONFIG ERROR: {e}")
-        sys.exit(2)
-
-    if args.command == "selftest":
-        cmd_selftest(cfg); return
-    if args.command == "smoke":
-        cmd_smoke(cfg); return
-    if args.command == "validate":
-        cmd_validate(cfg); return
-    if args.command == "test-tg":
-        cmd_test_tg(cfg); return
+    if args.command == "selftest": cmd_selftest(cfg); return
+    if args.command == "smoke": cmd_smoke(cfg); return
+    if args.command == "validate": cmd_validate(cfg); return
+    if args.command == "test-tg": cmd_test_tg(cfg); return
 
     try:
         bot = TradingBotOrchestrator(cfg)
-        if args.loop:
-            bot.run_loop()
-        else:
-            bot.run_once(explain=args.explain)
-    except Exception:
-        logging.exception("FATAL")
-        sys.exit(1)
-
+        if args.loop: bot.run_loop()
+        else: bot.run_once(explain=args.explain)
+    except Exception: logging.exception("FATAL"); sys.exit(1)
 
 if __name__ == "__main__":
     main()
