@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v19.0 — Institutional Production Grade
-====================================================
-OOP Architecture | Zero Look-Ahead Bias | Multi-Provider Failover
-Dynamic Risk Sizing | News Blackout | Circuit Breakers
+APEX PREDATOR v19.1 — Hotfix: TwelveData missing volume field
+=============================================================
+Patch: handle missing 'volume' key from TwelveData XAU/USD response
 """
 from __future__ import annotations
 import os
@@ -28,7 +27,6 @@ from functools import wraps
 # ════════════════════════════════════════════════════════════
 @dataclass
 class Config:
-    # Core
     symbol: str = "XAUUSD"
     contract_size: float = 100.0
     account_currency: str = "USD"
@@ -37,7 +35,6 @@ class Config:
     min_lot: float = 0.01
     max_lot: float = 5.0
 
-    # Risk & Capital
     account_balance: float = 1000.0
     max_risk_pct_per_trade: float = 1.0
     max_leverage: float = 30.0
@@ -46,7 +43,6 @@ class Config:
     max_daily_signals: int = 5
     dd_pause_hours: int = 24
 
-    # Technical & Strategy
     atr_period: int = 14
     atr_sl_mult: float = 1.8
     atr_tp1_mult: float = 1.0
@@ -59,7 +55,6 @@ class Config:
     parliament_half_ratio: float = 0.65
     parliament_full_ratio: float = 0.75
 
-    # Data & Fetch
     min_bars_m5: int = 100
     min_bars_m15: int = 100
     min_bars_h1: int = 100
@@ -68,7 +63,6 @@ class Config:
     http_timeout: Tuple[int, int] = (5, 15)
     max_retry: int = 3
 
-    # Filters & Safety
     news_blackout_min: int = 30
     cooldown_minutes: int = 45
     opposite_cooldown_minutes: int = 120
@@ -77,7 +71,6 @@ class Config:
     dry_run: bool = True
     kill_switch: bool = False
 
-    # State
     gist_id: str = ""
     gist_token: str = ""
     state_file: str = "apex_state_v19.json"
@@ -145,7 +138,7 @@ class StateError(Exception):
     pass
 
 # ════════════════════════════════════════════════════════════
-# STATE STORE (Local / Gist Failover)
+# STATE STORE
 # ════════════════════════════════════════════════════════════
 class StateStore:
     def __init__(self, cfg: Config):
@@ -210,7 +203,7 @@ class StateStore:
         return self._save(data)
 
 # ════════════════════════════════════════════════════════════
-# MARKET DATA HANDLER
+# MARKET DATA HANDLER — FIXED FOR MISSING VOLUME
 # ════════════════════════════════════════════════════════════
 class MarketDataHandler:
     def __init__(self, cfg: Config):
@@ -229,13 +222,48 @@ class MarketDataHandler:
         r = requests.get(url, params=params, timeout=self.cfg.http_timeout)
         r.raise_for_status()
         data = r.json()
-        if "values" not in data:
+        if "values" not in data or not data["values"]:
             raise DataFetchError(data.get("message", "Invalid TD response"))
+
         df = pd.DataFrame(data["values"])
-        for c in ["open", "high", "low", "close", "volume"]:
+
+        # === HOTFIX: safe parse — handle missing 'volume' ===
+        for c in ["open", "high", "low", "close"]:
+            if c not in df.columns:
+                raise DataFetchError(f"Missing required column: {c}")
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
+        else:
+            # Forex/CFD often has no volume — use synthetic default
+            df["volume"] = 100.0
+
+        df = df.dropna(subset=["open", "high", "low", "close"])
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         return df.sort_values("datetime").reset_index(drop=True)
+
+    @staticmethod
+    def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+        """Safe resample that handles missing/zero volume."""
+        agg = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+        if "volume" in df.columns:
+            agg["volume"] = "sum"
+        out = (
+            df.set_index("datetime")
+            .resample(rule, label="left", closed="left")
+            .agg(agg)
+            .dropna(subset=["open", "high", "low", "close"])
+            .reset_index()
+        )
+        if "volume" not in out.columns:
+            out["volume"] = 100.0
+        return out
 
     def fetch_all(self) -> Dict[str, pd.DataFrame]:
         dfs = {}
@@ -243,10 +271,7 @@ class MarketDataHandler:
             dfs["5min"] = self._fetch_twelvedata("5min", 800)
             dfs["1h"] = self._fetch_twelvedata("1h", 500)
             dfs["4h"] = self._fetch_twelvedata("4h", 300)
-            dfs["15min"] = dfs["5min"].set_index("datetime").resample("15min").agg({
-                "open": "first", "high": "max", "low": "min",
-                "close": "last", "volume": "sum"
-            }).dropna().reset_index()
+            dfs["15min"] = self._resample(dfs["5min"], "15min")
         except Exception as e:
             raise DataFetchError(f"Data fetch failed: {e}")
 
@@ -263,7 +288,7 @@ class MarketDataHandler:
         return dfs
 
 # ════════════════════════════════════════════════════════════
-# SIGNAL GENERATOR (Indicators & Parliament)
+# SIGNAL GENERATOR
 # ════════════════════════════════════════════════════════════
 class Indicators:
     @staticmethod
@@ -388,7 +413,6 @@ class SignalGenerator:
 
         direction = "BUY" if buy_ratio > sell_ratio else "SELL"
 
-        h4_ema20 = Indicators.ema(h4["close"], 20)
         h4_ema50 = Indicators.ema(h4["close"], 50)
         h4_trend = "BULLISH" if h4["close"].iloc[-1] > h4_ema50.iloc[-1] else "BEARISH"
 
@@ -586,7 +610,7 @@ class TradingBotOrchestrator:
         lot = self.risk.calculate_position_size(balance, entry, sl, risk_pct)
 
         msg = (
-            f"<b>🏛️ APEX v19 — {result['direction']}</b>\n"
+            f"<b>🏛️ APEX v19.1 — {result['direction']}</b>\n"
             f"<b>{self.cfg.symbol}</b> @ <code>{entry:.2f}</code>\n"
             f"SL: <code>{sl:.2f}</code> | TP1: <code>{tp1:.2f}</code>\n"
             f"TP2: <code>{tp2:.2f}</code> | TP3: <code>{tp3:.2f}</code>\n"
@@ -606,7 +630,7 @@ class TradingBotOrchestrator:
             self.store.set("journal", journal[-50:])
 
 # ════════════════════════════════════════════════════════════
-# CLI COMMANDS (For GitHub Actions Integration)
+# CLI COMMANDS
 # ════════════════════════════════════════════════════════════
 def cmd_selftest(cfg: Config) -> None:
     errors = []
@@ -619,7 +643,7 @@ def cmd_selftest(cfg: Config) -> None:
     if errors:
         print("❌ SELFTEST FAILED:", "; ".join(errors))
         sys.exit(1)
-    print("✅ SELFTEST PASSED (v19 Production)")
+    print("✅ SELFTEST PASSED (v19.1 Hotfix)")
 
 def cmd_smoke(cfg: Config) -> None:
     data = MarketDataHandler(cfg)
@@ -640,7 +664,7 @@ def cmd_smoke(cfg: Config) -> None:
 
 def cmd_test_tg(cfg: Config) -> None:
     tg = TelegramNotifier(cfg)
-    ok = tg.send("<b>🔔 TEST APEX v19</b>\nTelegram connection successful.")
+    ok = tg.send("<b>🔔 TEST APEX v19.1</b>\nTelegram connection successful.")
     print("✅ SENT" if ok else "❌ FAILED")
 
 # ════════════════════════════════════════════════════════════
