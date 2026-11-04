@@ -792,7 +792,6 @@ class SignalGenerator:
     def _fvg(df: pd.DataFrame) -> Tuple[int, float]:
         fvg = MarketStructure.detect_fvg(df, lookback=10)
         if not fvg: return 0, 0.0
-        price = float(df["close"].iloc[-1])
         if fvg["type"] == "BULL_FVG": return 1, 0.7
         if fvg["type"] == "BEAR_FVG": return -1, 0.7
         return 0, 0.0
