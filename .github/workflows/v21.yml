@@ -36,7 +36,6 @@ jobs:
           APEX_REQUIRE_STATE_PERSISTENCE: 'false'
         run: python apex_v21.py selftest
 
-      # Validasi otomatis jalan saat Anda klik tombol, atau hari Senin
       - name: 2️⃣ Edge Validation (Walk-Forward)
         if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 0 * * 1'
         env:
@@ -63,14 +62,11 @@ jobs:
           OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
           TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
 
-          # MEMBACA DARI VARIABLES GITHUB (Bukan di-hardcode)
           APEX_LIVE_ENABLED: ${{ vars.APEX_LIVE_ENABLED }}
           APEX_KILL_SWITCH: ${{ vars.APEX_KILL_SWITCH || 'false' }}
-          
-          # Jika APEX_LIVE_ENABLED = 'true', maka DRY_RUN = 'false' (LIVE)
           APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
-          
           APEX_REQUIRE_STATE_PERSISTENCE: 'true'
+          
           APEX_SYMBOL: 'XAUUSD'
           APEX_ACCOUNT_BALANCE: '1000'
           APEX_MAX_RISK_PCT_PER_TRADE: '0.5'
