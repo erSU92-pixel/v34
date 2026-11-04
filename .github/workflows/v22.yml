@@ -1,19 +1,24 @@
-name: APEX Debug
+name: APEX v22 Pipeline
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 0-22 * * 1-5'
 
 permissions:
   contents: read
 
+concurrency:
+  group: apex-v22
+  cancel-in-progress: false
+
 jobs:
-  debug:
+  apex:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
-      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -23,11 +28,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt
 
-      - name: RUN SMOKE TEST
+      - name: Selftest
+        env:
+          APEX_DRY_RUN: 'true'
+          APEX_REQUIRE_STATE_PERSISTENCE: 'false'
+        run: python apex_v22.py selftest
+
+      - name: Run Bot
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          APEX_DRY_RUN: 'true'
-          APEX_REQUIRE_STATE_PERSISTENCE: 'false'
-        run: python apex_v22.py smoke
+          GIST_ID:             ${{ secrets.GIST_ID }}
+          GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}
+
+          APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
+          APEX_KILL_SWITCH: ${{ vars.APEX_KILL_SWITCH || 'false' }}
+          APEX_REQUIRE_STATE_PERSISTENCE: 'true'
+          APEX_ACCOUNT_BALANCE: '1000'
+          APEX_RISK_PCT_PER_TRADE: '0.5'
+        run: python apex_v22.py run
