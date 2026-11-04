@@ -1,50 +1,238 @@
-name: APEX v22 Pipeline
-
+name: APEX PREDATOR v19.0
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '*/15 0-22 * * 1-5'
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Pilih tahap testing'
+        required: true
+        default: 'full_validation'
+        type: choice
+        options:
+          - full_validation
+          - live_promote
+          - smoke_only
+          - selftest_only
+  push:
+    branches: [main, master]
+    paths:
+      - 'apex_v19_production.py'
+      - '.github/workflows/apex_v19.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: apex-v22
+  group: apex-predator-v19
   cancel-in-progress: false
 
 jobs:
-  apex:
+  apex-manual:
+    name: APEX Manual — ${{ github.event.inputs.stage }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
 
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir \
+            "numpy>=1.24,<3" \
+            "pandas>=2.0,<3" \
+            "requests>=2.31"
+
+      - name: 🔎 Verify imports
+        run: |
+          python - <<'PY'
+          import numpy, pandas, requests
+          print("numpy    ", numpy.__version__)
+          print("pandas   ", pandas.__version__)
+          print("requests ", requests.__version__)
+          PY
+
+      - name: "1️⃣  Selftest — validasi config"
+        if: |
+          github.event.inputs.stage == 'full_validation' ||
+          github.event.inputs.stage == 'live_promote' ||
+          github.event.inputs.stage == 'selftest_only'
+        env:
+          APEX_DRY_RUN: 'true'
+        run: |
+          echo "::group::selftest"
+          python apex_v19_production.py selftest
+          echo "::endgroup::"
+
+      - name: "2️⃣  Test Telegram"
+        if: github.event.inputs.stage == 'full_validation'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APEX_DRY_RUN:     'false'
+        run: |
+          echo "::group::test-tg"
+          python apex_v19_production.py test-tg
+          echo "::endgroup::"
+
+      - name: "3️⃣  Smoke — fetch data + parliament vote"
+        if: |
+          github.event.inputs.stage == 'full_validation' ||
+          github.event.inputs.stage == 'smoke_only'
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN:        'true'
+        run: |
+          echo "::group::smoke"
+          python apex_v19_production.py smoke
+          echo "::endgroup::"
+
+      - name: "4️⃣  Run DRY — full pipeline tanpa kirim sinyal"
+        if: github.event.inputs.stage == 'full_validation'
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN:                     'true'
+          APEX_SYMBOL:                      'XAUUSD'
+          APEX_ACCOUNT_BALANCE:             '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
+          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
+          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
+          APEX_MAX_DAILY_SIGNALS:           '5'
+          APEX_NEWS_BLACKOUT_MIN:           '30'
+          APEX_KILL_SWITCH:                 'false'
+        run: |
+          echo "::group::run (dry)"
+          python apex_v19_production.py run
+          echo "::endgroup::"
+
+      - name: "5️⃣  Run LIVE — kirim sinyal nyata"
+        if: github.event.inputs.stage == 'live_promote'
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN:                     'false'
+          APEX_SYMBOL:                      'XAUUSD'
+          APEX_ACCOUNT_BALANCE:             '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
+          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
+          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
+          APEX_MAX_DAILY_SIGNALS:           '5'
+          APEX_NEWS_BLACKOUT_MIN:           '30'
+          APEX_KILL_SWITCH:                 'false'
+        run: |
+          echo "::group::run (live)"
+          python apex_v19_production.py run
+          echo "::endgroup::"
+
+      - name: 📋 Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-state-${{ github.run_number }}
+          path: apex_state_v19.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 🧾 Summary
+        if: always()
+        run: |
+          {
+            echo "### APEX v19.0 — Manual Test"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Stage | \`${{ github.event.inputs.stage }}\` |"
+            echo "| Status | ${{ job.status }} |"
+            echo "| Time | $(date -u +'%Y-%m-%d %H:%M:%S UTC') |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  apex-schedule:
+    name: APEX Scheduled Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: 📚 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir \
+            "numpy>=1.24,<3" \
+            "pandas>=2.0,<3" \
+            "requests>=2.31"
 
-      - name: Selftest
+      - name: 🧪 Selftest
+        run: python apex_v19_production.py selftest
+
+      - name: 🚀 Scheduled run
         env:
-          APEX_DRY_RUN: 'true'
-          APEX_REQUIRE_STATE_PERSISTENCE: 'false'
-        run: python apex_v22.py selftest
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
+          APEX_SYMBOL:                      'XAUUSD'
+          APEX_ACCOUNT_BALANCE:             '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
+          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
+          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
+          APEX_MAX_DAILY_SIGNALS:           '5'
+          APEX_NEWS_BLACKOUT_MIN:           '30'
+          APEX_KILL_SWITCH:                 'false'
+        run: python apex_v19_production.py run
 
-      - name: Run Bot
+      - name: 📋 Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-sched-${{ github.run_number }}
+          path: apex_state_v19.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+  validate-on-push:
+    name: Validate on Push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir \
+            "numpy>=1.24,<3" \
+            "pandas>=2.0,<3" \
+            "requests>=2.31"
+
+      - name: 🧪 Selftest
+        run: python apex_v19_production.py selftest
+
+      - name: 💨 Smoke
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          GIST_ID:             ${{ secrets.GIST_ID }}
-          GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}
-
-          APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
-          APEX_KILL_SWITCH: ${{ vars.APEX_KILL_SWITCH || 'false' }}
-          APEX_REQUIRE_STATE_PERSISTENCE: 'true'
-          APEX_ACCOUNT_BALANCE: '1000'
-          APEX_RISK_PCT_PER_TRADE: '0.5'
-        run: python apex_v22.py run
+          APEX_DRY_RUN:        'true'
+        run: python apex_v19_production.py smoke
