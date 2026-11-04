@@ -3,7 +3,9 @@ name: APEX v22 Pipeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * 1-5'  # tiap 15 menit hari kerja
+    # Setiap 15 menit, jam 00-22 UTC, Senin-Jumat
+    # (skip 23:00-23:59 UTC karena pre-Asia, XAUUSD mati)
+    - cron: '*/15 0-22 * * 1-5'
 
 permissions:
   contents: read
@@ -26,7 +28,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir "numpy>=1.24,<3" "pandas>=2.0,<3" "requests>=2.31"
+          pip install --no-cache-dir -r requirements.txt
 
       - name: Selftest
         env:
