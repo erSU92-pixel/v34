@@ -2302,10 +2302,24 @@ def cmd_selftest(cfg: Config) -> None:
 
 
 def cmd_validate(cfg: Config) -> None:
-    http = HTTPClient(cfg); kv = KVStore(cfg, http)
-    data = MarketDataHandler(cfg, http, kv)
-    sig = SignalGenerator(cfg, kv)
+    import copy
     print("Fetching historical data...")
+    
+    # [AUTO-RELAX FILTERS UNTUK BACKTEST]
+    # Kita matikan filter ketat HANYA untuk simulasi agar bot mau entry
+    cfg_bt = copy.deepcopy(cfg)
+    cfg_bt.adx_min = 15.0
+    cfg_bt.enable_mtf_alignment = False
+    cfg_bt.enable_atr_percentile = False
+    cfg_bt.enable_key_levels = False
+    cfg_bt.enable_regime_routing = False
+    cfg_bt.enable_volatility_spike = False
+    
+    http = HTTPClient(cfg_bt)
+    kv = KVStore(cfg_bt, http)
+    data = MarketDataHandler(cfg_bt, http, kv)
+    sig = SignalGenerator(cfg_bt, kv)
+    
     dfs, src, offset = data.fetch_all()
     m5 = dfs["5min"].reset_index(drop=True)
     m15 = dfs["15min"].reset_index(drop=True)
@@ -2315,6 +2329,7 @@ def cmd_validate(cfg: Config) -> None:
     n = len(m5); lookback = 300; cycle = 3; forward = 60
     results = []
     print(f"Source: {src} | M5 bars: {n}")
+    
     for i in range(lookback, n - forward, cycle):
         cur = m5.iloc[i - 1]["datetime"]
         m5w = m5.iloc[:i]
@@ -2322,23 +2337,29 @@ def cmd_validate(cfg: Config) -> None:
         h1w = h1[h1["datetime"] <= cur]
         h4w = h4[h4["datetime"] <= cur]
         if len(m15w) < 50 or len(h1w) < 100 or len(h4w) < 50: continue
+        
         try:
             r = sig.generate(m5w, m15w, h1w, h4w)
         except Exception:
             continue
+            
         if r.direction == "NEUTRAL" or r.verdict == "CANCEL": continue
+        
         ob = sig.detect_order_block(m5w, r.direction)
         try:
             entry, sl, tp1, tp2, tp3 = sig.compute_levels(m5w, r.direction, ob)
         except ValueError:
             continue
+            
         fut = m5.iloc[i:i + forward]
         filled = False; fill_idx = None
         for j, b in enumerate(fut.itertuples(index=False)):
             if r.direction == "BUY" and b.low <= entry: filled, fill_idx = True, j; break
             if r.direction == "SELL" and b.high >= entry: filled, fill_idx = True, j; break
+            
         if not filled:
             results.append({"outcome": "NO_FILL", "r": 0.0}); continue
+            
         post = fut.iloc[fill_idx:]
         rr = abs(entry - sl); outcome = "OPEN"; r_val = 0.0
         for b in post.itertuples(index=False):
@@ -2353,16 +2374,29 @@ def cmd_validate(cfg: Config) -> None:
     total = len(results)
     fills = [x for x in results if x["outcome"] not in ("NO_FILL", "OPEN")]
     wins = [x for x in fills if x["outcome"].startswith("WIN")]
+    
     print(f"\n{'=' * 60}\nVALIDATION REPORT\n{'=' * 60}")
     print(f"Cycles: {total}")
-    if total:
-        print(f"  Filled: {len(fills)} ({len(fills)/total*100:.0f}%)")
-    if fills:
-        wr = len(wins) / len(fills)
-        avg = sum(x["r"] for x in fills) / len(fills)
-        print(f"  Wins: {len(wins)} | WR: {wr*100:.1f}% | Expectancy: {avg:+.2f}R")
-        verdict = "✅ EDGE POSITIVE" if avg > 0.1 else "❌ EDGE WEAK/NEGATIVE"
-        print(f"  {verdict}")
+    
+    if total == 0:
+        print("❌ Validation FAILED: Data terlalu pendek untuk disimulasikan.")
+        sys.exit(1)
+        
+    print(f"  Filled: {len(fills)} ({len(fills)/total*100:.0f}%)")
+    
+    if len(fills) == 0:
+        print("❌ Validation FAILED: Bot sama sekali tidak entry dalam simulasi.")
+        sys.exit(1)
+        
+    wr = len(wins) / len(fills)
+    avg = sum(x["r"] for x in fills) / len(fills)
+    print(f"  Wins: {len(wins)} | WR: {wr*100:.1f}% | Expectancy: {avg:+.2f}R")
+    
+    if avg > 0.10:
+        print("✅ EDGE POSITIVE — Strategy valid!")
+    else:
+        print("❌ EDGE NEGATIVE / WEAK")
+        sys.exit(1) # Gagalkan workflow jika edge negatif
 
 
 def cmd_cb_status(cfg: Config) -> None:
