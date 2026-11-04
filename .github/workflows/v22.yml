@@ -3,8 +3,6 @@ name: APEX v22 Pipeline
 on:
   workflow_dispatch:
   schedule:
-    # Setiap 15 menit, jam 00-22 UTC, Senin-Jumat
-    # (skip 23:00-23:59 UTC karena pre-Asia, XAUUSD mati)
     - cron: '*/15 0-22 * * 1-5'
 
 permissions:
