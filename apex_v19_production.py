@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v19.1 — Hotfix: TwelveData missing volume field
-=============================================================
-Patch: handle missing 'volume' key from TwelveData XAU/USD response
+APEX PREDATOR v19.2 — Hotfix: Config attribute name mapping
+===========================================================
+Patch: fix min_bars_{tf} attribute lookup in MarketDataHandler.fetch_all()
 """
 from __future__ import annotations
 import os
@@ -203,9 +203,20 @@ class StateStore:
         return self._save(data)
 
 # ════════════════════════════════════════════════════════════
-# MARKET DATA HANDLER — FIXED FOR MISSING VOLUME
+# MARKET DATA HANDLER
 # ════════════════════════════════════════════════════════════
 class MarketDataHandler:
+    # Explicit mapping: timeframe string -> Config attribute name
+    TF_MIN_BARS_ATTR = {
+        "5min":  "min_bars_m5",
+        "15min": "min_bars_m15",
+        "1h":    "min_bars_h1",
+        "4h":    "min_bars_h4",
+    }
+    TF_MINUTES = {
+        "5min": 5, "15min": 15, "1h": 60, "4h": 240
+    }
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
@@ -227,7 +238,6 @@ class MarketDataHandler:
 
         df = pd.DataFrame(data["values"])
 
-        # === HOTFIX: safe parse — handle missing 'volume' ===
         for c in ["open", "high", "low", "close"]:
             if c not in df.columns:
                 raise DataFetchError(f"Missing required column: {c}")
@@ -236,7 +246,6 @@ class MarketDataHandler:
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
         else:
-            # Forex/CFD often has no volume — use synthetic default
             df["volume"] = 100.0
 
         df = df.dropna(subset=["open", "high", "low", "close"])
@@ -245,7 +254,6 @@ class MarketDataHandler:
 
     @staticmethod
     def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-        """Safe resample that handles missing/zero volume."""
         agg = {
             "open": "first",
             "high": "max",
@@ -276,14 +284,17 @@ class MarketDataHandler:
             raise DataFetchError(f"Data fetch failed: {e}")
 
         now = datetime.now(timezone.utc)
-        for tf, mins in [("5min", 5), ("15min", 15), ("1h", 60), ("4h", 240)]:
+        for tf in ("5min", "15min", "1h", "4h"):
             df = dfs[tf]
+            mins = self.TF_MINUTES[tf]
+            attr = self.TF_MIN_BARS_ATTR[tf]
+            min_bars = getattr(self.cfg, attr)
+
             last_ts = df["datetime"].iloc[-1]
             if (now - last_ts).total_seconds() < (mins * 60 * 0.9):
                 df = df.iloc[:-1]
-            min_bars_attr = f"min_bars_{tf.replace('min','m').replace('h','h')}"
-            if len(df) < getattr(self.cfg, min_bars_attr):
-                raise DataFetchError(f"Insufficient bars for {tf}")
+            if len(df) < min_bars:
+                raise DataFetchError(f"Insufficient bars for {tf}: {len(df)} < {min_bars}")
             dfs[tf] = df.reset_index(drop=True)
         return dfs
 
@@ -610,7 +621,7 @@ class TradingBotOrchestrator:
         lot = self.risk.calculate_position_size(balance, entry, sl, risk_pct)
 
         msg = (
-            f"<b>🏛️ APEX v19.1 — {result['direction']}</b>\n"
+            f"<b>🏛️ APEX v19.2 — {result['direction']}</b>\n"
             f"<b>{self.cfg.symbol}</b> @ <code>{entry:.2f}</code>\n"
             f"SL: <code>{sl:.2f}</code> | TP1: <code>{tp1:.2f}</code>\n"
             f"TP2: <code>{tp2:.2f}</code> | TP3: <code>{tp3:.2f}</code>\n"
@@ -643,7 +654,7 @@ def cmd_selftest(cfg: Config) -> None:
     if errors:
         print("❌ SELFTEST FAILED:", "; ".join(errors))
         sys.exit(1)
-    print("✅ SELFTEST PASSED (v19.1 Hotfix)")
+    print("✅ SELFTEST PASSED (v19.2 Hotfix)")
 
 def cmd_smoke(cfg: Config) -> None:
     data = MarketDataHandler(cfg)
@@ -664,7 +675,7 @@ def cmd_smoke(cfg: Config) -> None:
 
 def cmd_test_tg(cfg: Config) -> None:
     tg = TelegramNotifier(cfg)
-    ok = tg.send("<b>🔔 TEST APEX v19.1</b>\nTelegram connection successful.")
+    ok = tg.send("<b>🔔 TEST APEX v19.2</b>\nTelegram connection successful.")
     print("✅ SENT" if ok else "❌ FAILED")
 
 # ════════════════════════════════════════════════════════════
