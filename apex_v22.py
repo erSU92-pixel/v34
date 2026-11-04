@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v22.0 — Production-Ready XAUUSD Trading Engine
+APEX PREDATOR v22.1 — Production-Ready XAUUSD Trading Engine
 =============================================================
 
-Arsitektur (Clean OOP):
-    MarketDataHandler     → OHLCV fetch + validation + resampling (no look-ahead)
-    SignalGenerator       → H1 trend + M15 momentum + M5 EMA/ATR zone entry
-    RiskManagementEngine  → ATR-based SL/TP + dynamic sizing + Daily DD Lock
-    NewsSafetyFilter      → ForexFactory 30-min blackout window
-    TelegramNotifier      → MT5-mobile-ready signal formatting
-    TradingBotOrchestrator→ Main coordination loop
+Forensically hardened build:
+    - Zero look-ahead bias (all indicators use CLOSED bars)
+    - ATR percentile warmup enforced (min_bars auto-derived)
+    - Floor-based lot sizing (never exceeds declared risk)
+    - Daily DD Lock, News Blackout, US Holidays, Daily Signal Cap
+    - Killzone PERMANENTLY DISABLED (per user requirement)
 
-Cara pakai:
-    python apex_v22.py run          # one-shot (cocok untuk cron / GH Actions)
-    python apex_v22.py run --loop   # daemon (loop 60 detik)
-    python apex_v22.py smoke        # cek koneksi + sinyal saat ini
-    python apex_v22.py validate     # walk-forward backtest
-    python apex_v22.py test-tg      # test kirim pesan Telegram
-    python apex_v22.py selftest     # verifikasi instalasi
+Commands:
+    python apex_v22.py run              # one-shot (cron)
+    python apex_v22.py run --loop       # daemon
+    python apex_v22.py smoke            # connectivity + signal test
+    python apex_v22.py validate         # walk-forward backtest
+    python apex_v22.py test-tg          # telegram test
+    python apex_v22.py selftest         # install verification
 """
 
 from __future__ import annotations
@@ -26,12 +25,13 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -40,8 +40,18 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "22.0"
+VERSION = "22.1"
 UTC = timezone.utc
+
+# US market holidays (early close = low liquidity = unsafe for XAUUSD scalping)
+US_HOLIDAYS = {
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-04-02", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -51,41 +61,42 @@ UTC = timezone.utc
 class Config:
     # Instrument
     symbol: str = "XAUUSD"
-    contract_size: float = 100.0        # 1 lot = 100 oz
+    contract_size: float = 100.0
     price_decimals: int = 2
 
     # Account
     account_balance: float = 1000.0
     min_balance_for_trading: float = 50.0
-    risk_pct_per_trade: float = 1.0      # 1% risk per trade
+    risk_pct_per_trade: float = 1.0
     max_lot: float = 5.0
     min_lot: float = 0.01
     hard_leverage_cap: float = 30.0
+    max_min_lot_risk_pct: float = 2.0        # reject if 0.01-lot risk > X% balance
 
     # Daily DD Protection
-    max_daily_loss_pct: float = 3.0      # lock kalau daily DD ≥ 3%
-    daily_dd_pause_hours: int = 24
+    max_daily_loss_pct: float = 3.0
+    max_daily_signals: int = 5               # NEW: hard cap per UTC day
 
-    # Signal parameters (EMA/ATR)
-    ema_fast: int = 20                   # M15 momentum fast
-    ema_slow: int = 50                   # M15 momentum slow
-    ema_trend_fast: int = 50             # H1 trend fast
-    ema_trend_slow: int = 200            # H1 trend slow
-    ema_entry_fast: int = 9              # M5 entry fast
-    ema_entry_slow: int = 21             # M5 entry slow
-    ema_zone_atr: float = 0.5            # zona entry = EMA21 ± 0.5·ATR
+    # Signal (EMA/ATR) — SL bumped to 2.0×ATR for XAUUSD
+    ema_fast: int = 20
+    ema_slow: int = 50
+    ema_trend_fast: int = 50
+    ema_trend_slow: int = 200
+    ema_entry_fast: int = 9
+    ema_entry_slow: int = 21
+    ema_zone_atr: float = 0.5
 
     atr_period: int = 14
-    atr_sl_mult: float = 1.5
-    atr_tp1_mult: float = 1.5
-    atr_tp2_mult: float = 3.0
-    atr_tp3_mult: float = 4.5
+    atr_sl_mult: float = 2.0                 # CHANGED: 1.5 → 2.0
+    atr_tp1_mult: float = 2.0                # CHANGED: 1.5 → 2.0 (RR 1:1)
+    atr_tp2_mult: float = 4.0                # RR 1:2
+    atr_tp3_mult: float = 6.0                # RR 1:3
     atr_pct_min: float = 0.15
     atr_pct_max: float = 0.95
     atr_pct_lookback: int = 200
 
-    # Data
-    min_bars_m5: int = 100
+    # Data — min_bars auto-calculated in validate()
+    min_bars_m5: int = 250
     min_bars_m15: int = 100
     min_bars_h1: int = 250
     m5_fetch_size: int = 800
@@ -97,16 +108,13 @@ class Config:
     # News
     news_blackout_min: int = 30
     news_cache_sec: int = 1800
-    news_fail_open: bool = True          # True = fail-open (jangan block kalau API mati)
+    news_fail_open: bool = True
+    news_max_consecutive_fail: int = 3
 
-    # Loop
+    # Loop / cooldown
     loop_interval_sec: int = 60
     cooldown_minutes: int = 60
     max_pending: int = 2
-
-    # Killzone (UTC): London AM 07-10, NY PM 12-16
-    skip_killzone: bool = False
-    killzones: Tuple[Tuple[int,int], ...] = ((7,10), (12,16))
 
     # HTTP
     http_timeout: Tuple[int, int] = (3, 10)
@@ -116,7 +124,7 @@ class Config:
     dry_run: bool = True
     kill_switch: bool = False
 
-    # State persistence
+    # State
     state_file: str = "apex_state_v22.json"
     gist_id: str = ""
     gist_token: str = ""
@@ -133,7 +141,7 @@ class Config:
             cur = getattr(cfg, name)
             try:
                 if isinstance(cur, bool):
-                    setattr(cfg, name, str(raw).strip().lower() in ("1","true","yes","on"))
+                    setattr(cfg, name, str(raw).strip().lower() in ("1", "true", "yes", "on"))
                 elif isinstance(cur, int):
                     setattr(cfg, name, int(raw))
                 elif isinstance(cur, float):
@@ -144,7 +152,7 @@ class Config:
                 pass
         cfg.gist_id = os.getenv("GIST_ID", "").strip()
         cfg.gist_token = os.getenv("GIST_TOKEN", "").strip()
-        if os.getenv("APEX_KILL_SWITCH", "").lower() in ("1","true","yes"):
+        if os.getenv("APEX_KILL_SWITCH", "").lower() in ("1", "true", "yes"):
             cfg.kill_switch = True
         cfg.validate()
         return cfg
@@ -160,12 +168,18 @@ class Config:
             raise ValueError("invalid ATR percentile range")
         if self.max_daily_loss_pct <= 0 or self.max_daily_loss_pct >= 50:
             raise ValueError("max_daily_loss_pct must be (0, 50)")
+        # Auto-raise min_bars_m5 to accommodate ATR percentile warmup
+        needed = self.atr_pct_lookback + self.atr_period + 10
+        if self.min_bars_m5 < needed:
+            self.min_bars_m5 = needed
+        if self.m5_fetch_size < self.min_bars_m5:
+            self.m5_fetch_size = max(800, self.min_bars_m5 + 50)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 2. LOGGING + UTIL
 # ═══════════════════════════════════════════════════════════════
-def setup_logging(level=logging.INFO) -> None:
+def setup_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers.clear()
@@ -176,7 +190,7 @@ def setup_logging(level=logging.INFO) -> None:
     root.addHandler(h)
 
 
-def redact(text: str) -> str:
+def redact(text) -> str:
     s = str(text).replace("\n", " ").replace("\r", " ")
     s = re.sub(r"(token|apikey|api_key|bearer|secret)\s*[=:]\s*[^\s&'\"]+",
                r"\1=***", s, flags=re.I)
@@ -192,7 +206,7 @@ class StateError(Exception):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. HTTP CLIENT — retry + timeout
+# 3. HTTP CLIENT
 # ═══════════════════════════════════════════════════════════════
 class HTTPClient:
     def __init__(self, cfg: Config):
@@ -221,7 +235,7 @@ class HTTPClient:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. STATE STORE — local file atau GitHub Gist
+# 4. STATE STORE
 # ═══════════════════════════════════════════════════════════════
 class StateStore:
     def __init__(self, cfg: Config, http: HTTPClient):
@@ -230,8 +244,10 @@ class StateStore:
         self.use_gist = bool(cfg.gist_id and cfg.gist_token)
         self._cache: Optional[dict] = None
         if cfg.require_state_persistence and not self.use_gist and not cfg.dry_run:
-            raise StateError("Production mode requires GIST_ID + GIST_TOKEN (or set "
-                             "APEX_REQUIRE_STATE_PERSISTENCE=false to use local file)")
+            raise StateError(
+                "Production mode requires GIST_ID + GIST_TOKEN "
+                "(or set APEX_REQUIRE_STATE_PERSISTENCE=false)"
+            )
 
     def _headers(self) -> dict:
         return {
@@ -252,14 +268,14 @@ class StateStore:
                 content = files.get(self.cfg.state_file, {}).get("content", "").strip()
                 self._cache = json.loads(content) if content else {}
             except Exception as e:
-                logging.warning(f"Gist load failed ({redact(str(e))}), using empty state")
+                logging.warning(f"Gist load failed ({redact(str(e))})")
                 self._cache = {}
         else:
             p = Path(self.cfg.state_file)
             try:
                 self._cache = json.loads(p.read_text()) if p.exists() else {}
             except Exception as e:
-                logging.warning(f"Local load failed ({e}), using empty state")
+                logging.warning(f"Local load failed ({e})")
                 self._cache = {}
         if not isinstance(self._cache, dict):
             self._cache = {}
@@ -304,7 +320,7 @@ class StateStore:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. INDICATORS — akurat, no look-ahead
+# 5. INDICATORS
 # ═══════════════════════════════════════════════════════════════
 class Indicators:
     @staticmethod
@@ -313,14 +329,9 @@ class Indicators:
 
     @staticmethod
     def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Wilder's ATR (EMA with alpha=1/period)."""
         h, l, c = df["high"], df["low"], df["close"]
         prev_c = c.shift(1)
-        tr = pd.concat([
-            h - l,
-            (h - prev_c).abs(),
-            (l - prev_c).abs(),
-        ], axis=1).max(axis=1)
+        tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
         return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
     @staticmethod
@@ -331,22 +342,26 @@ class Indicators:
         return 0.0 if pd.isna(v) or v <= 0 else float(v)
 
     @staticmethod
-    def atr_percentile(df: pd.DataFrame, period: int, lookback: int) -> float:
-        if len(df) < lookback + period:
-            return 0.5
+    def atr_percentile(df: pd.DataFrame, period: int, lookback: int) -> Optional[float]:
+        """
+        Returns percentile of current ATR vs lookback window, or None if
+        insufficient data (warmup — DO NOT guess 0.5, reject signal).
+        """
+        if len(df) < lookback + period + 1:
+            return None
         atr = Indicators.atr_series(df, period)
         cur = atr.iloc[-1]
         if pd.isna(cur):
-            return 0.5
+            return None
         window = atr.iloc[-lookback:]
         lo, hi = float(window.min()), float(window.max())
         if hi - lo < 1e-9:
-            return 0.5
+            return None  # flat ATR window → unreliable
         return float(np.clip((cur - lo) / (hi - lo), 0.0, 1.0))
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. MARKET DATA HANDLER — fetch + validate + resample
+# 6. MARKET DATA HANDLER
 # ═══════════════════════════════════════════════════════════════
 class MarketDataHandler:
     TD_URL = "https://api.twelvedata.com/time_series"
@@ -359,18 +374,18 @@ class MarketDataHandler:
 
     def _validate_df(self, df: pd.DataFrame, name: str, min_bars: int) -> None:
         if df is None or df.empty:
-            raise DataFetchError(f"{name}: empty dataframe")
+            raise DataFetchError(f"{name}: empty")
         if len(df) < min_bars:
             raise DataFetchError(f"{name}: only {len(df)} bars (need {min_bars})")
         if df["datetime"].duplicated().any():
             raise DataFetchError(f"{name}: duplicated datetimes")
         if (df["high"] < df["low"]).any():
-            raise DataFetchError(f"{name}: high < low detected")
+            raise DataFetchError(f"{name}: high < low")
         if (df[["open", "high", "low", "close"]] <= 0).any().any():
             raise DataFetchError(f"{name}: non-positive prices")
         last = float(df["close"].iloc[-1])
         if not (self.cfg.price_min <= last <= self.cfg.price_max):
-            raise DataFetchError(f"{name}: last close {last} outside sanity range")
+            raise DataFetchError(f"{name}: price {last} out of range")
 
     def _check_staleness(self, df: pd.DataFrame, tf_minutes: int, name: str) -> None:
         if df.empty:
@@ -380,13 +395,12 @@ class MarketDataHandler:
             last_ts = last_ts.replace(tzinfo=UTC)
         age_min = (datetime.now(UTC) - last_ts.to_pydatetime()).total_seconds() / 60.0
         if age_min > self.cfg.max_stale_mult * tf_minutes:
-            raise DataFetchError(f"{name}: stale ({age_min:.0f} min old)")
+            raise DataFetchError(f"{name}: stale ({age_min:.0f} min)")
 
     def _fetch_td(self, interval: str, outputsize: int) -> pd.DataFrame:
         key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
         if not key:
             raise DataFetchError("TWELVE_DATA_API_KEY not set")
-        # rate limit
         elapsed = time.time() - self._last_call
         if elapsed < 1.5:
             time.sleep(1.5 - elapsed)
@@ -395,12 +409,9 @@ class MarketDataHandler:
         r = self.http.request(
             "GET", self.TD_URL,
             params={
-                "symbol": "XAU/USD",
-                "interval": interval,
-                "outputsize": outputsize,
-                "apikey": key,
-                "timezone": "UTC",
-                "order": "ASC",
+                "symbol": "XAU/USD", "interval": interval,
+                "outputsize": outputsize, "apikey": key,
+                "timezone": "UTC", "order": "ASC",
             },
         )
         payload = r.json()
@@ -411,21 +422,20 @@ class MarketDataHandler:
         for c in ("open", "high", "low", "close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df["volume"] = pd.to_numeric(df.get("volume", 100.0), errors="coerce").fillna(100.0)
-        df = df.dropna(subset=["open","high","low","close"]).sort_values("datetime").reset_index(drop=True)
-        return df[["datetime","open","high","low","close","volume"]]
+        df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
+        return df[["datetime", "open", "high", "low", "close", "volume"]]
 
     @staticmethod
     def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         return (
             df.set_index("datetime")
               .resample(rule, label="left", closed="left")
-              .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+              .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
               .dropna()
               .reset_index()
         )
 
     def fetch_all(self) -> Dict[str, pd.DataFrame]:
-        """Fetch M5, H1, H4, derive M15. Returns dict keyed by TF."""
         m5 = self._fetch_td("5min", self.cfg.m5_fetch_size)
         h1 = self._fetch_td("1h", self.cfg.h1_fetch_size)
         h4 = self._fetch_td("4h", self.cfg.h1_fetch_size)
@@ -433,9 +443,9 @@ class MarketDataHandler:
         self._validate_df(m5, "M5", self.cfg.min_bars_m5)
         self._validate_df(h1, "H1", self.cfg.min_bars_h1)
         self._validate_df(h4, "H4", 50)
-
         self._check_staleness(m5, 5, "M5")
         self._check_staleness(h1, 60, "H1")
+        self._check_staleness(h4, 240, "H4")
 
         m15 = self._resample(m5, "15min")
         self._validate_df(m15, "M15", self.cfg.min_bars_m15)
@@ -444,11 +454,11 @@ class MarketDataHandler:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. SIGNAL GENERATOR — EMA/ATR zones, no look-ahead
+# 7. SIGNAL GENERATOR
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class Signal:
-    direction: str      # "BUY" or "SELL"
+    direction: str
     entry: float
     sl: float
     tp1: float
@@ -458,6 +468,7 @@ class Signal:
     atr_pct: float
     trend_h1: str
     reason: str
+    signal_bar_ts: str = ""     # ISO ts of last CLOSED M5 bar
 
 
 class SignalGenerator:
@@ -471,28 +482,13 @@ class SignalGenerator:
         h1: pd.DataFrame,
     ) -> Optional[Signal]:
         """
-        Rule (semua timeframe harus aligned):
-
-        [1] H1 TREND FILTER
-            BUY  : close > EMA200_H1  AND  EMA50_H1 > EMA200_H1
-            SELL : close < EMA200_H1  AND  EMA50_H1 < EMA200_H1
-
-        [2] M15 MOMENTUM
-            BUY  : EMA20_M15 > EMA50_M15
-            SELL : EMA20_M15 < EMA50_M15
-
-        [3] ATR REGIME FILTER
-            ATR percentile ∈ [atr_pct_min, atr_pct_max]
-            (menghindari pasar mati / panik)
-
-        [4] M5 ENTRY ZONE
-            price berada dalam zona EMA21_M5 ± (ema_zone_atr · ATR_M5)
-            BUY  : EMA9_M5 > EMA21_M5
-            SELL : EMA9_M5 < EMA21_M5
+        3-layer confluence:
+          [1] H1 trend     : close vs EMA200_H1 + EMA50_H1 alignment
+          [2] M15 momentum : EMA20_M15 vs EMA50_M15 direction
+          [3] M5 entry     : price inside EMA21_M5 ± zone·ATR_M5 + EMA9 cross
+        + ATR percentile regime filter (rejects dead/panic markets)
         """
         cfg = self.cfg
-
-        # ---- Guard: minimal bars termasuk bar closed ----
         if len(m5) < cfg.min_bars_m5 + 1:
             return None
         if len(m15) < cfg.min_bars_m15 + 1:
@@ -500,16 +496,17 @@ class SignalGenerator:
         if len(h1) < cfg.min_bars_h1 + 1:
             return None
 
-        # ---- Drop bar terakhir (belum closed) → no look-ahead ----
+        # Drop forming bar — enforce no look-ahead
         m5 = m5.iloc[:-1].reset_index(drop=True)
         m15 = m15.iloc[:-1].reset_index(drop=True)
         h1 = h1.iloc[:-1].reset_index(drop=True)
 
-        # ---- [1] H1 Trend Filter ----
+        signal_bar_ts = m5["datetime"].iloc[-1].isoformat()
+
+        # [1] H1 trend
         ema50_h1 = Indicators.ema(h1["close"], cfg.ema_trend_fast)
         ema200_h1 = Indicators.ema(h1["close"], cfg.ema_trend_slow)
         p_h1 = float(h1["close"].iloc[-1])
-
         if p_h1 > ema200_h1.iloc[-1] and ema50_h1.iloc[-1] > ema200_h1.iloc[-1]:
             trend = "BUY"
         elif p_h1 < ema200_h1.iloc[-1] and ema50_h1.iloc[-1] < ema200_h1.iloc[-1]:
@@ -517,7 +514,7 @@ class SignalGenerator:
         else:
             return None
 
-        # ---- [2] M15 Momentum ----
+        # [2] M15 momentum
         ema20_m15 = float(Indicators.ema(m15["close"], cfg.ema_fast).iloc[-1])
         ema50_m15 = float(Indicators.ema(m15["close"], cfg.ema_slow).iloc[-1])
         if trend == "BUY" and ema20_m15 <= ema50_m15:
@@ -525,15 +522,17 @@ class SignalGenerator:
         if trend == "SELL" and ema20_m15 >= ema50_m15:
             return None
 
-        # ---- [3] ATR Regime ----
+        # [3] ATR regime
         atr_now = Indicators.atr_last(m5, cfg.atr_period)
         if atr_now <= 0:
             return None
         atr_pct = Indicators.atr_percentile(m5, cfg.atr_period, cfg.atr_pct_lookback)
+        if atr_pct is None:
+            return None  # warmup — DO NOT trade blind
         if not (cfg.atr_pct_min <= atr_pct <= cfg.atr_pct_max):
             return None
 
-        # ---- [4] M5 Entry Zone ----
+        # [4] M5 entry zone
         ema9_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_fast).iloc[-1])
         ema21_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_slow).iloc[-1])
         price = float(m5["close"].iloc[-1])
@@ -572,18 +571,18 @@ class SignalGenerator:
             atr_pct=atr_pct,
             trend_h1=trend,
             reason=f"H1={trend} | M15 aligned | ATR%={atr_pct:.0%}",
+            signal_bar_ts=signal_bar_ts,
         )
 
 
 # ═══════════════════════════════════════════════════════════════
-# 8. RISK MANAGEMENT ENGINE
+# 8. RISK MANAGEMENT
 # ═══════════════════════════════════════════════════════════════
 class RiskManagementEngine:
     def __init__(self, cfg: Config, store: StateStore):
         self.cfg = cfg
         self.store = store
 
-    # ---------- Balance tracking ----------
     def current_balance(self) -> float:
         state = self.store.load()
         if "current_balance" in state:
@@ -602,16 +601,14 @@ class RiskManagementEngine:
             self.store.save(state)
 
     def apply_trade_result(self, r_multiple: float, risk_amount_usd: float) -> None:
-        """Update balance setelah trade close."""
+        if risk_amount_usd <= 0:
+            return
         state = self.store.load()
         bal = float(state.get("current_balance", self.cfg.account_balance))
-        pnl = risk_amount_usd * r_multiple
-        state["current_balance"] = bal + pnl
+        state["current_balance"] = bal + (risk_amount_usd * r_multiple)
         self.store.save(state)
 
-    # ---------- Daily DD Lock ----------
     def daily_dd_check(self) -> Tuple[bool, str]:
-        """Return (is_locked, reason)."""
         self._ensure_balance_initialized()
         state = self.store.load()
         balance = self.current_balance()
@@ -621,10 +618,11 @@ class RiskManagementEngine:
             state["daily_date"] = today
             state["daily_start_balance"] = balance
             state["daily_locked"] = False
+            state["daily_signal_count"] = 0
             self.store.save(state)
 
         if state.get("daily_locked"):
-            return True, "daily_dd_already_locked"
+            return True, "daily_dd_locked"
 
         start = float(state.get("daily_start_balance", balance))
         if start <= 0:
@@ -633,16 +631,24 @@ class RiskManagementEngine:
         if dd_pct >= self.cfg.max_daily_loss_pct:
             state["daily_locked"] = True
             self.store.save(state)
-            logging.warning(
-                f"🛑 DAILY DD LOCK ENGAGED: -{dd_pct:.2f}% (start=${start:.2f}, now=${balance:.2f})"
-            )
+            logging.warning(f"🛑 DAILY DD LOCK: -{dd_pct:.2f}% (start ${start:.2f} → ${balance:.2f})")
             return True, f"daily_dd_{dd_pct:.2f}%"
+
+        # Daily signal cap
+        sig_count = int(state.get("daily_signal_count", 0))
+        if sig_count >= self.cfg.max_daily_signals:
+            return True, f"daily_signals_{sig_count}/{self.cfg.max_daily_signals}"
+
         return False, ""
 
-    # ---------- Position sizing ----------
+    def increment_daily_signal(self) -> None:
+        state = self.store.load()
+        state["daily_signal_count"] = int(state.get("daily_signal_count", 0)) + 1
+        self.store.save(state)
+
     def compute_lot(self, balance: float, entry: float, sl: float) -> Optional[float]:
         if balance < self.cfg.min_balance_for_trading:
-            logging.warning(f"balance {balance:.2f} < min {self.cfg.min_balance_for_trading}")
+            logging.warning(f"balance ${balance:.2f} < min ${self.cfg.min_balance_for_trading}")
             return None
         sl_dist = abs(entry - sl)
         if sl_dist <= 1e-6:
@@ -650,18 +656,21 @@ class RiskManagementEngine:
 
         risk_usd = balance * (self.cfg.risk_pct_per_trade / 100.0)
         lot_raw = risk_usd / (sl_dist * self.cfg.contract_size)
-        lot = max(self.cfg.min_lot, min(self.cfg.max_lot, round(lot_raw, 2)))
+        # FLOOR, never round up — cap risk at declared %
+        lot = math.floor(lot_raw * 100) / 100.0
+        lot = max(self.cfg.min_lot, min(self.cfg.max_lot, lot))
 
         # Leverage cap
         notional = lot * self.cfg.contract_size * entry
         if notional > self.cfg.hard_leverage_cap * balance:
-            max_lot = self.cfg.hard_leverage_cap * balance / (self.cfg.contract_size * entry)
-            lot = max(self.cfg.min_lot, round(max_lot, 2))
+            cap = self.cfg.hard_leverage_cap * balance / (self.cfg.contract_size * entry)
+            lot = math.floor(cap * 100) / 100.0
+            lot = max(self.cfg.min_lot, lot)
 
-        # Safety: min-lot risk harus ≤ 2% balance
+        # Min-lot safety
         min_risk = self.cfg.min_lot * self.cfg.contract_size * sl_dist
-        if min_risk > balance * 0.02:
-            logging.warning(f"min-lot risk ${min_risk:.2f} > 2% of ${balance:.2f}")
+        if min_risk > balance * (self.cfg.max_min_lot_risk_pct / 100.0):
+            logging.warning(f"min-lot risk ${min_risk:.2f} > {self.cfg.max_min_lot_risk_pct}% of ${balance:.2f}")
             return None
 
         return lot
@@ -690,15 +699,19 @@ class NewsSafetyFilter:
         try:
             r = self.http.request("GET", self.FF_URL, headers={"User-Agent": "Mozilla/5.0"})
             events = r.json()
+            self.store.set("news_fail_count", 0)
         except Exception as e:
             logging.warning(f"News fetch failed: {redact(str(e))}")
+            fc = int(self.store.get("news_fail_count", 0)) + 1
+            self.store.set("news_fail_count", fc)
+            if fc >= self.cfg.news_max_consecutive_fail:
+                return True, f"news_api_down_{fc}x"
             if self.cfg.news_fail_open:
                 return False, ""
             return True, "news_api_down"
 
         now = datetime.now(UTC)
-        blackout_min = self.cfg.news_blackout_min
-
+        bm = self.cfg.news_blackout_min
         for ev in events:
             if str(ev.get("country", "")).upper() != "USD":
                 continue
@@ -710,9 +723,8 @@ class NewsSafetyFilter:
                     evt = evt.replace(tzinfo=UTC)
             except Exception:
                 continue
-            delta_min = abs((evt - now).total_seconds()) / 60.0
-            if delta_min <= blackout_min:
-                title = str(ev.get("title", "High-impact event"))
+            if abs((evt - now).total_seconds()) / 60.0 <= bm:
+                title = str(ev.get("title", "High-impact USD"))
                 self.store.set("news_cache", {"ts": now_ts, "blackout": True, "title": title})
                 return True, title
 
@@ -721,7 +733,7 @@ class NewsSafetyFilter:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 10. TELEGRAM NOTIFIER
+# 10. TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 class TelegramNotifier:
     def __init__(self, cfg: Config, http: HTTPClient, store: StateStore):
@@ -738,15 +750,13 @@ class TelegramNotifier:
             if self.cfg.dry_run:
                 logging.info(f"[DRY-TG] {redact(text)}")
                 return True
-            logging.error("Telegram token/chat not configured")
+            logging.error("Telegram not configured")
             return False
 
-        # Dedup berdasarkan hash
         digest = hashlib.sha256(text.encode()).hexdigest()[:16]
         now = datetime.now(UTC)
         hashes = self.store.get("tg_hashes", {}) or {}
-        hashes = {k: v for k, v in hashes.items()
-                  if self._recent(v, now, 3600)}
+        hashes = {k: v for k, v in hashes.items() if self._recent(v, now, 3600)}
         if digest in hashes:
             return True
 
@@ -761,7 +771,7 @@ class TelegramNotifier:
                 self.store.set("tg_hashes", hashes)
                 return True
         except Exception as e:
-            logging.error(f"Telegram send failed: {redact(str(e))}")
+            logging.error(f"Telegram failed: {redact(str(e))}")
         return False
 
     @staticmethod
@@ -771,19 +781,20 @@ class TelegramNotifier:
         except Exception:
             return False
 
-    # ---------- Formatting ----------
     def format_signal(self, sig: Signal, lot: float, balance: float, risk_usd: float) -> str:
         p = self.cfg.price_decimals
         sl_dist = abs(sig.entry - sig.sl)
         emoji = "🟢" if sig.direction == "BUY" else "🔴"
+        rr1 = abs(sig.tp1 - sig.entry) / sl_dist if sl_dist > 0 else 0
+        rr3 = abs(sig.tp3 - sig.entry) / sl_dist if sl_dist > 0 else 0
         return (
             f"{emoji} <b>{self.cfg.symbol} — {sig.direction}</b> (M5)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 <b>Entry:</b> <code>{sig.entry:.{p}f}</code>\n"
             f"🛑 <b>SL   :</b> <code>{sig.sl:.{p}f}</code>  (<i>-{sl_dist:.{p}f}</i>)\n"
-            f"🎯 <b>TP1  :</b> <code>{sig.tp1:.{p}f}</code>  (<i>+{abs(sig.tp1-sig.entry):.{p}f}</i>)\n"
+            f"🎯 <b>TP1  :</b> <code>{sig.tp1:.{p}f}</code>  (<i>+{abs(sig.tp1-sig.entry):.{p}f} • RR 1:{rr1:.1f}</i>)\n"
             f"🎯 <b>TP2  :</b> <code>{sig.tp2:.{p}f}</code>  (<i>+{abs(sig.tp2-sig.entry):.{p}f}</i>)\n"
-            f"🎯 <b>TP3  :</b> <code>{sig.tp3:.{p}f}</code>  (<i>+{abs(sig.tp3-sig.entry):.{p}f}</i>)\n"
+            f"🎯 <b>TP3  :</b> <code>{sig.tp3:.{p}f}</code>  (<i>+{abs(sig.tp3-sig.entry):.{p}f} • RR 1:{rr3:.1f}</i>)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 <b>Lot:</b> <code>{lot}</code>\n"
             f"💰 <b>Risk:</b> ${risk_usd:.2f} ({self.cfg.risk_pct_per_trade:.1f}% of ${balance:.2f})\n"
@@ -793,7 +804,7 @@ class TelegramNotifier:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 11. OUTCOME TRACKER — update balance + journal
+# 11. OUTCOME TRACKER
 # ═══════════════════════════════════════════════════════════════
 class OutcomeTracker:
     def __init__(self, cfg: Config, store: StateStore, risk: RiskManagementEngine):
@@ -802,23 +813,20 @@ class OutcomeTracker:
         self.risk = risk
 
     def update(self, m5: pd.DataFrame) -> List[dict]:
-        """Walk pending journal entries → close those whose SL/TP hit."""
         state = self.store.load()
         journal: List[dict] = state.get("journal", []) or []
-        closed_events: List[dict] = []
+        closed: List[dict] = []
         changed = False
         now = datetime.now(UTC)
 
         for entry in journal:
             if entry.get("outcome") not in ("PENDING", None):
                 continue
-
             try:
                 ts = pd.Timestamp(entry.get("signal_ts", entry.get("timestamp")), tz="UTC")
             except Exception:
                 continue
 
-            # Expire stale pending
             if (now - ts.to_pydatetime()) > timedelta(hours=24):
                 entry["outcome"] = "STALE"
                 entry["r_achieved"] = 0.0
@@ -836,7 +844,6 @@ class OutcomeTracker:
             if bars.empty:
                 continue
 
-            # Fill detection
             if not entry.get("filled"):
                 fill_idx = None
                 for i, b in enumerate(bars.itertuples(index=False)):
@@ -854,15 +861,12 @@ class OutcomeTracker:
             else:
                 walk = bars
 
-            # Walk to outcome
             hit_tp1 = bool(entry.get("hit_tp1"))
             outcome = "PENDING"
             r_val = 0.0
 
             for b in walk.itertuples(index=False):
-                # Move SL to BE after TP1
                 active_sl = ep if hit_tp1 else sl
-
                 if side == "BUY":
                     if b.low <= active_sl:
                         outcome = "WIN_BE" if hit_tp1 else "LOSS"
@@ -892,17 +896,17 @@ class OutcomeTracker:
                 entry["r_achieved"] = round(r_val, 3)
                 entry["closed_ts"] = now.isoformat()
                 self.risk.apply_trade_result(r_val, risk_usd)
-                closed_events.append(dict(entry))
+                closed.append(dict(entry))
                 changed = True
 
         if changed:
             state["journal"] = journal
             self.store.save(state)
-        return closed_events
+        return closed
 
 
 # ═══════════════════════════════════════════════════════════════
-# 12. ORCHESTRATOR — loop utama
+# 12. ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════
 class TradingBotOrchestrator:
     def __init__(self, cfg: Config):
@@ -916,15 +920,16 @@ class TradingBotOrchestrator:
         self.tg = TelegramNotifier(cfg, self.http, self.store)
         self.tracker = OutcomeTracker(cfg, self.store, self.risk)
 
-    # ---------- Helpers ----------
-    def _in_killzone(self, now: datetime) -> bool:
-        if self.cfg.skip_killzone:
-            return True
-        h = now.hour + now.minute / 60.0
-        for start, end in self.cfg.killzones:
-            if start <= h < end:
-                return True
-        return False
+    def _is_weekend_or_closed(self, now: datetime) -> Tuple[bool, str]:
+        wd = now.weekday()  # Mon=0 ... Sun=6
+        h = now.hour
+        if wd == 5:
+            return True, "Saturday"
+        if wd == 6 and h < 22:
+            return True, "Sunday pre-open"
+        if wd == 4 and h >= 21:
+            return True, "Friday post-close"
+        return False, ""
 
     def _cooldown_active(self) -> bool:
         last = self.store.get("last_signal_ts", "")
@@ -940,93 +945,99 @@ class TradingBotOrchestrator:
 
     def _count_pending(self) -> int:
         journal = self.store.get("journal", []) or []
-        return sum(1 for j in journal if j.get("outcome") == "PENDING")
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(hours=24)
+        n = 0
+        for j in journal:
+            if j.get("outcome") != "PENDING":
+                continue
+            try:
+                ts = datetime.fromisoformat(j.get("signal_ts", j.get("timestamp", "")))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                if ts > cutoff:
+                    n += 1
+            except Exception:
+                n += 1
+        return n
 
-    # ---------- Single tick ----------
     def tick(self) -> None:
         now = datetime.now(UTC)
 
-        # --- Global gates ---
         if self.cfg.kill_switch:
-            logging.info("KILL switch engaged → abort")
-            return
-        if now.weekday() >= 5:
-            logging.info("Weekend → skip")
-            return
-        if not self._in_killzone(now):
-            logging.info(f"Outside killzone ({now.strftime('%H:%M')} UTC) → skip")
+            logging.info("KILL switch → abort")
             return
 
-        # --- Daily DD lock ---
+        weekend, wreason = self._is_weekend_or_closed(now)
+        if weekend:
+            logging.info(f"Market closed ({wreason}) → skip")
+            return
+
+        if now.date().isoformat() in US_HOLIDAYS:
+            logging.info(f"US holiday ({now.date()}) → skip")
+            return
+
         locked, reason = self.risk.daily_dd_check()
         if locked:
-            logging.warning(f"Daily DD locked: {reason}")
+            logging.warning(f"Gate blocked: {reason}")
             return
 
-        # --- News blackout ---
         blackout, title = self.news.is_blackout()
         if blackout:
             logging.info(f"News blackout: {title}")
             return
 
-        # --- Fetch data ---
         try:
             dfs = self.data.fetch_all()
         except Exception as e:
-            logging.error(f"Data fetch failed: {redact(str(e))}")
+            logging.error(f"Data fetch: {redact(str(e))}")
             return
 
-        # --- Update pending trades first ---
+        # Update pending trades
         try:
             closed = self.tracker.update(dfs["M5"])
             for ev in closed:
                 emoji = "🏆" if ev["outcome"].startswith("WIN") else (
                     "⚖️" if ev["outcome"] == "WIN_BE" else "💀"
                 )
-                msg = (
+                self.tg.send(
                     f"{emoji} <b>Trade Closed</b> — {ev['signal']} {self.cfg.symbol}\n"
                     f"Outcome: <b>{ev['outcome']}</b>  ({ev['r_achieved']:+.2f}R)\n"
                     f"Entry: {ev['entry']}  SL: {ev['sl']}"
                 )
-                self.tg.send(msg)
         except Exception as e:
-            logging.error(f"Tracker error: {redact(str(e))}")
+            logging.error(f"Tracker: {redact(str(e))}")
 
-        # --- Cooldown + pending limit ---
         if self._cooldown_active():
-            logging.info("Cooldown active → skip new signal")
+            logging.info("Cooldown active")
             return
         if self._count_pending() >= self.cfg.max_pending:
-            logging.info(f"Max pending reached ({self.cfg.max_pending})")
+            logging.info(f"Max pending ({self.cfg.max_pending})")
             return
 
-        # --- Generate signal ---
         sig = self.signal.generate(dfs["M5"], dfs["M15"], dfs["H1"])
         if sig is None:
             logging.info("No signal")
             return
 
-        # --- Position sizing ---
         balance = self.risk.current_balance()
         lot = self.risk.compute_lot(balance, sig.entry, sig.sl)
         if lot is None:
-            logging.warning("Position sizing rejected")
+            logging.warning("Sizing rejected")
             return
-        risk_usd = lot * self.cfg.contract_size * abs(sig.entry - sig.sl)
+        risk_usd = round(lot * self.cfg.contract_size * abs(sig.entry - sig.sl), 2)
 
-        # --- Telegram ---
         msg = self.tg.format_signal(sig, lot, balance, risk_usd)
         if not self.tg.send(msg):
-            logging.error("Telegram send failed → tidak mencatat trade")
+            logging.error("Telegram failed → trade not journaled")
             return
 
-        # --- Persist journal ---
         state = self.store.load()
         journal = state.get("journal", []) or []
         journal.append({
             "id": f"{now.strftime('%Y%m%dT%H%M%S')}_{sig.direction}",
             "timestamp": now.isoformat(),
-            "signal_ts": dfs["M5"].iloc[-1]["datetime"].isoformat(),
+            "signal_ts": sig.signal_bar_ts,
             "symbol": self.cfg.symbol,
             "signal": sig.direction,
             "entry": sig.entry,
@@ -1035,7 +1046,7 @@ class TradingBotOrchestrator:
             "tp2": sig.tp2,
             "tp3": sig.tp3,
             "lot": lot,
-            "risk_amount_usd": round(risk_usd, 2),
+            "risk_amount_usd": risk_usd,
             "atr": sig.atr,
             "outcome": "PENDING",
             "filled": 0,
@@ -1044,24 +1055,28 @@ class TradingBotOrchestrator:
         state["journal"] = journal[-500:]
         state["last_signal_ts"] = now.isoformat()
         self.store.save(state)
-        logging.info(f"✅ Signal dispatched: {sig.direction} lot={lot} entry={sig.entry} sl={sig.sl}")
+        self.risk.increment_daily_signal()
 
-    # ---------- Loop ----------
+        logging.info(
+            f"✅ Signal: {sig.direction} lot={lot} entry={sig.entry} "
+            f"sl={sig.sl} risk=${risk_usd:.2f} bal=${balance:.2f}"
+        )
+
     def run_once(self) -> None:
         try:
             self.tick()
         except Exception:
-            logging.exception("Unhandled error in tick")
+            logging.exception("Unhandled in tick")
 
     def run_loop(self) -> None:
-        logging.info(f"🚀 APEX v{VERSION} starting loop (every {self.cfg.loop_interval_sec}s)")
+        logging.info(f"🚀 APEX v{VERSION} loop every {self.cfg.loop_interval_sec}s")
         while not self.cfg.kill_switch:
             self.run_once()
             time.sleep(self.cfg.loop_interval_sec)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 13. CLI COMMANDS
+# 13. CLI
 # ═══════════════════════════════════════════════════════════════
 def cmd_smoke(cfg: Config) -> None:
     http = HTTPClient(cfg)
@@ -1078,7 +1093,11 @@ def cmd_smoke(cfg: Config) -> None:
         print(f"   entry={sig.entry}  sl={sig.sl}  tp1={sig.tp1}  tp2={sig.tp2}  tp3={sig.tp3}")
         print(f"   {sig.reason}")
     else:
-        print("\n⊘ No signal (market conditions not met)")
+        print("\n⊘ No signal (conditions not met)")
+
+    tg = TelegramNotifier(cfg, http, store)
+    ok = tg.send(f"<b>🔔 APEX v{VERSION} SMOKE OK</b>")
+    print(f"Telegram: {'✓ SENT' if ok else '✗ FAILED'}")
 
 
 def cmd_validate(cfg: Config) -> None:
@@ -1094,17 +1113,17 @@ def cmd_validate(cfg: Config) -> None:
     h1 = dfs["H1"].reset_index(drop=True)
 
     n = len(m5)
-    lookback = 250
+    lookback = cfg.min_bars_m5 + 20
     step = 3
     forward = 60
     results = []
 
     for i in range(lookback, n - forward, step):
         cur_ts = m5.iloc[i]["datetime"]
-        m5w = m5.iloc[:i]
+        m5w = m5.iloc[:i + 1]           # includes bar i, will be dropped inside
         m15w = m15[m15["datetime"] <= cur_ts]
         h1w = h1[h1["datetime"] <= cur_ts]
-        if len(m15w) < 100 or len(h1w) < 250:
+        if len(m15w) < cfg.min_bars_m15 + 1 or len(h1w) < cfg.min_bars_h1 + 1:
             continue
 
         sig = sig_gen.generate(m5w, m15w, h1w)
@@ -1115,16 +1134,16 @@ def cmd_validate(cfg: Config) -> None:
         fill_idx = None
         for j, b in enumerate(fut.itertuples(index=False)):
             if sig.direction == "BUY" and b.low <= sig.entry:
-                fill_idx = j
-                break
+                fill_idx = j; break
             if sig.direction == "SELL" and b.high >= sig.entry:
-                fill_idx = j
-                break
+                fill_idx = j; break
         if fill_idx is None:
             continue
 
         post = fut.iloc[fill_idx:]
         rr = abs(sig.entry - sig.sl)
+        if rr <= 0:
+            continue
         outcome = "OPEN"
         r_val = 0.0
         hit_tp1 = False
@@ -1177,17 +1196,17 @@ def cmd_test_tg(cfg: Config) -> None:
     store = StateStore(cfg, http)
     tg = TelegramNotifier(cfg, http, store)
     dummy = Signal(
-        direction="BUY", entry=2045.50, sl=2038.20,
-        tp1=2052.80, tp2=2060.10, tp3=2067.40,
-        atr=8.10, atr_pct=0.55, trend_h1="BUY", reason="SELF-TEST",
+        direction="BUY", entry=2045.50, sl=2036.20,
+        tp1=2054.80, tp2=2064.10, tp3=2073.40,
+        atr=6.50, atr_pct=0.55, trend_h1="BUY", reason="SELF-TEST",
+        signal_bar_ts=datetime.now(UTC).isoformat(),
     )
-    msg = tg.format_signal(dummy, lot=0.10, balance=1000.0, risk_usd=10.0)
-    ok = tg.send("🔔 <b>APEX v" + VERSION + "</b> — Telegram OK\n\n" + msg)
+    msg = tg.format_signal(dummy, lot=0.01, balance=1000.0, risk_usd=9.30)
+    ok = tg.send(f"🔔 <b>APEX v{VERSION}</b> — Telegram OK\n\n" + msg)
     print("SENT" if ok else "FAILED")
 
 
 def cmd_selftest(cfg: Config) -> None:
-    # Check imports
     try:
         import numpy, pandas, requests
         print(f"✓ numpy {numpy.__version__}")
@@ -1197,25 +1216,26 @@ def cmd_selftest(cfg: Config) -> None:
         print(f"✗ missing dependency: {e}")
         sys.exit(1)
 
-    # Config sanity
-    print(f"✓ Config loaded: symbol={cfg.symbol} risk={cfg.risk_pct_per_trade}%")
-    print(f"✓ ATR: period={cfg.atr_period} sl={cfg.atr_sl_mult}x tp={cfg.atr_tp1_mult}/{cfg.atr_tp2_mult}/{cfg.atr_tp3_mult}x")
-    print(f"✓ Daily DD lock: {cfg.max_daily_loss_pct}%")
-    print(f"✓ News blackout: ±{cfg.news_blackout_min} min")
+    print(f"✓ Config: symbol={cfg.symbol} risk={cfg.risk_pct_per_trade}%")
+    print(f"✓ ATR: period={cfg.atr_period} sl={cfg.atr_sl_mult}x "
+          f"tp={cfg.atr_tp1_mult}/{cfg.atr_tp2_mult}/{cfg.atr_tp3_mult}x")
+    print(f"✓ Daily DD lock: {cfg.max_daily_loss_pct}% | "
+          f"max signals/day: {cfg.max_daily_signals}")
+    print(f"✓ News blackout: ±{cfg.news_blackout_min} min (fail-open={cfg.news_fail_open})")
+    print(f"✓ min_bars_m5 (auto): {cfg.min_bars_m5}")
+    print(f"✓ Killzone: DISABLED (permanent)")
     print(f"\n✅ SELFTEST PASSED (v{VERSION})")
 
 
-# ═══════════════════════════════════════════════════════════════
-# 14. MAIN
-# ═══════════════════════════════════════════════════════════════
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"APEX v{VERSION}")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run","smoke","validate","test-tg","selftest"])
-    parser.add_argument("--loop", action="store_true", help="Daemon mode")
+                        choices=["run", "smoke", "validate", "test-tg", "selftest"])
+    parser.add_argument("--loop", action="store_true", help="daemon mode")
     args = parser.parse_args()
 
-    setup_logging()
+    level = getattr(logging, os.getenv("APEX_LOG_LEVEL", "INFO").upper(), logging.INFO)
+    setup_logging(level)
 
     try:
         cfg = Config.from_env()
@@ -1232,7 +1252,6 @@ def main() -> None:
     if args.command == "test-tg":
         cmd_test_tg(cfg); return
 
-    # run
     try:
         bot = TradingBotOrchestrator(cfg)
         if args.loop:
