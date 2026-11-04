@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v22.1 — Production-Ready XAUUSD Trading Engine
+APEX PREDATOR v22.2 — FINAL LIVE-READY XAUUSD Trading Engine
 =============================================================
 
-Forensically hardened build:
-    - Zero look-ahead bias (all indicators use CLOSED bars)
-    - ATR percentile warmup enforced (min_bars auto-derived)
-    - Floor-based lot sizing (never exceeds declared risk)
-    - Daily DD Lock, News Blackout, US Holidays, Daily Signal Cap
-    - Killzone PERMANENTLY DISABLED
-    - Volume column safely handled (TwelveData XAU/USD has no volume)
+Forensically hardened. Zero look-ahead. Fail-safe by design.
+
+Key features:
+    ✓ 3-layer confluence (H1 trend + M15 momentum + M5 EMA zone)
+    ✓ ATR regime filter (reject dead/panic markets)
+    ✓ ATR-based SL/TP (RR 1:1 / 1:2 / 1:3, SL = 2×ATR)
+    ✓ Floor-based position sizing (never exceeds declared risk %)
+    ✓ Daily DD Lock (persistent, reset per UTC day)
+    ✓ Max daily signals cap
+    ✓ US holiday + weekend + news blackout
+    ✓ Volume column safe (TwelveData XAU/USD has no volume)
+    ✓ Full diagnostics (explain mode logs each gate)
+    ✓ Killzone PERMANENTLY DISABLED
 
 Commands:
-    python apex_v22.py run              # one-shot (cron)
-    python apex_v22.py run --loop       # daemon
-    python apex_v22.py smoke            # connectivity + signal test
-    python apex_v22.py validate         # walk-forward backtest
-    python apex_v22.py test-tg          # telegram test
-    python apex_v22.py selftest         # install verification
+    python apex_v22.py selftest       # install verification
+    python apex_v22.py smoke          # connectivity + signal explain
+    python apex_v22.py validate       # walk-forward backtest
+    python apex_v22.py test-tg        # telegram test
+    python apex_v22.py run            # ONE-SHOT (GitHub Actions / cron)
+    python apex_v22.py run --loop     # daemon mode
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-VERSION = "22.1"
+VERSION = "22.2"
 UTC = timezone.utc
 
 US_HOLIDAYS = {
@@ -406,6 +412,7 @@ class MarketDataHandler:
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
+        # Volume column safe (TwelveData XAU/USD has no volume)
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
         else:
@@ -442,7 +449,7 @@ class MarketDataHandler:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. SIGNAL GENERATOR
+# 7. SIGNAL GENERATOR — with explain mode
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class Signal:
@@ -468,59 +475,80 @@ class SignalGenerator:
         m5: pd.DataFrame,
         m15: pd.DataFrame,
         h1: pd.DataFrame,
+        explain: bool = False,
     ) -> Optional[Signal]:
         cfg = self.cfg
+
+        def _fail(reason: str):
+            if explain:
+                logging.info(f"[Signal] REJECT: {reason}")
+            return None
+
         if len(m5) < cfg.min_bars_m5 + 1:
-            return None
+            return _fail(f"M5 bars {len(m5)} < {cfg.min_bars_m5+1}")
         if len(m15) < cfg.min_bars_m15 + 1:
-            return None
+            return _fail(f"M15 bars {len(m15)} < {cfg.min_bars_m15+1}")
         if len(h1) < cfg.min_bars_h1 + 1:
-            return None
+            return _fail(f"H1 bars {len(h1)} < {cfg.min_bars_h1+1}")
 
         m5 = m5.iloc[:-1].reset_index(drop=True)
         m15 = m15.iloc[:-1].reset_index(drop=True)
         h1 = h1.iloc[:-1].reset_index(drop=True)
-
         signal_bar_ts = m5["datetime"].iloc[-1].isoformat()
 
+        # [1] H1 trend
         ema50_h1 = Indicators.ema(h1["close"], cfg.ema_trend_fast)
         ema200_h1 = Indicators.ema(h1["close"], cfg.ema_trend_slow)
         p_h1 = float(h1["close"].iloc[-1])
-        if p_h1 > ema200_h1.iloc[-1] and ema50_h1.iloc[-1] > ema200_h1.iloc[-1]:
+        e50 = float(ema50_h1.iloc[-1])
+        e200 = float(ema200_h1.iloc[-1])
+        if p_h1 > e200 and e50 > e200:
             trend = "BUY"
-        elif p_h1 < ema200_h1.iloc[-1] and ema50_h1.iloc[-1] < ema200_h1.iloc[-1]:
+            if explain:
+                logging.info(f"[Signal] H1 TREND: BUY (close={p_h1:.2f} > EMA200={e200:.2f}, EMA50 > EMA200)")
+        elif p_h1 < e200 and e50 < e200:
             trend = "SELL"
+            if explain:
+                logging.info(f"[Signal] H1 TREND: SELL (close={p_h1:.2f} < EMA200={e200:.2f}, EMA50 < EMA200)")
         else:
-            return None
+            return _fail(f"H1 trend NEUTRAL (close={p_h1:.2f}, EMA50={e50:.2f}, EMA200={e200:.2f})")
 
+        # [2] M15 momentum
         ema20_m15 = float(Indicators.ema(m15["close"], cfg.ema_fast).iloc[-1])
         ema50_m15 = float(Indicators.ema(m15["close"], cfg.ema_slow).iloc[-1])
         if trend == "BUY" and ema20_m15 <= ema50_m15:
-            return None
+            return _fail(f"M15 opposing BUY (EMA20={ema20_m15:.2f} <= EMA50={ema50_m15:.2f})")
         if trend == "SELL" and ema20_m15 >= ema50_m15:
-            return None
+            return _fail(f"M15 opposing SELL (EMA20={ema20_m15:.2f} >= EMA50={ema50_m15:.2f})")
+        if explain:
+            logging.info(f"[Signal] M15 MOMENTUM: aligned (EMA20={ema20_m15:.2f} vs EMA50={ema50_m15:.2f})")
 
+        # [3] ATR regime
         atr_now = Indicators.atr_last(m5, cfg.atr_period)
         if atr_now <= 0:
-            return None
+            return _fail("ATR=0")
         atr_pct = Indicators.atr_percentile(m5, cfg.atr_period, cfg.atr_pct_lookback)
         if atr_pct is None:
-            return None
+            return _fail(f"ATR warmup insufficient (need {cfg.atr_pct_lookback + cfg.atr_period + 1} bars, have {len(m5)})")
         if not (cfg.atr_pct_min <= atr_pct <= cfg.atr_pct_max):
-            return None
+            return _fail(f"ATR pct {atr_pct:.0%} outside [{cfg.atr_pct_min:.0%}, {cfg.atr_pct_max:.0%}]")
+        if explain:
+            logging.info(f"[Signal] ATR REGIME: OK (ATR={atr_now:.2f}, pct={atr_pct:.0%})")
 
+        # [4] M5 entry zone
         ema9_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_fast).iloc[-1])
         ema21_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_slow).iloc[-1])
         price = float(m5["close"].iloc[-1])
-
         zone_lo = ema21_m5 - atr_now * cfg.ema_zone_atr
         zone_hi = ema21_m5 + atr_now * cfg.ema_zone_atr
         if not (zone_lo <= price <= zone_hi):
-            return None
+            return _fail(f"Price {price:.2f} outside zone [{zone_lo:.2f}, {zone_hi:.2f}] (EMA21={ema21_m5:.2f})")
+        if explain:
+            logging.info(f"[Signal] M5 ZONE: OK (price={price:.2f} in [{zone_lo:.2f}, {zone_hi:.2f}])")
 
         if trend == "BUY":
             if ema9_m5 <= ema21_m5:
-                return None
+                return _fail(f"M5 EMA9={ema9_m5:.2f} <= EMA21={ema21_m5:.2f} (no bullish cross)")
             direction = "BUY"
             sl = price - atr_now * cfg.atr_sl_mult
             tp1 = price + atr_now * cfg.atr_tp1_mult
@@ -528,7 +556,7 @@ class SignalGenerator:
             tp3 = price + atr_now * cfg.atr_tp3_mult
         else:
             if ema9_m5 >= ema21_m5:
-                return None
+                return _fail(f"M5 EMA9={ema9_m5:.2f} >= EMA21={ema21_m5:.2f} (no bearish cross)")
             direction = "SELL"
             sl = price + atr_now * cfg.atr_sl_mult
             tp1 = price - atr_now * cfg.atr_tp1_mult
@@ -536,6 +564,8 @@ class SignalGenerator:
             tp3 = price - atr_now * cfg.atr_tp3_mult
 
         p = cfg.price_decimals
+        if explain:
+            logging.info(f"[Signal] ✅ ALL GATES PASSED → {direction}")
         return Signal(
             direction=direction,
             entry=round(price, p),
@@ -933,7 +963,7 @@ class TradingBotOrchestrator:
                 n += 1
         return n
 
-    def tick(self) -> None:
+    def tick(self, explain: bool = False) -> None:
         now = datetime.now(UTC)
 
         if self.cfg.kill_switch:
@@ -986,7 +1016,7 @@ class TradingBotOrchestrator:
             logging.info(f"Max pending ({self.cfg.max_pending})")
             return
 
-        sig = self.signal.generate(dfs["M5"], dfs["M15"], dfs["H1"])
+        sig = self.signal.generate(dfs["M5"], dfs["M15"], dfs["H1"], explain=explain)
         if sig is None:
             logging.info("No signal")
             return
@@ -1033,9 +1063,9 @@ class TradingBotOrchestrator:
             f"sl={sig.sl} risk=${risk_usd:.2f} bal=${balance:.2f}"
         )
 
-    def run_once(self) -> None:
+    def run_once(self, explain: bool = False) -> None:
         try:
-            self.tick()
+            self.tick(explain=explain)
         except Exception:
             logging.exception("Unhandled in tick")
 
@@ -1047,28 +1077,29 @@ class TradingBotOrchestrator:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 13. CLI
+# 13. CLI COMMANDS
 # ═══════════════════════════════════════════════════════════════
 def cmd_smoke(cfg: Config) -> None:
     http = HTTPClient(cfg)
     store = StateStore(cfg, http)
     data = MarketDataHandler(cfg, http, store)
     sig_gen = SignalGenerator(cfg)
-    print("─── SMOKE TEST ───")
+    print("─── SMOKE TEST (with full diagnostics) ───")
     dfs = data.fetch_all()
     for tf, df in dfs.items():
         print(f"  {tf}: {len(df)} bars | last={df['close'].iloc[-1]:.2f} @ {df['datetime'].iloc[-1]}")
-    sig = sig_gen.generate(dfs["M5"], dfs["M15"], dfs["H1"])
+    print("\n--- Signal Pipeline ---")
+    sig = sig_gen.generate(dfs["M5"], dfs["M15"], dfs["H1"], explain=True)
     if sig:
         print(f"\n✅ SIGNAL: {sig.direction}")
         print(f"   entry={sig.entry}  sl={sig.sl}  tp1={sig.tp1}  tp2={sig.tp2}  tp3={sig.tp3}")
         print(f"   {sig.reason}")
     else:
-        print("\n⊘ No signal (conditions not met)")
+        print("\n⊘ No signal — see REJECT reason above")
 
     tg = TelegramNotifier(cfg, http, store)
     ok = tg.send(f"<b>🔔 APEX v{VERSION} SMOKE OK</b>")
-    print(f"Telegram: {'✓ SENT' if ok else '✗ FAILED'}")
+    print(f"\nTelegram: {'✓ SENT' if ok else '✗ FAILED'}")
 
 
 def cmd_validate(cfg: Config) -> None:
@@ -1203,6 +1234,7 @@ def main() -> None:
     parser.add_argument("command", nargs="?", default="run",
                         choices=["run", "smoke", "validate", "test-tg", "selftest"])
     parser.add_argument("--loop", action="store_true", help="daemon mode")
+    parser.add_argument("--explain", action="store_true", help="show signal gate diagnostics")
     args = parser.parse_args()
 
     level = getattr(logging, os.getenv("APEX_LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -1228,7 +1260,7 @@ def main() -> None:
         if args.loop:
             bot.run_loop()
         else:
-            bot.run_once()
+            bot.run_once(explain=args.explain)
     except Exception:
         logging.exception("FATAL")
         sys.exit(1)
