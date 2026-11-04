@@ -51,6 +51,7 @@ jobs:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           APEX_DRY_RUN:     'false'
+          APEX_REQUIRE_STATE_PERSISTENCE: 'false'  # FIX: Agar tidak error StateError
         run: python apex_v21.py test-tg
 
       - name: 4️⃣ Run Bot (Live/Dry based on Repo Variables)
