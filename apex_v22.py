@@ -8,7 +8,8 @@ Forensically hardened build:
     - ATR percentile warmup enforced (min_bars auto-derived)
     - Floor-based lot sizing (never exceeds declared risk)
     - Daily DD Lock, News Blackout, US Holidays, Daily Signal Cap
-    - Killzone PERMANENTLY DISABLED (per user requirement)
+    - Killzone PERMANENTLY DISABLED
+    - Volume column safely handled (TwelveData XAU/USD has no volume)
 
 Commands:
     python apex_v22.py run              # one-shot (cron)
@@ -43,7 +44,6 @@ import requests
 VERSION = "22.1"
 UTC = timezone.utc
 
-# US market holidays (early close = low liquidity = unsafe for XAUUSD scalping)
 US_HOLIDAYS = {
     "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
     "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
@@ -59,25 +59,21 @@ US_HOLIDAYS = {
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class Config:
-    # Instrument
     symbol: str = "XAUUSD"
     contract_size: float = 100.0
     price_decimals: int = 2
 
-    # Account
     account_balance: float = 1000.0
     min_balance_for_trading: float = 50.0
     risk_pct_per_trade: float = 1.0
     max_lot: float = 5.0
     min_lot: float = 0.01
     hard_leverage_cap: float = 30.0
-    max_min_lot_risk_pct: float = 2.0        # reject if 0.01-lot risk > X% balance
+    max_min_lot_risk_pct: float = 2.0
 
-    # Daily DD Protection
     max_daily_loss_pct: float = 3.0
-    max_daily_signals: int = 5               # NEW: hard cap per UTC day
+    max_daily_signals: int = 5
 
-    # Signal (EMA/ATR) — SL bumped to 2.0×ATR for XAUUSD
     ema_fast: int = 20
     ema_slow: int = 50
     ema_trend_fast: int = 50
@@ -87,15 +83,14 @@ class Config:
     ema_zone_atr: float = 0.5
 
     atr_period: int = 14
-    atr_sl_mult: float = 2.0                 # CHANGED: 1.5 → 2.0
-    atr_tp1_mult: float = 2.0                # CHANGED: 1.5 → 2.0 (RR 1:1)
-    atr_tp2_mult: float = 4.0                # RR 1:2
-    atr_tp3_mult: float = 6.0                # RR 1:3
+    atr_sl_mult: float = 2.0
+    atr_tp1_mult: float = 2.0
+    atr_tp2_mult: float = 4.0
+    atr_tp3_mult: float = 6.0
     atr_pct_min: float = 0.15
     atr_pct_max: float = 0.95
     atr_pct_lookback: int = 200
 
-    # Data — min_bars auto-calculated in validate()
     min_bars_m5: int = 250
     min_bars_m15: int = 100
     min_bars_h1: int = 250
@@ -105,26 +100,21 @@ class Config:
     price_min: float = 500.0
     price_max: float = 10000.0
 
-    # News
     news_blackout_min: int = 30
     news_cache_sec: int = 1800
     news_fail_open: bool = True
     news_max_consecutive_fail: int = 3
 
-    # Loop / cooldown
     loop_interval_sec: int = 60
     cooldown_minutes: int = 60
     max_pending: int = 2
 
-    # HTTP
     http_timeout: Tuple[int, int] = (3, 10)
     max_retry: int = 3
 
-    # Safety
     dry_run: bool = True
     kill_switch: bool = False
 
-    # State
     state_file: str = "apex_state_v22.json"
     gist_id: str = ""
     gist_token: str = ""
@@ -168,7 +158,6 @@ class Config:
             raise ValueError("invalid ATR percentile range")
         if self.max_daily_loss_pct <= 0 or self.max_daily_loss_pct >= 50:
             raise ValueError("max_daily_loss_pct must be (0, 50)")
-        # Auto-raise min_bars_m5 to accommodate ATR percentile warmup
         needed = self.atr_pct_lookback + self.atr_period + 10
         if self.min_bars_m5 < needed:
             self.min_bars_m5 = needed
@@ -343,10 +332,6 @@ class Indicators:
 
     @staticmethod
     def atr_percentile(df: pd.DataFrame, period: int, lookback: int) -> Optional[float]:
-        """
-        Returns percentile of current ATR vs lookback window, or None if
-        insufficient data (warmup — DO NOT guess 0.5, reject signal).
-        """
         if len(df) < lookback + period + 1:
             return None
         atr = Indicators.atr_series(df, period)
@@ -356,7 +341,7 @@ class Indicators:
         window = atr.iloc[-lookback:]
         lo, hi = float(window.min()), float(window.max())
         if hi - lo < 1e-9:
-            return None  # flat ATR window → unreliable
+            return None
         return float(np.clip((cur - lo) / (hi - lo), 0.0, 1.0))
 
 
@@ -421,7 +406,10 @@ class MarketDataHandler:
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 100.0), errors="coerce").fillna(100.0)
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
+        else:
+            df["volume"] = 100.0
         df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
         return df[["datetime", "open", "high", "low", "close", "volume"]]
 
@@ -468,7 +456,7 @@ class Signal:
     atr_pct: float
     trend_h1: str
     reason: str
-    signal_bar_ts: str = ""     # ISO ts of last CLOSED M5 bar
+    signal_bar_ts: str = ""
 
 
 class SignalGenerator:
@@ -481,13 +469,6 @@ class SignalGenerator:
         m15: pd.DataFrame,
         h1: pd.DataFrame,
     ) -> Optional[Signal]:
-        """
-        3-layer confluence:
-          [1] H1 trend     : close vs EMA200_H1 + EMA50_H1 alignment
-          [2] M15 momentum : EMA20_M15 vs EMA50_M15 direction
-          [3] M5 entry     : price inside EMA21_M5 ± zone·ATR_M5 + EMA9 cross
-        + ATR percentile regime filter (rejects dead/panic markets)
-        """
         cfg = self.cfg
         if len(m5) < cfg.min_bars_m5 + 1:
             return None
@@ -496,14 +477,12 @@ class SignalGenerator:
         if len(h1) < cfg.min_bars_h1 + 1:
             return None
 
-        # Drop forming bar — enforce no look-ahead
         m5 = m5.iloc[:-1].reset_index(drop=True)
         m15 = m15.iloc[:-1].reset_index(drop=True)
         h1 = h1.iloc[:-1].reset_index(drop=True)
 
         signal_bar_ts = m5["datetime"].iloc[-1].isoformat()
 
-        # [1] H1 trend
         ema50_h1 = Indicators.ema(h1["close"], cfg.ema_trend_fast)
         ema200_h1 = Indicators.ema(h1["close"], cfg.ema_trend_slow)
         p_h1 = float(h1["close"].iloc[-1])
@@ -514,7 +493,6 @@ class SignalGenerator:
         else:
             return None
 
-        # [2] M15 momentum
         ema20_m15 = float(Indicators.ema(m15["close"], cfg.ema_fast).iloc[-1])
         ema50_m15 = float(Indicators.ema(m15["close"], cfg.ema_slow).iloc[-1])
         if trend == "BUY" and ema20_m15 <= ema50_m15:
@@ -522,17 +500,15 @@ class SignalGenerator:
         if trend == "SELL" and ema20_m15 >= ema50_m15:
             return None
 
-        # [3] ATR regime
         atr_now = Indicators.atr_last(m5, cfg.atr_period)
         if atr_now <= 0:
             return None
         atr_pct = Indicators.atr_percentile(m5, cfg.atr_period, cfg.atr_pct_lookback)
         if atr_pct is None:
-            return None  # warmup — DO NOT trade blind
+            return None
         if not (cfg.atr_pct_min <= atr_pct <= cfg.atr_pct_max):
             return None
 
-        # [4] M5 entry zone
         ema9_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_fast).iloc[-1])
         ema21_m5 = float(Indicators.ema(m5["close"], cfg.ema_entry_slow).iloc[-1])
         price = float(m5["close"].iloc[-1])
@@ -634,7 +610,6 @@ class RiskManagementEngine:
             logging.warning(f"🛑 DAILY DD LOCK: -{dd_pct:.2f}% (start ${start:.2f} → ${balance:.2f})")
             return True, f"daily_dd_{dd_pct:.2f}%"
 
-        # Daily signal cap
         sig_count = int(state.get("daily_signal_count", 0))
         if sig_count >= self.cfg.max_daily_signals:
             return True, f"daily_signals_{sig_count}/{self.cfg.max_daily_signals}"
@@ -656,18 +631,15 @@ class RiskManagementEngine:
 
         risk_usd = balance * (self.cfg.risk_pct_per_trade / 100.0)
         lot_raw = risk_usd / (sl_dist * self.cfg.contract_size)
-        # FLOOR, never round up — cap risk at declared %
         lot = math.floor(lot_raw * 100) / 100.0
         lot = max(self.cfg.min_lot, min(self.cfg.max_lot, lot))
 
-        # Leverage cap
         notional = lot * self.cfg.contract_size * entry
         if notional > self.cfg.hard_leverage_cap * balance:
             cap = self.cfg.hard_leverage_cap * balance / (self.cfg.contract_size * entry)
             lot = math.floor(cap * 100) / 100.0
             lot = max(self.cfg.min_lot, lot)
 
-        # Min-lot safety
         min_risk = self.cfg.min_lot * self.cfg.contract_size * sl_dist
         if min_risk > balance * (self.cfg.max_min_lot_risk_pct / 100.0):
             logging.warning(f"min-lot risk ${min_risk:.2f} > {self.cfg.max_min_lot_risk_pct}% of ${balance:.2f}")
@@ -921,7 +893,7 @@ class TradingBotOrchestrator:
         self.tracker = OutcomeTracker(cfg, self.store, self.risk)
 
     def _is_weekend_or_closed(self, now: datetime) -> Tuple[bool, str]:
-        wd = now.weekday()  # Mon=0 ... Sun=6
+        wd = now.weekday()
         h = now.hour
         if wd == 5:
             return True, "Saturday"
@@ -993,7 +965,6 @@ class TradingBotOrchestrator:
             logging.error(f"Data fetch: {redact(str(e))}")
             return
 
-        # Update pending trades
         try:
             closed = self.tracker.update(dfs["M5"])
             for ev in closed:
@@ -1120,7 +1091,7 @@ def cmd_validate(cfg: Config) -> None:
 
     for i in range(lookback, n - forward, step):
         cur_ts = m5.iloc[i]["datetime"]
-        m5w = m5.iloc[:i + 1]           # includes bar i, will be dropped inside
+        m5w = m5.iloc[:i + 1]
         m15w = m15[m15["datetime"] <= cur_ts]
         h1w = h1[h1["datetime"] <= cur_ts]
         if len(m15w) < cfg.min_bars_m15 + 1 or len(h1w) < cfg.min_bars_h1 + 1:
