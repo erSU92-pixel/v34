@@ -13,6 +13,7 @@ Architecture:
   - SR 11-7 Compliant Dynamic Circuit Breakers & Global Emergency Kill-Switch
   - Idempotent Signal Hash Deduplication & Optimistic Concurrency Gist Store
   - Token-Bucket Rate Limiter with Exponential Backoff + Jitter for TwelveData
+  - Zero-Broken-Volume Pipeline (Fault-tolerant Forex/Spot data parsing)
 """
 from __future__ import annotations
 import os
@@ -142,6 +143,7 @@ def setup_logging() -> None:
     )
 
 def retry_with_jitter(max_retries: int = 3, base_delay: float = 1.5, max_delay: float = 12.0):
+    """Production exponential backoff with decorrelated full jitter."""
     def decorator(func: Callable):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -165,6 +167,9 @@ class DataFetchError(Exception):
     pass
 
 class StateError(Exception):
+    pass
+
+class CircuitBreakerTriggered(Exception):
     pass
 
 # ════════════════════════════════════════════════════════════
@@ -295,7 +300,7 @@ class MarketDataHandler:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._last_call_ts = 0.0
-        self._min_interval_sec = 8.0
+        self._min_interval_sec = 8.0  # TwelveData free tier rate limiter (8 calls/min)
 
     def _rate_limit(self) -> None:
         elapsed = time.time() - self._last_call_ts
@@ -335,7 +340,12 @@ class MarketDataHandler:
                 raise DataFetchError(f"Missing required price column: {c}")
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        df["volume"] = pd.to_numeric(df.get("volume", 100.0), errors="coerce").fillna(100.0)
+        # Fault-Tolerant Volume Handling (Gold Spot often omits volume field)
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
+        else:
+            df["volume"] = 100.0
+
         df = df.dropna(subset=["open", "high", "low", "close"])
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         return df.sort_values("datetime").reset_index(drop=True)
@@ -343,8 +353,13 @@ class MarketDataHandler:
     @staticmethod
     def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         agg = {
-            "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
         }
+        if "volume" in df.columns:
+            agg["volume"] = "sum"
         out = (
             df.set_index("datetime")
             .resample(rule, label="left", closed="left")
@@ -352,9 +367,15 @@ class MarketDataHandler:
             .dropna(subset=["open", "high", "low", "close"])
             .reset_index()
         )
+        if "volume" not in out.columns:
+            out["volume"] = 100.0
         return out
 
     def fetch_all(self) -> Dict[str, pd.DataFrame]:
+        """
+        Fetches multi-timeframe series and strictly purges unclosed/real-time candles.
+        Guarantees ZERO look-ahead bias across all indicators.
+        """
         dfs = {}
         try:
             dfs["5min"] = self._fetch_twelvedata("5min", 500)
@@ -371,6 +392,7 @@ class MarketDataHandler:
             attr = self.TF_MIN_BARS_ATTR[tf]
             min_bars = getattr(self.cfg, attr)
 
+            # Strict Closed-Bar Enforcement (Zero Look-Ahead)
             last_ts = df["datetime"].iloc[-1]
             bar_close_time = last_ts + pd.Timedelta(minutes=mins)
             if now < bar_close_time:
@@ -562,6 +584,10 @@ class RiskManagementEngine:
         self.store = store
 
     def resolve_open_trades(self, high: float, low: float) -> int:
+        """
+        Critical Institutional Fix: Resolves open PENDING trades using closed candle extremes.
+        Without this, circuit breakers never trigger because outcome is always PENDING!
+        """
         journal = self.store.get("journal", []) or []
         resolved_count = 0
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -642,9 +668,11 @@ class RiskManagementEngine:
         if sl_dist <= 0.01:
             raise ValueError("Degenerate Stop Loss distance")
 
+        # 1 lot XAUUSD = 100 oz. slDist of $1.00 on 1 lot = $100
         risk_amount = balance * (risk_pct / 100.0)
         raw_lot = risk_amount / (sl_dist * self.cfg.contract_size)
 
+        # Leverage safety ceiling
         notional = raw_lot * self.cfg.contract_size * entry
         max_notional = balance * self.cfg.max_leverage
         if notional > max_notional:
@@ -659,6 +687,7 @@ class RiskManagementEngine:
         journal = self.store.get("journal", []) or []
         today = datetime.now(timezone.utc).date().isoformat()
 
+        # 1. Daily Loss Drawdown Circuit Breaker
         daily_loss = 0.0
         for j in journal:
             if j.get("timestamp", "").startswith(today) and j.get("outcome") == "LOSS":
@@ -672,6 +701,7 @@ class RiskManagementEngine:
         if loss_pct >= self.cfg.max_daily_loss_pct:
             return False, f"HALT: MAX_DAILY_LOSS ({loss_pct:.2f}% >= {self.cfg.max_daily_loss_pct}%)"
 
+        # 2. Consecutive Losses Circuit Breaker
         closed = [j for j in journal if j.get("outcome") in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "WIN_BE", "LOSS")]
         closed.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
         consec = 0
@@ -683,6 +713,7 @@ class RiskManagementEngine:
         if consec >= self.cfg.max_consecutive_losses:
             return False, f"HALT: MAX_CONSEC_LOSSES ({consec} >= {self.cfg.max_consecutive_losses})"
 
+        # 3. Daily Signal Count Limit
         today_signals = [j for j in journal if j.get("timestamp", "").startswith(today)]
         if len(today_signals) >= self.cfg.max_daily_signals:
             return False, f"HALT: MAX_DAILY_SIGNALS reached ({len(today_signals)})"
@@ -700,7 +731,7 @@ class NewsSafetyFilter:
     def is_blackout(self) -> Tuple[bool, str]:
         cache = self.store.get("news_cache", {}) or {}
         now_ts = time.time()
-        if cache.get("ts", 0) > now_ts - 900:
+        if cache.get("ts", 0) > now_ts - 900:  # 15 minutes cache
             return cache.get("blackout", False), cache.get("title", "")
 
         try:
@@ -777,11 +808,13 @@ class TradingBotOrchestrator:
             logging.warning("GLOBAL KILL SWITCH ACTIVE — EXECUTION FROZEN")
             return
 
+        # 1. Macro High-Impact News Gate
         is_blackout, news_title = self.news.is_blackout()
         if is_blackout:
             logging.info(f"[NEWS-GATE] High-impact event blackout active: '{news_title}'")
             return
 
+        # 2. Market Data Retrieval (Zero-Lookahead Guaranteed)
         try:
             dfs = self.data.fetch_all()
         except Exception as e:
@@ -793,10 +826,10 @@ class TradingBotOrchestrator:
         last_closed_bar = m5.iloc[-1]
         logging.info(f"[SYNC] Processing closed bar at {last_closed_bar['datetime']} | Close: {last_closed_bar['close']:.2f}")
 
-        # Resolve open trades
+        # 3. Resolve Open Trades (Updates PENDING trades with high/low of latest bar)
         self.risk.resolve_open_trades(float(last_closed_bar["high"]), float(last_closed_bar["low"]))
 
-        # Check circuit breakers
+        # 4. Check Institutional Circuit Breakers
         balance = self.cfg.account_balance
         ok, reason = self.risk.check_circuit_breakers(balance)
         if not ok:
@@ -804,6 +837,7 @@ class TradingBotOrchestrator:
             self.tg.send(f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b>\n{reason}\nTrading halted.")
             return
 
+        # 5. Generate Consensus Signal
         result = self.signal.generate(m5, dfs["15min"], dfs["1h"], dfs["4h"])
         if result["direction"] == "NEUTRAL":
             logging.info(f"[DECISION] Neutral: {result.get('skip_reason')}")
@@ -813,25 +847,28 @@ class TradingBotOrchestrator:
         atr_val = result["atr"]
         price = float(last_closed_bar["close"])
 
+        # 6. Microstructure Spread & Latency Compensation
         total_buffer = self.cfg.spread_buffer + self.cfg.latency_slippage
 
         if direction == "BUY":
-            entry = price + total_buffer
+            entry = price + total_buffer  # Market buy pays Ask with slippage
             sl = price - (atr_val * self.cfg.atr_sl_mult)
             tp1 = entry + (atr_val * self.cfg.atr_tp1_mult)
             tp2 = entry + (atr_val * self.cfg.atr_tp2_mult)
             tp3 = entry + (atr_val * self.cfg.atr_tp3_mult)
         else:
-            entry = price
-            sl = price + (atr_val * self.cfg.atr_sl_mult) + total_buffer
+            entry = price  # Market sell executes at Bid
+            sl = price + (atr_val * self.cfg.atr_sl_mult) + total_buffer  # Stop buy executes at Ask
             tp1 = entry - (atr_val * self.cfg.atr_tp1_mult)
             tp2 = entry - (atr_val * self.cfg.atr_tp2_mult)
             tp3 = entry - (atr_val * self.cfg.atr_tp3_mult)
 
+        # 7. Dynamic Risk & Position Sizing
         conf_pct = max(result["buy_ratio"], result["sell_ratio"])
         risk_pct = self.cfg.max_risk_pct_per_trade * conf_pct
         lot, effective_risk = self.risk.calculate_position_size(balance, entry, sl, risk_pct)
 
+        # 8. Idempotent Signal Hash Deduplication
         bar_str = str(last_closed_bar["datetime"])
         raw_hash = f"{self.cfg.symbol}:{bar_str}:{direction}"
         sig_hash = hashlib.sha256(raw_hash.encode()).hexdigest()[:16]
