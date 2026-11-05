@@ -1,11 +1,11 @@
-name: APEX PREDATOR v19.0
+name: APEX PREDATOR v20.0 — Institutional Quant Engine
 on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       stage:
-        description: 'Pilih tahap testing'
+        description: 'Execution Stage'
         required: true
         default: 'full_validation'
         type: choice
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: apex-predator-v19
+  group: apex-predator-v20
   cancel-in-progress: false
 
 jobs:
@@ -41,6 +41,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: 📚 Install dependencies
         run: |
@@ -59,7 +60,7 @@ jobs:
           print("requests ", requests.__version__)
           PY
 
-      - name: "1️⃣  Selftest — validasi config"
+      - name: "1️⃣  Selftest — Config & Mathematical Invariant Validation"
         if: |
           github.event.inputs.stage == 'full_validation' ||
           github.event.inputs.stage == 'live_promote' ||
@@ -71,7 +72,7 @@ jobs:
           python apex_v19_production.py selftest
           echo "::endgroup::"
 
-      - name: "2️⃣  Test Telegram"
+      - name: "2️⃣  Test Telegram — Handshake"
         if: github.event.inputs.stage == 'full_validation'
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
@@ -82,7 +83,7 @@ jobs:
           python apex_v19_production.py test-tg
           echo "::endgroup::"
 
-      - name: "3️⃣  Smoke — fetch data + parliament vote"
+      - name: "3️⃣  Smoke — Zero-Lookahead Data Fetch & Voting"
         if: |
           github.event.inputs.stage == 'full_validation' ||
           github.event.inputs.stage == 'smoke_only'
@@ -94,7 +95,7 @@ jobs:
           python apex_v19_production.py smoke
           echo "::endgroup::"
 
-      - name: "4️⃣  Run DRY — full pipeline tanpa kirim sinyal"
+      - name: "4️⃣  Run DRY — Full Pipeline & Circuit Breaker Check"
         if: github.event.inputs.stage == 'full_validation'
         env:
           GIST_ID:              ${{ secrets.GIST_ID }}
@@ -116,7 +117,7 @@ jobs:
           python apex_v19_production.py run
           echo "::endgroup::"
 
-      - name: "5️⃣  Run LIVE — kirim sinyal nyata"
+      - name: "5️⃣  Run LIVE — Institutional Signal Dispatch"
         if: github.event.inputs.stage == 'live_promote'
         env:
           GIST_ID:              ${{ secrets.GIST_ID }}
@@ -151,13 +152,15 @@ jobs:
         if: always()
         run: |
           {
-            echo "### APEX v19.0 — Manual Test"
+            echo "### 🏛️ APEX v20.0 — Execution Summary"
             echo ""
-            echo "| Field | Value |"
+            echo "| Parameter | Value |"
             echo "|---|---|"
             echo "| Stage | \`${{ github.event.inputs.stage }}\` |"
             echo "| Status | ${{ job.status }} |"
-            echo "| Time | $(date -u +'%Y-%m-%d %H:%M:%S UTC') |"
+            echo "| Engine Version | \`v20.0-institutional\` |"
+            echo "| Zero-Lookahead | \`Enforced\` |"
+            echo "| Timestamp | $(date -u +'%Y-%m-%d %H:%M:%S UTC') |"
           } >> $GITHUB_STEP_SUMMARY
 
   apex-schedule:
@@ -170,6 +173,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: 📚 Install dependencies
         run: |
@@ -182,7 +186,7 @@ jobs:
       - name: 🧪 Selftest
         run: python apex_v19_production.py selftest
 
-      - name: 🚀 Scheduled run
+      - name: 🚀 Scheduled Execution
         env:
           GIST_ID:              ${{ secrets.GIST_ID }}
           GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
@@ -219,6 +223,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: 📚 Install dependencies
         run: |
