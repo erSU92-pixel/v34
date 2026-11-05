@@ -1,19 +1,21 @@
-name: APEX PREDATOR v20.0 — Institutional Quant Engine
+name: APEX PREDATOR v20.0 — Unified Quant Engine
 on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
-      stage:
-        description: 'Execution Stage'
+      mode:
+        description: 'Mode Eksekusi APEX'
         required: true
-        default: 'full_validation'
+        default: 'auto'
         type: choice
         options:
-          - full_validation
-          - live_promote
-          - smoke_only
-          - selftest_only
+          - auto         # Otomatis: LIVE jika APEX_LIVE_ENABLED == true, selain itu DRY-RUN
+          - live         # Paksa kirim sinyal real LIVE ke Telegram
+          - dry_run      # Simulasi full pipeline tanpa sinyal live
+          - smoke_test   # Uji fetch data TwelveData & Parliament Voting
+          - test_tg      # Uji koneksi & kirim pesan bot Telegram
+          - selftest     # Uji parameter matematika & konfigurasi saja
   push:
     branches: [main, master]
     paths:
@@ -24,17 +26,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: apex-predator-v20
+  group: apex-engine-single
   cancel-in-progress: false
 
 jobs:
-  apex-manual:
-    name: APEX Manual — ${{ github.event.inputs.stage }}
+  apex-engine:
+    name: 🏛️ APEX — ${{ github.event_name == 'schedule' && 'Scheduled 15m' || github.event_name == 'push' && 'Push CI' || github.event.inputs.mode }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 10
     steps:
-      - name: 📥 Checkout
+      - name: 📥 Checkout Code
         uses: actions/checkout@v4
 
       - name: 🐍 Setup Python 3.11
@@ -43,7 +44,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 📚 Install dependencies
+      - name: 📚 Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir \
@@ -51,95 +52,54 @@ jobs:
             "pandas>=2.0,<3" \
             "requests>=2.31"
 
-      - name: 🔎 Verify imports
-        run: |
-          python - <<'PY'
-          import numpy, pandas, requests
-          print("numpy    ", numpy.__version__)
-          print("pandas   ", pandas.__version__)
-          print("requests ", requests.__version__)
-          PY
+      - name: 🧪 Invariant Selftest
+        run: python apex_v19_production.py selftest
 
-      - name: "1️⃣  Selftest — Config & Mathematical Invariant Validation"
-        if: |
-          github.event.inputs.stage == 'full_validation' ||
-          github.event.inputs.stage == 'live_promote' ||
-          github.event.inputs.stage == 'selftest_only'
+      - name: 🔎 Test Telegram Connection
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test_tg'
         env:
-          APEX_DRY_RUN: 'true'
-        run: |
-          echo "::group::selftest"
-          python apex_v19_production.py selftest
-          echo "::endgroup::"
-
-      - name: "2️⃣  Test Telegram — Handshake"
-        if: github.event.inputs.stage == 'full_validation'
-        env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          APEX_DRY_RUN:     'false'
-        run: |
-          echo "::group::test-tg"
-          python apex_v19_production.py test-tg
-          echo "::endgroup::"
+          APEX_DRY_RUN: 'false'
+        run: python apex_v19_production.py test-tg
 
-      - name: "3️⃣  Smoke — Zero-Lookahead Data Fetch & Voting"
+      - name: 💨 Smoke Test — Fetch Data & Consensus
         if: |
-          github.event.inputs.stage == 'full_validation' ||
-          github.event.inputs.stage == 'smoke_only'
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'smoke_test')
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          APEX_DRY_RUN:        'true'
-        run: |
-          echo "::group::smoke"
-          python apex_v19_production.py smoke
-          echo "::endgroup::"
+          APEX_DRY_RUN: 'true'
+        run: python apex_v19_production.py smoke
 
-      - name: "4️⃣  Run DRY — Full Pipeline & Circuit Breaker Check"
-        if: github.event.inputs.stage == 'full_validation'
+      - name: 🚀 Core Execution Pipeline
+        if: |
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && contains(fromJSON('["auto", "live", "dry_run"]'), github.event.inputs.mode))
         env:
-          GIST_ID:              ${{ secrets.GIST_ID }}
-          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
-          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
-          APEX_DRY_RUN:                     'true'
-          APEX_SYMBOL:                      'XAUUSD'
-          APEX_ACCOUNT_BALANCE:             '1000'
-          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
-          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
-          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
-          APEX_MAX_DAILY_SIGNALS:           '5'
-          APEX_NEWS_BLACKOUT_MIN:           '30'
-          APEX_KILL_SWITCH:                 'false'
-        run: |
-          echo "::group::run (dry)"
-          python apex_v19_production.py run
-          echo "::endgroup::"
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN: >-
+            ${{
+              (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'live') && 'false' ||
+              (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') && 'true' ||
+              (vars.APEX_LIVE_ENABLED == 'true') && 'false' ||
+              'true'
+            }}
+          APEX_SYMBOL: 'XAUUSD'
+          APEX_ACCOUNT_BALANCE: '1000'
+          APEX_MAX_RISK_PCT_PER_TRADE: '1.0'
+          APEX_MAX_DAILY_LOSS_PCT: '3.0'
+          APEX_MAX_CONSECUTIVE_LOSSES: '3'
+          APEX_MAX_DAILY_SIGNALS: '5'
+          APEX_NEWS_BLACKOUT_MIN: '30'
+          APEX_KILL_SWITCH: 'false'
+        run: python apex_v19_production.py run
 
-      - name: "5️⃣  Run LIVE — Institutional Signal Dispatch"
-        if: github.event.inputs.stage == 'live_promote'
-        env:
-          GIST_ID:              ${{ secrets.GIST_ID }}
-          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
-          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
-          APEX_DRY_RUN:                     'false'
-          APEX_SYMBOL:                      'XAUUSD'
-          APEX_ACCOUNT_BALANCE:             '1000'
-          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
-          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
-          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
-          APEX_MAX_DAILY_SIGNALS:           '5'
-          APEX_NEWS_BLACKOUT_MIN:           '30'
-          APEX_KILL_SWITCH:                 'false'
-        run: |
-          echo "::group::run (live)"
-          python apex_v19_production.py run
-          echo "::endgroup::"
-
-      - name: 📋 Upload state artifact
+      - name: 📋 Upload State Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -148,7 +108,7 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: 🧾 Summary
+      - name: 🧾 Step Summary
         if: always()
         run: |
           {
@@ -156,88 +116,9 @@ jobs:
             echo ""
             echo "| Parameter | Value |"
             echo "|---|---|"
-            echo "| Stage | \`${{ github.event.inputs.stage }}\` |"
-            echo "| Status | ${{ job.status }} |"
-            echo "| Engine Version | \`v20.0-institutional\` |"
-            echo "| Zero-Lookahead | \`Enforced\` |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Mode / Input | \`${{ github.event.inputs.mode || 'Automatic' }}\` |"
+            echo "| Job Status | ${{ job.status }} |"
+            echo "| Engine Version | \`v20.0-institutional-unified\` |"
             echo "| Timestamp | $(date -u +'%Y-%m-%d %H:%M:%S UTC') |"
           } >> $GITHUB_STEP_SUMMARY
-
-  apex-schedule:
-    name: APEX Scheduled Run
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    if: github.event_name == 'schedule'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: 📚 Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir \
-            "numpy>=1.24,<3" \
-            "pandas>=2.0,<3" \
-            "requests>=2.31"
-
-      - name: 🧪 Selftest
-        run: python apex_v19_production.py selftest
-
-      - name: 🚀 Scheduled Execution
-        env:
-          GIST_ID:              ${{ secrets.GIST_ID }}
-          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
-          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
-          APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
-          APEX_SYMBOL:                      'XAUUSD'
-          APEX_ACCOUNT_BALANCE:             '1000'
-          APEX_MAX_RISK_PCT_PER_TRADE:      '1.0'
-          APEX_MAX_DAILY_LOSS_PCT:          '3.0'
-          APEX_MAX_CONSECUTIVE_LOSSES:      '3'
-          APEX_MAX_DAILY_SIGNALS:           '5'
-          APEX_NEWS_BLACKOUT_MIN:           '30'
-          APEX_KILL_SWITCH:                 'false'
-        run: python apex_v19_production.py run
-
-      - name: 📋 Upload state artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: apex-sched-${{ github.run_number }}
-          path: apex_state_v19.json
-          retention-days: 3
-          if-no-files-found: ignore
-
-  validate-on-push:
-    name: Validate on Push
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: 📚 Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir \
-            "numpy>=1.24,<3" \
-            "pandas>=2.0,<3" \
-            "requests>=2.31"
-
-      - name: 🧪 Selftest
-        run: python apex_v19_production.py selftest
-
-      - name: 💨 Smoke
-        env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          APEX_DRY_RUN:        'true'
-        run: python apex_v19_production.py smoke
