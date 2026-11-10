@@ -1,6 +1,6 @@
 """
-supabase_client.py — DEBUG MODE (Mencetak URL ke Log)
-=====================================================
+supabase_client.py — FINAL (SDK Resmi Supabase)
+===============================================
 """
 from __future__ import annotations
 
@@ -43,10 +43,6 @@ class SupabaseClient:
         self.table = os.getenv("SUPABASE_TABLE", "signals")
         self.enabled = bool(self.url and self.key and Client)
         self.client = None
-        
-        # --- TAMBAHAN DEBUG ---
-        print(f"DEBUG URL YANG DIBACA BOT: {self.url}")
-        print(f"DEBUG KEY YANG DIBACA BOT: {self.key[:15]}...")
         
         if self.enabled:
             try:
