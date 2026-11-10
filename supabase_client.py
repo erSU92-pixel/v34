@@ -1,9 +1,8 @@
 """
-supabase_client.py — REST insert via requests (FIXED 405 ERROR)
-==============================================================
-- Menghapus header 'Authorization: Bearer' (tidak kompatibel dengan key sb_secret_)
-- Hanya menggunakan header 'apikey'
-- Menambahkan timeout dan error handling yang lebih baik
+supabase_client.py — FINAL FIX (405 Method Not Allowed)
+======================================================
+- Hanya mengirim header 'apikey' dan 'Content-Type'
+- Tidak mengirim 'Authorization' atau 'Prefer' yang dapat memicu 405
 """
 from __future__ import annotations
 
@@ -36,12 +35,10 @@ class SupabaseClient:
         self.enabled = bool(self.url and self.key)
         self._session = requests.Session()
         
-        # FIX 405: Hanya kirim 'apikey'. JANGAN kirim 'Authorization: Bearer'
-        # karena key sb_secret_ bukan format JWT.
+        # HANYA header ini yang dikirim. Jangan tambahkan yang lain.
         self._session.headers.update({
             "apikey": self.key,
             "Content-Type": "application/json",
-            "Prefer": "return=minimal",
         })
 
     def insert(self, row: Dict[str, Any]) -> bool:
@@ -63,7 +60,6 @@ class SupabaseClient:
             return False
 
     def fetch_recent_r(self, limit: int = 50) -> Optional[list]:
-        """Fetch last N closed trades for Kelly stats. Returns list of R floats."""
         if not self.enabled:
             return None
         try:
