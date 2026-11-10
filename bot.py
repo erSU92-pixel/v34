@@ -1,14 +1,10 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v7.0.4 FINAL
-============================================================
-FIX LOG:
-  - FIX-1: TwelveData volume scalar
-  - FIX-2: Weekend/holiday gap false positive
-  - FIX-3: check_news_guard wrapper
-  - FIX-4: params.json missing → blend returns 0 → SL/TP broken
-  - FIX-5: HTML entity injection in notes → Telegram 400 Bad Request
-  - FIX-6: Suppress WAIT notifications (NOTIFY_WAIT env, default OFF)
-           WAIT still logged + stored (SQLite/Supabase), only Telegram skipped
+XAUUSD Quantitative Institutional Signal Bot — v7.1.0 SELF-CONTAINED
+====================================================================
+LANGSUNG ON tanpa setup optimizer/params.json.
+  - Built-in per-regime tuned defaults (TRENDING/WEAK_TREND/RANGING)
+  - Cukup 3 secrets: TWELVE_DATA_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  - params.json OPSIONAL (untuk override via optimizer)
 """
 from __future__ import annotations
 
@@ -46,16 +42,35 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "7.0.4"
+VERSION = "7.1.0"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
-DEFAULT_PARAMS_FALLBACK: Dict[str, float] = {
-    "threshold": 70.0,
-    "sl_mult": 1.5,
-    "tp1_mult": 1.5,
-    "tp2_mult": 2.5,
-    "max_hold": 48.0,
+# ============================================================================
+# BUILT-IN PER-REGIME PARAMS (ter-tune dari karakter XAUUSD)
+# ============================================================================
+DEFAULT_PER_REGIME_PARAMS: Dict[str, Dict[str, float]] = {
+    "TRENDING": {
+        "threshold": 65.0,
+        "sl_mult":   1.5,
+        "tp1_mult":  2.0,
+        "tp2_mult":  3.0,
+        "max_hold":  72.0,
+    },
+    "WEAK_TREND": {
+        "threshold": 70.0,
+        "sl_mult":   1.5,
+        "tp1_mult":  1.5,
+        "tp2_mult":  2.5,
+        "max_hold":  48.0,
+    },
+    "RANGING": {
+        "threshold": 78.0,
+        "sl_mult":   1.0,
+        "tp1_mult":  1.0,
+        "tp2_mult":  2.0,
+        "max_hold":  24.0,
+    },
 }
 
 
@@ -75,7 +90,7 @@ class BotConfig:
     spot_cache_min: int = 2
     macro_cache_min: int = 30
     news_enabled: bool = True
-    notify_wait: bool = False          # FIX-6: default OFF (anti-spam)
+    notify_wait: bool = False
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -102,10 +117,6 @@ class BotConfig:
             w.append("TWELVE_DATA_API_KEY missing → Yahoo fallback")
         if not self.telegram_bot_token or not self.telegram_chat_id:
             w.append("Telegram creds missing → stdout only")
-        if not SUPABASE.enabled:
-            w.append("Supabase disabled → SQLite only")
-        if not self.notify_wait:
-            w.append("NOTIFY_WAIT=0 → WAIT suppressed in Telegram (log only)")
         return w
 
 
@@ -503,7 +514,7 @@ class EnsembleResult:
     atr_value: float
     atr_multiplier: float
     blended_params: Dict[str, float]
-    using_fallback: bool = False
+    params_source: str = "builtin"
     voters_debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -563,22 +574,31 @@ def run_21_voters(df):
     return max(bull, bear) / 21.0, bull, bear, dbg
 
 
-def _load_params():
+def _load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
+    """Always returns per-regime dict. Source: 'file' or 'builtin'."""
     path = os.getenv("PARAMS_FILE", "params.json")
     if not os.path.exists(path):
-        return {}, 1
+        return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
     try:
         with open(path) as f:
             j = json.load(f)
         schema = int(j.get("schema", 1))
         if schema >= 2:
-            return j.get("per_regime", {}), schema
-        return {"_flat": j.get("best_params", {})}, schema
+            per = j.get("per_regime", {})
+            # Fill missing regimes with built-in defaults
+            merged = {}
+            for r in REGIMES:
+                merged[r] = {**DEFAULT_PER_REGIME_PARAMS[r], **per.get(r, {})}
+            return merged, "file"
+        # schema 1 (flat) → apply flat overrides to all regimes
+        flat = j.get("best_params", {})
+        merged = {r: {**DEFAULT_PER_REGIME_PARAMS[r], **flat} for r in REGIMES}
+        return merged, "file"
     except Exception:
-        return {}, 1
+        return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
 
 
-_PARAMS, _PARAMS_SCHEMA = _load_params()
+_PARAMS, _PARAMS_SOURCE = _load_params()
 
 
 def build_ensemble(md, cfg):
@@ -590,23 +610,10 @@ def build_ensemble(md, cfg):
 
     weights = membership(adx_val)
     dom = dominant(weights)
-    if _PARAMS_SCHEMA >= 2:
-        regime_params = _PARAMS
-    else:
-        flat = _PARAMS.get("_flat", {})
-        regime_params = {r: flat for r in REGIMES}
-    blended = blend_params(weights, regime_params)
+    blended = blend_params(weights, _PARAMS)
 
-    using_fallback = False
-    if blended.get("threshold", 0.0) <= 0.0:
-        using_fallback = True
-        log_event(logging.WARNING, "params_fallback",
-                  note="params.json missing/empty → DEFAULT_PARAMS_FALLBACK",
-                  schema=_PARAMS_SCHEMA)
-        blended = dict(DEFAULT_PARAMS_FALLBACK)
-
-    threshold = blended.get("threshold", DEFAULT_PARAMS_FALLBACK["threshold"])
-    atr_mult = blended.get("sl_mult", DEFAULT_PARAMS_FALLBACK["sl_mult"])
+    threshold = blended.get("threshold", 70.0)
+    atr_mult = blended.get("sl_mult", 1.5)
 
     poc = volume_profile_poc(df)
     session, allowed, _, _ = get_session_profile(cfg)
@@ -673,7 +680,7 @@ def build_ensemble(md, cfg):
         regime=dom, regime_weights=weights, poc_level=round(poc, 2),
         notes=notes, atr_value=round(atr_val, 4), atr_multiplier=round(atr_mult, 4),
         blended_params={k: round(v, 4) for k, v in blended.items()},
-        using_fallback=using_fallback,
+        params_source=_PARAMS_SOURCE,
         voters_debug=dbg,
     )
 
@@ -807,7 +814,6 @@ def _tg_post(cfg, payload):
 
 
 def send_signal(cfg, e, spot, levels):
-    # FIX-6: suppress WAIT unless NOTIFY_WAIT=1
     if e.action == "WAIT" and not cfg.notify_wait:
         log_event(event="telegram_suppressed", action="WAIT",
                   score=e.total_score,
@@ -827,15 +833,11 @@ def send_signal(cfg, e, spot, levels):
     safe_reason = html.escape(e.notes[0]) if e.notes else ""
     safe_kelly = html.escape(levels["kelly_reason"]) if levels else ""
 
-    fallback_warn = ""
-    if e.using_fallback and e.action in ("BUY", "SELL"):
-        fallback_warn = "\n⚠️ <b>DEFAULT PARAMS</b> (params.json missing → run optimizer)"
-
     if e.action == "WAIT" or not levels:
         text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
                 f"⏰ <code>{now}</code>\n"
                 f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                f"Reason: {safe_reason}{fallback_warn}")
+                f"Reason: {safe_reason}")
     else:
         em = "🟢" if e.action == "BUY" else "🔴"
         text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
@@ -850,7 +852,7 @@ def send_signal(cfg, e, spot, levels):
                 f"BE @  : ${levels['break_even_trigger']:.2f}</code>\n"
                 f"Lot: <b>{levels['lot_size']}</b> | "
                 f"Risk: ${levels['actual_risk_usd']:.0f} ({levels['risk_pct']:.2f}%)\n"
-                f"<i>Kelly: {safe_kelly}</i>{fallback_warn}")
+                f"<i>Kelly: {safe_kelly}</i>")
     return _tg_post(cfg, {
         "chat_id": cfg.telegram_chat_id, "text": text,
         "parse_mode": "HTML", "reply_markup": kb,
@@ -873,7 +875,8 @@ def send_failure(cfg, err):
 # ============================================================================
 def main() -> int:
     cfg = BotConfig.from_env()
-    log_event(event="bot_start", version=VERSION, params_schema=_PARAMS_SCHEMA,
+    log_event(event="bot_start", version=VERSION, params_source=_PARAMS_SOURCE,
+              params_loaded=_PARAMS,
               supabase_enabled=SUPABASE.enabled, notify_wait=cfg.notify_wait,
               warnings=cfg.warnings())
 
@@ -935,12 +938,12 @@ def main() -> int:
                   spot=round(tradable, 2), basis=round(basis, 2),
                   source=md.source, m15_synthetic=md.m15_synthetic,
                   regime=e.regime, regime_weights=e.regime_weights,
-                  using_fallback=e.using_fallback,
+                  params_source=e.params_source,
                   kelly_pct=kelly_pct, kelly_reason=kelly_reason,
                   supabase_ok=sb_ok, voters=e.voters_debug, tg=sent)
         print(f"ACTION: {e.action} | Score: {e.total_score}% | Regime: {e.regime} | "
               f"Kelly: {kelly_pct:.2f}% | Spot: {tradable:.2f} | TG: {sent} | SB: {sb_ok}"
-              f" | fallback={e.using_fallback}")
+              f" | params={e.params_source}")
         return 0
     except Exception as ex:
         err = f"{type(ex).__name__}: {ex}"
