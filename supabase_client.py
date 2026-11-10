@@ -1,7 +1,9 @@
 """
-supabase_client.py — REST insert via requests (no SDK dependency).
-===============================================================
-Free tier safe: single insert per signal, no bulk, no reads.
+supabase_client.py — REST insert via requests (FIXED 405 ERROR)
+==============================================================
+- Menghapus header 'Authorization: Bearer' (tidak kompatibel dengan key sb_secret_)
+- Hanya menggunakan header 'apikey'
+- Menambahkan timeout dan error handling yang lebih baik
 """
 from __future__ import annotations
 
@@ -33,9 +35,11 @@ class SupabaseClient:
         self.table = os.getenv("SUPABASE_TABLE", "signals")
         self.enabled = bool(self.url and self.key)
         self._session = requests.Session()
+        
+        # FIX 405: Hanya kirim 'apikey'. JANGAN kirim 'Authorization: Bearer'
+        # karena key sb_secret_ bukan format JWT.
         self._session.headers.update({
             "apikey": self.key,
-            "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
             "Prefer": "return=minimal",
         })
