@@ -1,8 +1,6 @@
 """
-supabase_client.py — FINAL PERFECT (SDK Resmi + Auto-Clean URL)
-===============================================================
-- Menggunakan SDK resmi Supabase (anti 405).
-- Auto-clean URL (menghapus spasi, garis miring di ujung, dll).
+supabase_client.py — ULTIMATE FIX (Auto-Parse URL + Debug)
+==========================================================
 """
 from __future__ import annotations
 
@@ -32,25 +30,27 @@ def _log(level: int, msg: str, **kw) -> None:
 
 class SupabaseClient:
     def __init__(self) -> None:
-        # 1. Ambil URL dan Key dari Environment
         raw_url = (os.getenv("SUPABASE_URL") or "").strip()
-        raw_key = (os.getenv("SUPABASE_KEY") or "").strip()
         
-        # 2. Auto-Clean URL (Bersihkan spasi, slash di ujung, atau sisa '/rest/v1')
+        # Auto-Clean URL
         clean_url = raw_url.rstrip("/")
         if clean_url.endswith("/rest/v1"):
             clean_url = clean_url.replace("/rest/v1", "")
             
+        # Pastikan ada https://
+        if clean_url and not clean_url.startswith("http"):
+            clean_url = f"https://{clean_url}"
+            
         self.url = clean_url
-        self.key = raw_key
+        self.key = (os.getenv("SUPABASE_KEY") or "").strip()
         self.table = os.getenv("SUPABASE_TABLE", "signals")
         self.enabled = bool(self.url and self.key and Client)
         self.client = None
         
-        # 3. Inisialisasi SDK
         if self.enabled:
             try:
                 self.client = create_client(self.url, self.key)
+                # Log URL yang digunakan agar bisa dicek di GitHub Actions
                 _log(logging.INFO, "supabase_ready", url=self.url)
             except Exception as e:
                 _log(logging.ERROR, "supabase_init_fail", err=str(e)[:100])
@@ -60,7 +60,6 @@ class SupabaseClient:
         if not self.enabled or not self.client:
             return False
         try:
-            # Gunakan SDK untuk insert
             self.client.table(self.table).insert(row).execute()
             return True
         except Exception as e:
