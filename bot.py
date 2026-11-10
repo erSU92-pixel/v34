@@ -1,14 +1,14 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v7.0.3 FINAL
+XAUUSD Quantitative Institutional Signal Bot — v7.0.4 FINAL
 ============================================================
 FIX LOG:
   - FIX-1: TwelveData volume scalar
   - FIX-2: Weekend/holiday gap false positive
   - FIX-3: check_news_guard wrapper
   - FIX-4: params.json missing → blend returns 0 → SL/TP broken
-           (fallback to DEFAULT_PARAMS_FALLBACK, warn in Telegram)
   - FIX-5: HTML entity injection in notes → Telegram 400 Bad Request
-           (escape user-facing strings + plain-text retry)
+  - FIX-6: Suppress WAIT notifications (NOTIFY_WAIT env, default OFF)
+           WAIT still logged + stored (SQLite/Supabase), only Telegram skipped
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "7.0.3"
+VERSION = "7.0.4"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -75,6 +75,7 @@ class BotConfig:
     spot_cache_min: int = 2
     macro_cache_min: int = 30
     news_enabled: bool = True
+    notify_wait: bool = False          # FIX-6: default OFF (anti-spam)
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -87,6 +88,7 @@ class BotConfig:
             account_size_usd=float(os.getenv("ACCOUNT_SIZE_USD", "10000")),
             risk_pct=float(os.getenv("RISK_PCT", "1.0")),
             news_enabled=os.getenv("NEWS_ENABLED", "1") == "1",
+            notify_wait=os.getenv("NOTIFY_WAIT", "0") == "1",
             twelve_data_api_key=os.getenv("TWELVE_DATA_API_KEY"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
@@ -102,6 +104,8 @@ class BotConfig:
             w.append("Telegram creds missing → stdout only")
         if not SUPABASE.enabled:
             w.append("Supabase disabled → SQLite only")
+        if not self.notify_wait:
+            w.append("NOTIFY_WAIT=0 → WAIT suppressed in Telegram (log only)")
         return w
 
 
@@ -761,7 +765,6 @@ class AuditDB:
 # 11. TELEGRAM
 # ============================================================================
 def _strip_html(text: str) -> str:
-    """Remove HTML tags for plain-text fallback."""
     return re.sub(r"<[^>]+>", "", text)
 
 
@@ -777,7 +780,6 @@ def _tg_post(cfg, payload):
         if r.status_code == 200:
             return True
 
-        # FIX-5: fallback to plain text on HTML parse error
         if r.status_code == 400 and "parse entities" in r.text:
             log_event(logging.WARNING, "telegram_html_retry", body=r.text[:200])
             plain = {
@@ -805,6 +807,13 @@ def _tg_post(cfg, payload):
 
 
 def send_signal(cfg, e, spot, levels):
+    # FIX-6: suppress WAIT unless NOTIFY_WAIT=1
+    if e.action == "WAIT" and not cfg.notify_wait:
+        log_event(event="telegram_suppressed", action="WAIT",
+                  score=e.total_score,
+                  reason=e.notes[0] if e.notes else "")
+        return False
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     kb = {"inline_keyboard": [[
         {"text": "🔄 Refresh", "callback_data": "refresh"},
@@ -865,7 +874,8 @@ def send_failure(cfg, err):
 def main() -> int:
     cfg = BotConfig.from_env()
     log_event(event="bot_start", version=VERSION, params_schema=_PARAMS_SCHEMA,
-              supabase_enabled=SUPABASE.enabled, warnings=cfg.warnings())
+              supabase_enabled=SUPABASE.enabled, notify_wait=cfg.notify_wait,
+              warnings=cfg.warnings())
 
     if not is_market_open():
         log_event(event="market_closed", skip=True)
