@@ -1,8 +1,10 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v7.0 FINAL
-==========================================================
-Fuzzy regime + Half-Kelly sizing + Supabase telemetry.
-Signal-only. Manual execution.
+XAUUSD Quantitative Institutional Signal Bot — v7.0.1 FIXED
+============================================================
+FIX LOG:
+  - FIX-1: TwelveData volume scalar (df.get → float → .fillna crash)
+  - FIX-2: Weekend/holiday gap false positive di validate_ohlcv
+  - FIX-3: check_news_guard wrapper (sebelumnya NameError)
 """
 from __future__ import annotations
 
@@ -36,10 +38,10 @@ except ImportError:
 # --- Local modules ---
 from fuzzy_regime import blend_params, dominant, membership
 from kelly import kelly_fraction, risk_pct_from_env
-from news_calendar import NewsResult, check_news_guard as _live_news_guard, describe_next_events
+from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "7.0.0"
+VERSION = "7.0.1"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -131,9 +133,12 @@ def log_event(level: int = logging.INFO, event: str = "", **kw: Any) -> None:
 def is_market_open(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     wd, h = now.weekday(), now.hour
-    if wd == 5: return False
-    if wd == 6: return h >= 22
-    if wd == 4: return h < 21
+    if wd == 5:
+        return False
+    if wd == 6:
+        return h >= 22
+    if wd == 4:
+        return h < 21
     return True
 
 
@@ -146,16 +151,18 @@ def sma(s, p): return s.rolling(p, min_periods=p).mean()
 
 def rsi(s, p=14):
     d = s.diff()
-    gain = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
-    loss = -d.clip(upper=0).ewm(alpha=1/p, adjust=False).mean()
-    return 100.0 - 100.0/(1.0 + gain/(loss+1e-10))
+    gain = d.clip(lower=0).ewm(alpha=1 / p, adjust=False).mean()
+    loss = -d.clip(upper=0).ewm(alpha=1 / p, adjust=False).mean()
+    return 100.0 - 100.0 / (1.0 + gain / (loss + 1e-10))
 
 
 def atr(df, p=14):
-    tr = pd.concat([df["high"]-df["low"],
-                    (df["high"]-df["close"].shift(1)).abs(),
-                    (df["low"]-df["close"].shift(1)).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/p, adjust=False).mean()
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / p, adjust=False).mean()
 
 
 def adx(df, p=14):
@@ -163,10 +170,10 @@ def adx(df, p=14):
     plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
     minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
     tr = atr(df, p)
-    p_di = 100*pd.Series(plus_dm, index=df.index).ewm(alpha=1/p, adjust=False).mean()/(tr+1e-10)
-    m_di = 100*pd.Series(minus_dm, index=df.index).ewm(alpha=1/p, adjust=False).mean()/(tr+1e-10)
-    dx = 100*(p_di-m_di).abs()/(p_di+m_di+1e-10)
-    return dx.ewm(alpha=1/p, adjust=False).mean(), p_di, m_di
+    p_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / (tr + 1e-10)
+    m_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / (tr + 1e-10)
+    dx = 100 * (p_di - m_di).abs() / (p_di + m_di + 1e-10)
+    return dx.ewm(alpha=1 / p, adjust=False).mean(), p_di, m_di
 
 
 def volume_profile_poc(df, bins=25):
@@ -174,45 +181,66 @@ def volume_profile_poc(df, bins=25):
         return float(df["close"].median())
     hist, edges = np.histogram(df["close"], bins=bins, weights=df["volume"])
     i = int(np.argmax(hist))
-    return float((edges[i] + edges[i+1])/2.0)
+    return float((edges[i] + edges[i + 1]) / 2.0)
 
 
 # ============================================================================
-# 5. DATA QUALITY
+# 5. DATA QUALITY  (FIX-2: weekend/holiday gap aware)
 # ============================================================================
 def validate_ohlcv(df, min_bars, label, allow_gap=False):
     req = {"time", "open", "high", "low", "close", "volume"}
     miss = req - set(df.columns)
-    if miss: raise ValueError(f"{label}: missing {miss}")
-    if len(df) < min_bars: raise ValueError(f"{label}: {len(df)}<{min_bars}")
-    if df[["open","high","low","close"]].isna().any().any():
+    if miss:
+        raise ValueError(f"{label}: missing {miss}")
+    if len(df) < min_bars:
+        raise ValueError(f"{label}: {len(df)}<{min_bars}")
+    if df[["open", "high", "low", "close"]].isna().any().any():
         raise ValueError(f"{label}: NaN OHLC")
-    if (df["high"] < df["low"]).any(): raise ValueError(f"{label}: high<low")
-    if df["volume"].sum() <= 0: raise ValueError(f"{label}: zero volume")
+    if (df["high"] < df["low"]).any():
+        raise ValueError(f"{label}: high<low")
+    if df["volume"].sum() <= 0:
+        raise ValueError(f"{label}: zero volume")
+
     if not allow_gap and len(df) > 1:
-        mg = df["time"].diff().max()
-        if mg > pd.Timedelta("4h"):
-            raise ValueError(f"{label}: internal gap {mg}")
+        gaps = df["time"].diff()
+        for i in range(1, len(df)):
+            g = gaps.iloc[i]
+            if g <= pd.Timedelta("4h"):
+                continue
+            prev_t = df["time"].iloc[i - 1]
+            curr_t = df["time"].iloc[i]
+            if g > pd.Timedelta("24h"):
+                continue  # holiday / long weekend
+            if prev_t.weekday() == 4 and prev_t.hour >= 20:
+                continue  # Friday close
+            if curr_t.weekday() in (6, 0):
+                continue  # Sunday reopen / Monday
+            raise ValueError(f"{label}: internal gap {g} at {curr_t}")
+
     last_ts = pd.to_datetime(df["time"].iloc[-1])
     now = datetime.now(timezone.utc)
-    age_h = (now.replace(tzinfo=None) - last_ts).total_seconds()/3600
+    age_h = (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600
     max_age = 6 if is_market_open(now) else 72
     if age_h > max_age:
-        raise ValueError(f"{label}: stale {age_h:.1f}h")
+        raise ValueError(f"{label}: stale {age_h:.1f}h (max {max_age})")
 
 
 # ============================================================================
-# 6. SESSION & MACRO
+# 6. SESSION, MACRO, NEWS
 # ============================================================================
 def get_session_profile(cfg):
     now = datetime.now(timezone.utc)
     if not is_market_open(now):
         return "WEEKEND", False, 999.0, 1.0
     h = now.hour
-    if 0 <= h < 7: return "ASIA_RANGE", True, 65.0, 1.0
-    if 7 <= h < 12: return "LONDON_TREND", True, 70.0, 1.3
-    if 12 <= h < 16: return "NY_OVERLAP", True, 75.0, 1.5
-    if 16 <= h < 21: return "NY_PM", True, 70.0, 1.3
+    if 0 <= h < 7:
+        return "ASIA_RANGE", True, 65.0, 1.0
+    if 7 <= h < 12:
+        return "LONDON_TREND", True, 70.0, 1.3
+    if 12 <= h < 16:
+        return "NY_OVERLAP", True, 75.0, 1.5
+    if 16 <= h < 21:
+        return "NY_PM", True, 70.0, 1.3
     return "OFF_HOURS", False, 999.0, 1.0
 
 
@@ -223,7 +251,7 @@ def check_macro_correlation(cfg):
     now = datetime.now(timezone.utc)
     if "m" in _macro_cache:
         ts, val = _macro_cache["m"]
-        if (now-ts).total_seconds() < cfg.macro_cache_min*60:
+        if (now - ts).total_seconds() < cfg.macro_cache_min * 60:
             return val
     if yf is None:
         return True, "bypass"
@@ -232,12 +260,16 @@ def check_macro_correlation(cfg):
         tnx = yf.Ticker("^TNX").history(period="5d")["Close"]
         notes, safe = [], True
         if len(dxy) >= 2:
-            ch = (dxy.iloc[-1]-dxy.iloc[-2])/dxy.iloc[-2]*100
-            if ch > 0.4: safe=False; notes.append(f"DXY+{ch:.2f}%")
+            ch = (dxy.iloc[-1] - dxy.iloc[-2]) / dxy.iloc[-2] * 100
+            if ch > 0.4:
+                safe = False
+                notes.append(f"DXY+{ch:.2f}%")
         if len(tnx) >= 2:
-            ch = (tnx.iloc[-1]-tnx.iloc[-2])/tnx.iloc[-2]*100
-            if ch > 0.5: safe=False; notes.append(f"10Y+{ch:.2f}%")
-        res = (True,"normal") if safe else (False,"veto "+", ".join(notes))
+            ch = (tnx.iloc[-1] - tnx.iloc[-2]) / tnx.iloc[-2] * 100
+            if ch > 0.5:
+                safe = False
+                notes.append(f"10Y+{ch:.2f}%")
+        res = (True, "normal") if safe else (False, "veto " + ", ".join(notes))
         _macro_cache["m"] = (now, res)
         return res
     except Exception as e:
@@ -246,13 +278,21 @@ def check_macro_correlation(cfg):
         return res
 
 
+# FIX-3: wrapper yang sebelumnya hilang
+def check_news_guard(cfg: BotConfig) -> NewsResult:
+    """Wrapper for news_calendar.check_news_guard with env gating."""
+    if not cfg.news_enabled:
+        return NewsResult(allowed=True, reason="news disabled", source="bypass")
+    return _live_news_guard()
+
+
 # ============================================================================
 # 7. DATA FETCHER
 # ============================================================================
 def _retry_session(retries, backoff):
     s = requests.Session()
     r = Retry(total=retries, backoff_factor=backoff,
-              status_forcelist=[429,500,502,503,504],
+              status_forcelist=[429, 500, 502, 503, 504],
               allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({"User-Agent": f"XAUUSD-Quant/{VERSION}"})
@@ -276,39 +316,53 @@ class DataFetcher:
     def _twelve(self, interval, size):
         if not self.cfg.twelve_data_api_key:
             return None
-        url = (f"https://api.twelvedata.com/time_series?symbol=XAU/USD"
-               f"&interval={interval}&outputsize={size}"
-               f"&apikey={self.cfg.twelve_data_api_key}")
+        url = (
+            f"https://api.twelvedata.com/time_series?symbol=XAU/USD"
+            f"&interval={interval}&outputsize={size}"
+            f"&apikey={self.cfg.twelve_data_api_key}"
+        )
         r = self.session.get(url, timeout=self.cfg.http_timeout)
         r.raise_for_status()
         j = r.json()
         if j.get("status") == "error" or j.get("code", 200) >= 400:
-            raise RuntimeError(j.get("message","TwelveData error"))
+            raise RuntimeError(j.get("message", "TwelveData error"))
         vals = j.get("values") or []
-        if not vals: return None
-        df = pd.DataFrame(vals).rename(columns={"datetime":"time"})
+        if not vals:
+            return None
+        df = pd.DataFrame(vals).rename(columns={"datetime": "time"})
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
-        for c in ["open","high","low","close"]:
+        for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume",1000.0), errors="coerce").fillna(1000.0)
+        # FIX-1: volume scalar bug
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
         return df.sort_values("time").reset_index(drop=True)
 
     def _yf(self):
-        if yf is None: raise RuntimeError("yfinance missing")
+        if yf is None:
+            raise RuntimeError("yfinance missing")
         tk = yf.Ticker("GC=F")
         h1_raw = tk.history(period="60d", interval="1h")
         m15_raw = tk.history(period="60d", interval="15m")
-        if h1_raw.empty: raise RuntimeError("Yahoo H1 empty")
+        if h1_raw.empty:
+            raise RuntimeError("Yahoo H1 empty")
 
         def norm(df):
             df = df.reset_index()
-            tcol = "Datetime" if "Datetime" in df.columns else ("Date" if "Date" in df.columns else df.columns[0])
-            df = df.rename(columns={tcol:"time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            tcol = "Datetime" if "Datetime" in df.columns else (
+                "Date" if "Date" in df.columns else df.columns[0])
+            df = df.rename(columns={tcol: "time", "Open": "open", "High": "high",
+                                    "Low": "low", "Close": "close", "Volume": "volume"})
             df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
-            for c in ["open","high","low","close"]:
+            for c in ["open", "high", "low", "close"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["volume"] = pd.to_numeric(df.get("volume",1000.0), errors="coerce").fillna(1000.0)
-            return df.dropna(subset=["open","high","low","close"]).sort_values("time").reset_index(drop=True)
+            if "volume" in df.columns:
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+            else:
+                df["volume"] = 1000.0
+            return df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
 
         h1 = norm(h1_raw)
         if not m15_raw.empty:
@@ -323,18 +377,28 @@ class DataFetcher:
         p = self.cfg.csv_path
         if not (os.path.exists(p) and os.path.getsize(p) > 0):
             d = os.path.dirname(p)
-            if d: os.makedirs(d, exist_ok=True)
-            dummy = pd.date_range(end=datetime.now(timezone.utc).replace(tzinfo=None), periods=600, freq="h")
-            pd.DataFrame({"time":dummy,"open":2000.0,"high":2001.0,"low":1999.0,"close":2000.0,"volume":1000.0}).to_csv(p, index=False)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            dummy = pd.date_range(
+                end=datetime.now(timezone.utc).replace(tzinfo=None),
+                periods=600, freq="h")
+            pd.DataFrame({
+                "time": dummy, "open": 2000.0, "high": 2001.0,
+                "low": 1999.0, "close": 2000.0, "volume": 1000.0,
+            }).to_csv(p, index=False)
             log_event(logging.WARNING, "csv_seeded_dummy", path=p)
         df = pd.read_csv(p)
         df.columns = [c.strip().lower() for c in df.columns]
-        tcol = "datetime" if "datetime" in df.columns else ("time" if "time" in df.columns else df.columns[0])
+        tcol = "datetime" if "datetime" in df.columns else (
+            "time" if "time" in df.columns else df.columns[0])
         df["time"] = pd.to_datetime(df[tcol], utc=True).dt.tz_localize(None)
-        for c in ["open","high","low","close"]:
+        for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume",1000.0), errors="coerce").fillna(1000.0)
-        df = df.dropna(subset=["open","high","low","close"]).sort_values("time").reset_index(drop=True)
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
+        df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
         m15 = df.set_index("time").resample("15min").ffill().reset_index()
         m15["volume"] /= 4.0
         return MarketData(df, m15, "csv", m15_synthetic=True)
@@ -350,7 +414,8 @@ class DataFetcher:
                     m15["volume"] /= 4.0
                     synth = True
                 else:
-                    validate_ohlcv(m15, 50, "12data-M15"); synth = False
+                    validate_ohlcv(m15, 50, "12data-M15")
+                    synth = False
                 log_event(event="data_ok", source="twelvedata", m15_synthetic=synth)
                 return MarketData(h1, m15, "twelvedata", m15_synthetic=synth)
         except Exception as e:
@@ -372,21 +437,27 @@ class DataFetcher:
     def fetch_spot(self, h1):
         if self._spot_cache:
             ts, v = self._spot_cache
-            if (datetime.now(timezone.utc)-ts).total_seconds() < self.cfg.spot_cache_min*60:
+            if (datetime.now(timezone.utc) - ts).total_seconds() < self.cfg.spot_cache_min * 60:
                 return v
         price = None
         if self.cfg.twelve_data_api_key:
             try:
-                r = self.session.get(f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}", timeout=6)
+                r = self.session.get(
+                    f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}",
+                    timeout=6)
                 r.raise_for_status()
                 p = float(r.json().get("price", 0) or 0)
-                if p > 0: price = p
-            except Exception: pass
+                if p > 0:
+                    price = p
+            except Exception:
+                pass
         if price is None and yf is not None:
             try:
                 p = float(yf.Ticker("GC=F").fast_info["last_price"])
-                if p > 0: price = p
-            except Exception: pass
+                if p > 0:
+                    price = p
+            except Exception:
+                pass
         if price is None:
             price = float(h1["close"].iloc[-1])
         self._spot_cache = (datetime.now(timezone.utc), price)
@@ -427,17 +498,20 @@ def run_21_voters(df):
     v: List[int] = []
     dbg: Dict[str, int] = {}
 
-    sma_votes = [1 if c > sma(close, p).iloc[-1] else -1 for p in (5,10,20,50,100,200)]
-    v.extend(sma_votes); dbg["sma"] = sum(sma_votes)
+    sma_votes = [1 if c > sma(close, p).iloc[-1] else -1 for p in (5, 10, 20, 50, 100, 200)]
+    v.extend(sma_votes)
+    dbg["sma"] = sum(sma_votes)
 
-    e1 = 1 if ema(close,9).iloc[-1] > ema(close,21).iloc[-1] else -1
-    e2 = 1 if ema(close,12).iloc[-1] > ema(close,26).iloc[-1] else -1
-    e3 = 1 if ema(close,50).iloc[-1] > ema(close,200).iloc[-1] else -1
-    v.extend([e1,e2,e3]); dbg["ema"] = e1+e2+e3
+    e1 = 1 if ema(close, 9).iloc[-1] > ema(close, 21).iloc[-1] else -1
+    e2 = 1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1
+    e3 = 1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1
+    v.extend([e1, e2, e3])
+    dbg["ema"] = e1 + e2 + e3
 
-    r = float(rsi(close,14).iloc[-1])
+    r = float(rsi(close, 14).iloc[-1])
     r_v = [1 if r > 50 else -1, 1 if r < 70 else -1, 1 if r > 30 else -1]
-    v.extend(r_v); dbg["rsi"] = sum(r_v)
+    v.extend(r_v)
+    dbg["rsi"] = sum(r_v)
 
     adx_v, p_di, m_di = adx(df, 14)
     m_v = [
@@ -447,27 +521,31 @@ def run_21_voters(df):
         1 if c > close.iloc[-5] else -1,
         1 if c > close.iloc[-10] else -1,
     ]
-    v.extend(m_v); dbg["momentum"] = sum(m_v)
+    v.extend(m_v)
+    dbg["momentum"] = sum(m_v)
 
     mp = 0
-    for n in (5,10):
+    for n in (5, 10):
         hi_n, lo_n = df["high"].iloc[-n:].max(), df["low"].iloc[-n:].min()
-        pos = (c-lo_n)/max(hi_n-lo_n,1e-10)
+        pos = (c - lo_n) / max(hi_n - lo_n, 1e-10)
         vote = 1 if pos > 0.5 else -1
-        v.append(vote); mp += vote
+        v.append(vote)
+        mp += vote
     dbg["micro"] = mp
 
     vol_v = 1 if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1] else -1
-    v.append(vol_v); dbg["volume"] = vol_v
+    v.append(vol_v)
+    dbg["volume"] = vol_v
 
     poc = volume_profile_poc(df)
     poc_v = 1 if c > poc else -1
-    v.append(poc_v); dbg["poc"] = poc_v
+    v.append(poc_v)
+    dbg["poc"] = poc_v
 
     assert len(v) == 21
     bull = sum(1 for x in v if x == 1)
     bear = 21 - bull
-    return max(bull, bear)/21.0, bull, bear, dbg
+    return max(bull, bear) / 21.0, bull, bear, dbg
 
 
 def _load_params():
@@ -500,10 +578,9 @@ def build_ensemble(md, cfg):
     df, m15 = md.h1, md.m15
     close = df["close"]
     c_last = float(close.iloc[-1])
-    atr_val = float(atr(df,14).iloc[-1])
-    adx_val = float(adx(df,14)[0].iloc[-1])
+    atr_val = float(atr(df, 14).iloc[-1])
+    adx_val = float(adx(df, 14)[0].iloc[-1])
 
-    # --- FUZZY REGIME ---
     weights = membership(adx_val)
     dom = dominant(weights)
     if _PARAMS_SCHEMA >= 2:
@@ -518,52 +595,69 @@ def build_ensemble(md, cfg):
 
     poc = volume_profile_poc(df)
     session, allowed, _, _ = get_session_profile(cfg)
-    news = check_news_guard(cfg)
+    news = check_news_guard(cfg)                     # <- FIX-3
     corr_ok, corr_msg = check_macro_correlation(cfg)
-    ema200 = float(ema(close,200).iloc[-1])
+    ema200 = float(ema(close, 200).iloc[-1])
 
     last, prev = df.iloc[-1], df.iloc[-21:-1]
     op, hi, lo, cl = last["open"], last["high"], last["low"], last["close"]
-    rng = max(hi-lo, 0.01)
-    wick_pct = (max(hi-max(op,cl), min(op,cl)-lo)/rng)*100.0
+    rng = max(hi - lo, 0.01)
+    wick_pct = (max(hi - max(op, cl), min(op, cl) - lo) / rng) * 100.0
     sweep = "NONE"
-    if hi > prev["high"].max() and cl < prev["high"].max(): sweep = "BEAR"
-    elif lo < prev["low"].min() and cl > prev["low"].min(): sweep = "BULL"
-    h1_vr = last["volume"] / (df["volume"].iloc[-21:-1].mean()+1e-10)
-    m15_vr = m15["volume"].iloc[-1]/(m15["volume"].iloc[-20:].mean()+1e-10) if not md.m15_synthetic else 1.0
+    if hi > prev["high"].max() and cl < prev["high"].max():
+        sweep = "BEAR"
+    elif lo < prev["low"].min() and cl > prev["low"].min():
+        sweep = "BULL"
+    h1_vr = last["volume"] / (df["volume"].iloc[-21:-1].mean() + 1e-10)
+    m15_vr = (
+        m15["volume"].iloc[-1] / (m15["volume"].iloc[-20:].mean() + 1e-10)
+        if not md.m15_synthetic else 1.0
+    )
     f_score = 30.0
-    if sweep != "NONE": f_score += 35.0
-    if wick_pct > 40.0: f_score += 20.0
-    if h1_vr > 1.2 or m15_vr > 1.3: f_score += 15.0
+    if sweep != "NONE":
+        f_score += 35.0
+    if wick_pct > 40.0:
+        f_score += 20.0
+    if h1_vr > 1.2 or m15_vr > 1.3:
+        f_score += 15.0
     f_score = min(f_score, 100.0)
 
-    m15_bull = ema(m15["close"],9).iloc[-1] > ema(m15["close"],21).iloc[-1]
+    m15_bull = ema(m15["close"], 9).iloc[-1] > ema(m15["close"], 21).iloc[-1]
     voter_agree, bull, bear, dbg = run_21_voters(df)
-    combined = round((voter_agree*0.6 + (f_score/100.0)*0.4)*100, 1)
+    combined = round((voter_agree * 0.6 + (f_score / 100.0) * 0.4) * 100, 1)
     intended = "BUY" if bull > bear else "SELL"
-    macro_ok = (intended=="BUY" and c_last>ema200) or (intended=="SELL" and c_last<ema200)
+    macro_ok = (
+        (intended == "BUY" and c_last > ema200)
+        or (intended == "SELL" and c_last < ema200)
+    )
 
     notes, action = [], "WAIT"
-    if not news.allowed: notes.append(f"NEWS: {news.reason}")
-    elif not allowed: notes.append(f"SESSION: {session}")
-    elif not corr_ok: notes.append(f"MACRO: {corr_msg}")
+    if not news.allowed:
+        notes.append(f"NEWS: {news.reason}")
+    elif not allowed:
+        notes.append(f"SESSION: {session}")
+    elif not corr_ok:
+        notes.append(f"MACRO: {corr_msg}")
     elif combined < threshold:
         notes.append(f"GATED[{dom}]: {combined}%<{threshold:.1f}%")
-    elif not macro_ok: notes.append("VETO EMA200 H1")
-    elif intended=="BUY" and m15_bull:
-        action="BUY"; notes.append(f"OK[{dom}/{session}] {combined}%")
-    elif intended=="SELL" and not m15_bull:
-        action="SELL"; notes.append(f"OK[{dom}/{session}] {combined}%")
+    elif not macro_ok:
+        notes.append("VETO EMA200 H1")
+    elif intended == "BUY" and m15_bull:
+        action = "BUY"
+        notes.append(f"OK[{dom}/{session}] {combined}%")
+    elif intended == "SELL" and not m15_bull:
+        action = "SELL"
+        notes.append(f"OK[{dom}/{session}] {combined}%")
     else:
         notes.append("M15 misaligned")
 
     dbg["news_source"] = news.source
     return EnsembleResult(
         action=action, total_score=combined,
-        voter_agreement=round(voter_agree,4), forensic_score=round(f_score,1),
-        regime=dom, regime_weights=weights, poc_level=round(poc,2),
-        notes=notes, atr_value=round(atr_val,4), atr_multiplier=round(atr_mult,4),
-        blended_params={k: round(v,4) for k,v in blended.items()},
+        voter_agreement=round(voter_agree, 4), forensic_score=round(f_score, 1),
+        regime=dom, regime_weights=weights, poc_level=round(poc, 2),
+        notes=notes, atr_value=round(atr_val, 4), atr_multiplier=round(atr_mult, 4),
+        blended_params={k: round(v, 4) for k, v in blended.items()},
         voters_debug=dbg,
     )
 
@@ -572,23 +666,24 @@ def build_ensemble(md, cfg):
 # 9. RISK & KELLY
 # ============================================================================
 def calc_levels(sig, entry, atr_v, atr_mult, cfg, blended, kelly_risk_pct, kelly_reason):
-    if sig not in ("BUY","SELL"): return None
-    sl_d = max(atr_v*atr_mult, 1.0)
-    risk_usd = cfg.account_size_usd * kelly_risk_pct/100.0
-    lot = round(max(risk_usd/(sl_d*100.0), 0.01), 2)
-    actual_risk = lot*sl_d*100.0
+    if sig not in ("BUY", "SELL"):
+        return None
+    sl_d = max(atr_v * atr_mult, 1.0)
+    risk_usd = cfg.account_size_usd * kelly_risk_pct / 100.0
+    lot = round(max(risk_usd / (sl_d * 100.0), 0.01), 2)
+    actual_risk = lot * sl_d * 100.0
     tp1_r = blended.get("tp1_mult", 1.5)
     tp2_r = blended.get("tp2_mult", 2.5)
-    if sig=="BUY":
-        sl, tp1, tp2, be = entry-sl_d, entry+sl_d*tp1_r, entry+sl_d*tp2_r, entry+sl_d
+    if sig == "BUY":
+        sl, tp1, tp2, be = entry - sl_d, entry + sl_d * tp1_r, entry + sl_d * tp2_r, entry + sl_d
     else:
-        sl, tp1, tp2, be = entry+sl_d, entry-sl_d*tp1_r, entry-sl_d*tp2_r, entry-sl_d
+        sl, tp1, tp2, be = entry + sl_d, entry - sl_d * tp1_r, entry - sl_d * tp2_r, entry - sl_d
     return {
-        "entry_price": round(entry,2), "sl_price": round(sl,2),
-        "tp1_price": round(tp1,2), "tp2_price": round(tp2,2),
-        "break_even_trigger": round(be,2),
-        "lot_size": lot, "risk_amount_usd": round(risk_usd,2),
-        "actual_risk_usd": round(actual_risk,2),
+        "entry_price": round(entry, 2), "sl_price": round(sl, 2),
+        "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2),
+        "break_even_trigger": round(be, 2),
+        "lot_size": lot, "risk_amount_usd": round(risk_usd, 2),
+        "actual_risk_usd": round(actual_risk, 2),
         "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason,
     }
 
@@ -601,7 +696,8 @@ class AuditDB:
         self.ok = False
         try:
             d = os.path.dirname(path)
-            if d: os.makedirs(d, exist_ok=True)
+            if d:
+                os.makedirs(d, exist_ok=True)
             self.conn = sqlite3.connect(path, check_same_thread=False)
             with self.conn:
                 self.conn.execute("""CREATE TABLE IF NOT EXISTS signals(
@@ -613,11 +709,13 @@ class AuditDB:
             log_event(logging.WARNING, "db_init_fail", err=str(e)[:80])
 
     def record(self, e, spot, lv):
-        if not self.ok: return
+        if not self.ok:
+            return
         try:
             with self.conn:
                 self.conn.execute(
-                    "INSERT INTO signals(ts,action,spot,score,regime,kelly_pct,lot,risk,notes) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO signals(ts,action,spot,score,regime,kelly_pct,lot,risk,notes) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
                     (datetime.now(timezone.utc).isoformat(), e.action, spot, e.total_score,
                      e.regime, lv["risk_pct"] if lv else 0, lv["lot_size"] if lv else 0,
                      lv["risk_amount_usd"] if lv else 0, "; ".join(e.notes)))
@@ -625,30 +723,36 @@ class AuditDB:
             log_event(logging.WARNING, "db_write_fail", err=str(ex)[:80])
 
     def last_action(self):
-        if not self.ok: return None
+        if not self.ok:
+            return None
         try:
             row = self.conn.execute(
-                "SELECT action, ts, spot FROM signals WHERE action IN ('BUY','SELL') ORDER BY id DESC LIMIT 1"
+                "SELECT action, ts, spot FROM signals WHERE action IN ('BUY','SELL') "
+                "ORDER BY id DESC LIMIT 1"
             ).fetchone()
             if row:
                 return row[0], datetime.fromisoformat(row[1]), row[2]
-        except Exception: pass
+        except Exception:
+            pass
         return None
 
     def is_dup(self, cooldown, action, spot, tol=1.0):
         last = self.last_action()
-        if not last: return False
+        if not last:
+            return False
         a, ts, sp = last
-        age = (datetime.now(timezone.utc)-ts).total_seconds()/60
-        return age < cooldown and a == action and abs(sp-spot) < tol
+        age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+        return age < cooldown and a == action and abs(sp - spot) < tol
 
 
 # ============================================================================
 # 11. TELEGRAM
 # ============================================================================
 def _tg_post(cfg, payload):
-    if not (cfg.telegram_bot_token and cfg.telegram_chat_id): return False
-    if ":" not in cfg.telegram_bot_token: return False
+    if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+        return False
+    if ":" not in cfg.telegram_bot_token:
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
@@ -665,18 +769,20 @@ def _tg_post(cfg, payload):
 def send_signal(cfg, e, spot, levels):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     kb = {"inline_keyboard": [[
-        {"text":"🔄 Refresh","callback_data":"refresh"},
-        {"text":"📊 Macro","callback_data":"macro"}]]}
-
+        {"text": "🔄 Refresh", "callback_data": "refresh"},
+        {"text": "📊 Macro", "callback_data": "macro"},
+    ]]}
     w = e.regime_weights
-    fuzzy_str = f"{e.regime} (R:{w.get('RANGING',0):.2f} T:{w.get('TRANSITION',0):.2f} Tr:{w.get('TRENDING',0):.2f})"
+    fuzzy_str = (f"{e.regime} (R:{w.get('RANGING', 0):.2f} "
+                 f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
 
     if e.action == "WAIT" or not levels:
-        text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n⏰ <code>{now}</code>\n"
+        text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
+                f"⏰ <code>{now}</code>\n"
                 f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
                 f"Reason: {e.notes[0]}")
     else:
-        em = "🟢" if e.action=="BUY" else "🔴"
+        em = "🟢" if e.action == "BUY" else "🔴"
         text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
                 f"⏰ <code>{now}</code>\n───────────────────\n"
                 f"Score: <b>{e.total_score}%</b>\n"
@@ -698,11 +804,13 @@ def send_signal(cfg, e, spot, levels):
 
 
 def send_failure(cfg, err):
-    if not is_market_open(): return
+    if not is_market_open():
+        return
     _tg_post(cfg, {
         "chat_id": cfg.telegram_chat_id,
         "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{err[:400]}</code>",
-        "parse_mode":"HTML"})
+        "parse_mode": "HTML",
+    })
 
 
 # ============================================================================
@@ -734,7 +842,6 @@ def main() -> int:
         basis = fetcher.get_basis(md)
         tradable = float(md.h1["close"].iloc[-1]) + basis
 
-        # --- KELLY ---
         frac, cap = risk_pct_from_env()
         R_history = SUPABASE.fetch_recent_r(50) if SUPABASE.enabled else None
         if R_history:
@@ -747,23 +854,21 @@ def main() -> int:
 
         db = AuditDB(cfg.db_path)
         if levels and db.is_dup(cfg.signal_cooldown_min, e.action, tradable):
-            log_event(event="signal_deduped", action=e.action, spot=round(tradable,2))
+            log_event(event="signal_deduped", action=e.action, spot=round(tradable, 2))
             print(f"ACTION: {e.action} (deduped) | Score: {e.total_score}%")
             return 0
 
-        # Insert Supabase (WAIT juga di-log supaya dashboard lengkap)
-        sb_ok = False
         if levels:
             sb_ok = try_insert_signal(
                 action=e.action, spot=tradable, score=e.total_score,
-                regime=e.regime, kelly_frac=kelly_pct/100.0,
+                regime=e.regime, kelly_frac=kelly_pct / 100.0,
                 lot=levels["lot_size"], risk_usd=levels["actual_risk_usd"],
                 sl=levels["sl_price"], tp1=levels["tp1_price"], tp2=levels["tp2_price"],
                 notes="; ".join(e.notes))
         else:
             sb_ok = try_insert_signal(
                 action="WAIT", spot=tradable, score=e.total_score,
-                regime=e.regime, kelly_frac=kelly_pct/100.0,
+                regime=e.regime, kelly_frac=kelly_pct / 100.0,
                 lot=0, risk_usd=0, sl=0, tp1=0, tp2=0,
                 notes="; ".join(e.notes))
 
@@ -771,7 +876,7 @@ def main() -> int:
         sent = send_signal(cfg, e, tradable, levels)
 
         log_event(event="signal_emitted", action=e.action, score=e.total_score,
-                  spot=round(tradable,2), basis=round(basis,2),
+                  spot=round(tradable, 2), basis=round(basis, 2),
                   source=md.source, m15_synthetic=md.m15_synthetic,
                   regime=e.regime, regime_weights=e.regime_weights,
                   kelly_pct=kelly_pct, kelly_reason=kelly_reason,
