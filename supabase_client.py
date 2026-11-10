@@ -1,6 +1,6 @@
 """
-supabase_client.py — ULTIMATE FIX (Auto-Parse URL + Debug)
-==========================================================
+supabase_client.py — DEBUG MODE (Mencetak URL ke Log)
+=====================================================
 """
 from __future__ import annotations
 
@@ -32,12 +32,9 @@ class SupabaseClient:
     def __init__(self) -> None:
         raw_url = (os.getenv("SUPABASE_URL") or "").strip()
         
-        # Auto-Clean URL
         clean_url = raw_url.rstrip("/")
         if clean_url.endswith("/rest/v1"):
             clean_url = clean_url.replace("/rest/v1", "")
-            
-        # Pastikan ada https://
         if clean_url and not clean_url.startswith("http"):
             clean_url = f"https://{clean_url}"
             
@@ -47,11 +44,13 @@ class SupabaseClient:
         self.enabled = bool(self.url and self.key and Client)
         self.client = None
         
+        # --- TAMBAHAN DEBUG ---
+        print(f"DEBUG URL YANG DIBACA BOT: {self.url}")
+        print(f"DEBUG KEY YANG DIBACA BOT: {self.key[:15]}...")
+        
         if self.enabled:
             try:
                 self.client = create_client(self.url, self.key)
-                # Log URL yang digunakan agar bisa dicek di GitHub Actions
-                _log(logging.INFO, "supabase_ready", url=self.url)
             except Exception as e:
                 _log(logging.ERROR, "supabase_init_fail", err=str(e)[:100])
                 self.enabled = False
