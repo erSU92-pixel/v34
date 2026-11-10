@@ -1,10 +1,12 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v7.0.1 FIXED
+XAUUSD Quantitative Institutional Signal Bot — v7.0.2 FIXED
 ============================================================
 FIX LOG:
-  - FIX-1: TwelveData volume scalar (df.get → float → .fillna crash)
-  - FIX-2: Weekend/holiday gap false positive di validate_ohlcv
-  - FIX-3: check_news_guard wrapper (sebelumnya NameError)
+  - FIX-1: TwelveData volume scalar
+  - FIX-2: Weekend/holiday gap false positive
+  - FIX-3: check_news_guard wrapper
+  - FIX-4: params.json missing → blend returns 0 → SL/TP broken
+           (fallback to DEFAULT_PARAMS_FALLBACK, warn in Telegram)
 """
 from __future__ import annotations
 
@@ -35,15 +37,23 @@ try:
 except ImportError:
     pass
 
-# --- Local modules ---
 from fuzzy_regime import blend_params, dominant, membership
 from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "7.0.1"
+VERSION = "7.0.2"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
+
+# FIX-4: sane defaults when params.json missing
+DEFAULT_PARAMS_FALLBACK: Dict[str, float] = {
+    "threshold": 70.0,
+    "sl_mult": 1.5,
+    "tp1_mult": 1.5,
+    "tp2_mult": 2.5,
+    "max_hold": 48.0,
+}
 
 
 # ============================================================================
@@ -185,7 +195,7 @@ def volume_profile_poc(df, bins=25):
 
 
 # ============================================================================
-# 5. DATA QUALITY  (FIX-2: weekend/holiday gap aware)
+# 5. DATA QUALITY
 # ============================================================================
 def validate_ohlcv(df, min_bars, label, allow_gap=False):
     req = {"time", "open", "high", "low", "close", "volume"}
@@ -210,11 +220,11 @@ def validate_ohlcv(df, min_bars, label, allow_gap=False):
             prev_t = df["time"].iloc[i - 1]
             curr_t = df["time"].iloc[i]
             if g > pd.Timedelta("24h"):
-                continue  # holiday / long weekend
+                continue
             if prev_t.weekday() == 4 and prev_t.hour >= 20:
-                continue  # Friday close
+                continue
             if curr_t.weekday() in (6, 0):
-                continue  # Sunday reopen / Monday
+                continue
             raise ValueError(f"{label}: internal gap {g} at {curr_t}")
 
     last_ts = pd.to_datetime(df["time"].iloc[-1])
@@ -278,9 +288,7 @@ def check_macro_correlation(cfg):
         return res
 
 
-# FIX-3: wrapper yang sebelumnya hilang
 def check_news_guard(cfg: BotConfig) -> NewsResult:
-    """Wrapper for news_calendar.check_news_guard with env gating."""
     if not cfg.news_enabled:
         return NewsResult(allowed=True, reason="news disabled", source="bypass")
     return _live_news_guard()
@@ -333,7 +341,6 @@ class DataFetcher:
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        # FIX-1: volume scalar bug
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
         else:
@@ -489,6 +496,7 @@ class EnsembleResult:
     atr_value: float
     atr_multiplier: float
     blended_params: Dict[str, float]
+    using_fallback: bool = False
     voters_debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -566,14 +574,6 @@ def _load_params():
 _PARAMS, _PARAMS_SCHEMA = _load_params()
 
 
-def opt(regime, key, default):
-    if _PARAMS_SCHEMA >= 2 and regime in _PARAMS:
-        return _PARAMS[regime].get(key, default)
-    if "_flat" in _PARAMS:
-        return _PARAMS["_flat"].get(key, default)
-    return default
-
-
 def build_ensemble(md, cfg):
     df, m15 = md.h1, md.m15
     close = df["close"]
@@ -590,12 +590,21 @@ def build_ensemble(md, cfg):
         regime_params = {r: flat for r in REGIMES}
     blended = blend_params(weights, regime_params)
 
-    threshold = blended.get("threshold", 70.0)
-    atr_mult = blended.get("sl_mult", 1.5)
+    # FIX-4: params.json missing → blend returns zeros → SL/TP broken
+    using_fallback = False
+    if blended.get("threshold", 0.0) <= 0.0:
+        using_fallback = True
+        log_event(logging.WARNING, "params_fallback",
+                  note="params.json missing/empty → DEFAULT_PARAMS_FALLBACK",
+                  schema=_PARAMS_SCHEMA)
+        blended = dict(DEFAULT_PARAMS_FALLBACK)
+
+    threshold = blended.get("threshold", DEFAULT_PARAMS_FALLBACK["threshold"])
+    atr_mult = blended.get("sl_mult", DEFAULT_PARAMS_FALLBACK["sl_mult"])
 
     poc = volume_profile_poc(df)
     session, allowed, _, _ = get_session_profile(cfg)
-    news = check_news_guard(cfg)                     # <- FIX-3
+    news = check_news_guard(cfg)
     corr_ok, corr_msg = check_macro_correlation(cfg)
     ema200 = float(ema(close, 200).iloc[-1])
 
@@ -658,6 +667,7 @@ def build_ensemble(md, cfg):
         regime=dom, regime_weights=weights, poc_level=round(poc, 2),
         notes=notes, atr_value=round(atr_val, 4), atr_multiplier=round(atr_mult, 4),
         blended_params={k: round(v, 4) for k, v in blended.items()},
+        using_fallback=using_fallback,
         voters_debug=dbg,
     )
 
@@ -672,8 +682,8 @@ def calc_levels(sig, entry, atr_v, atr_mult, cfg, blended, kelly_risk_pct, kelly
     risk_usd = cfg.account_size_usd * kelly_risk_pct / 100.0
     lot = round(max(risk_usd / (sl_d * 100.0), 0.01), 2)
     actual_risk = lot * sl_d * 100.0
-    tp1_r = blended.get("tp1_mult", 1.5)
-    tp2_r = blended.get("tp2_mult", 2.5)
+    tp1_r = blended.get("tp1_mult", 1.5) or 1.5
+    tp2_r = blended.get("tp2_mult", 2.5) or 2.5
     if sig == "BUY":
         sl, tp1, tp2, be = entry - sl_d, entry + sl_d * tp1_r, entry + sl_d * tp2_r, entry + sl_d
     else:
@@ -689,7 +699,7 @@ def calc_levels(sig, entry, atr_v, atr_mult, cfg, blended, kelly_risk_pct, kelly
 
 
 # ============================================================================
-# 10. AUDIT DB (SQLite local)
+# 10. AUDIT DB
 # ============================================================================
 class AuditDB:
     def __init__(self, path):
@@ -776,11 +786,16 @@ def send_signal(cfg, e, spot, levels):
     fuzzy_str = (f"{e.regime} (R:{w.get('RANGING', 0):.2f} "
                  f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
 
+    # FIX-4b: warn when default params in use
+    fallback_warn = ""
+    if e.using_fallback and e.action in ("BUY", "SELL"):
+        fallback_warn = "\n⚠️ <b>DEFAULT PARAMS</b> (params.json missing → run optimizer)"
+
     if e.action == "WAIT" or not levels:
         text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
                 f"⏰ <code>{now}</code>\n"
                 f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                f"Reason: {e.notes[0]}")
+                f"Reason: {e.notes[0]}{fallback_warn}")
     else:
         em = "🟢" if e.action == "BUY" else "🔴"
         text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
@@ -795,7 +810,7 @@ def send_signal(cfg, e, spot, levels):
                 f"BE @  : ${levels['break_even_trigger']:.2f}</code>\n"
                 f"Lot: <b>{levels['lot_size']}</b> | "
                 f"Risk: ${levels['actual_risk_usd']:.0f} ({levels['risk_pct']:.2f}%)\n"
-                f"<i>Kelly: {levels['kelly_reason']}</i>")
+                f"<i>Kelly: {levels['kelly_reason']}</i>{fallback_warn}")
     return _tg_post(cfg, {
         "chat_id": cfg.telegram_chat_id, "text": text,
         "parse_mode": "HTML", "reply_markup": kb,
@@ -879,10 +894,12 @@ def main() -> int:
                   spot=round(tradable, 2), basis=round(basis, 2),
                   source=md.source, m15_synthetic=md.m15_synthetic,
                   regime=e.regime, regime_weights=e.regime_weights,
+                  using_fallback=e.using_fallback,
                   kelly_pct=kelly_pct, kelly_reason=kelly_reason,
                   supabase_ok=sb_ok, voters=e.voters_debug, tg=sent)
         print(f"ACTION: {e.action} | Score: {e.total_score}% | Regime: {e.regime} | "
-              f"Kelly: {kelly_pct:.2f}% | Spot: {tradable:.2f} | TG: {sent} | SB: {sb_ok}")
+              f"Kelly: {kelly_pct:.2f}% | Spot: {tradable:.2f} | TG: {sent} | SB: {sb_ok}"
+              f" | fallback={e.using_fallback}")
         return 0
     except Exception as ex:
         err = f"{type(ex).__name__}: {ex}"
