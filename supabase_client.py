@@ -1,8 +1,6 @@
 """
-supabase_client.py — FINAL FIX (405 Method Not Allowed)
-======================================================
-- Hanya mengirim header 'apikey' dan 'Content-Type'
-- Tidak mengirim 'Authorization' atau 'Prefer' yang dapat memicu 405
+supabase_client.py — FINAL FIX (Menggunakan SDK Resmi Supabase)
+==============================================================
 """
 from __future__ import annotations
 
@@ -11,7 +9,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import requests
+try:
+    from supabase import create_client, Client
+except ImportError:
+    Client = None
 
 try:
     from dotenv import load_dotenv
@@ -19,71 +20,49 @@ try:
 except ImportError:
     pass
 
-
 def _log(level: int, msg: str, **kw) -> None:
     lg = logging.getLogger("xauusd")
     rec = lg.makeRecord(lg.name, level, "", 0, msg, (), None)
     rec.extra_data = kw
     lg.handle(rec)
 
-
 class SupabaseClient:
     def __init__(self) -> None:
         self.url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
         self.key = os.getenv("SUPABASE_KEY") or ""
         self.table = os.getenv("SUPABASE_TABLE", "signals")
-        self.enabled = bool(self.url and self.key)
-        self._session = requests.Session()
+        self.enabled = bool(self.url and self.key and Client)
+        self.client = None
         
-        # HANYA header ini yang dikirim. Jangan tambahkan yang lain.
-        self._session.headers.update({
-            "apikey": self.key,
-            "Content-Type": "application/json",
-        })
+        if self.enabled:
+            try:
+                # SDK resmi otomatis mengurus header dan URL
+                self.client = create_client(self.url, self.key)
+            except Exception as e:
+                _log(logging.ERROR, "supabase_init_fail", err=str(e)[:100])
+                self.enabled = False
 
     def insert(self, row: Dict[str, Any]) -> bool:
-        if not self.enabled:
+        if not self.enabled or not self.client:
             return False
         try:
-            r = self._session.post(
-                f"{self.url}/rest/v1/{self.table}",
-                json=row,
-                timeout=10,
-            )
-            if r.status_code not in (200, 201, 204):
-                _log(logging.ERROR, "supabase_insert_fail",
-                     code=r.status_code, body=r.text[:200])
-                return False
+            # Insert menggunakan SDK
+            self.client.table(self.table).insert(row).execute()
             return True
         except Exception as e:
-            _log(logging.WARNING, "supabase_exception", err=str(e)[:100])
+            _log(logging.ERROR, "supabase_insert_fail", err=str(e)[:200])
             return False
 
     def fetch_recent_r(self, limit: int = 50) -> Optional[list]:
-        if not self.enabled:
+        if not self.enabled or not self.client:
             return None
         try:
-            r = self._session.get(
-                f"{self.url}/rest/v1/{self.table}",
-                params={
-                    "select": "r_multiple",
-                    "action": "in.(BUY,SELL)",
-                    "r_multiple": "not.is.null",
-                    "order": "ts.desc",
-                    "limit": str(limit),
-                },
-                timeout=10,
-            )
-            if r.status_code != 200:
-                return None
-            rows = r.json()
-            return [float(x["r_multiple"]) for x in rows if x.get("r_multiple") is not None]
+            res = self.client.table(self.table).select("r_multiple").in_("action", ["BUY", "SELL"]).not_.is_("r_multiple", "null").order("ts", desc=True).limit(limit).execute()
+            return [float(x["r_multiple"]) for x in res.data if x.get("r_multiple") is not None]
         except Exception:
             return None
 
-
 SUPABASE = SupabaseClient()
-
 
 def try_insert_signal(
     action: str, spot: float, score: float, regime: str,
