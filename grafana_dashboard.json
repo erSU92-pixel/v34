@@ -1,0 +1,39 @@
+{
+  "dashboard": {
+    "title": "XAUUSD Bot — Signals & Regime",
+    "panels": [
+      {
+        "type": "timeseries",
+        "title": "Signals per Hour",
+        "targets": [{
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, COUNT(*) FILTER (WHERE action='BUY') AS buys, COUNT(*) FILTER (WHERE action='SELL') AS sells FROM signals WHERE $__timeFilter(ts) GROUP BY 1 ORDER BY 1"
+        }]
+      },
+      {
+        "type": "stat",
+        "title": "Total Signals (24h)",
+        "targets": [{
+          "rawQuery": true,
+          "rawSql": "SELECT COUNT(*) FROM signals WHERE ts > NOW() - INTERVAL '24 hours'"
+        }]
+      },
+      {
+        "type": "table",
+        "title": "Latest 20 Signals",
+        "targets": [{
+          "rawQuery": true,
+          "rawSql": "SELECT ts, action, spot, score, regime, kelly_fraction, lot_size, risk_usd, r_multiple FROM signals ORDER BY ts DESC LIMIT 20"
+        }]
+      },
+      {
+        "type": "timeseries",
+        "title": "Cumulative R",
+        "targets": [{
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, SUM(r_multiple) OVER (ORDER BY ts) AS cum_r FROM signals WHERE r_multiple IS NOT NULL ORDER BY ts"
+        }]
+      }
+    ]
+  }
+}
