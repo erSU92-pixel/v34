@@ -1,5 +1,5 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v7.0.2 FIXED
+XAUUSD Quantitative Institutional Signal Bot — v7.0.3 FINAL
 ============================================================
 FIX LOG:
   - FIX-1: TwelveData volume scalar
@@ -7,12 +7,16 @@ FIX LOG:
   - FIX-3: check_news_guard wrapper
   - FIX-4: params.json missing → blend returns 0 → SL/TP broken
            (fallback to DEFAULT_PARAMS_FALLBACK, warn in Telegram)
+  - FIX-5: HTML entity injection in notes → Telegram 400 Bad Request
+           (escape user-facing strings + plain-text retry)
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -42,11 +46,10 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "7.0.2"
+VERSION = "7.0.3"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
-# FIX-4: sane defaults when params.json missing
 DEFAULT_PARAMS_FALLBACK: Dict[str, float] = {
     "threshold": 70.0,
     "sl_mult": 1.5,
@@ -481,7 +484,7 @@ class DataFetcher:
 
 
 # ============================================================================
-# 8. ENSEMBLE (21 voters + fuzzy regime)
+# 8. ENSEMBLE
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -590,7 +593,6 @@ def build_ensemble(md, cfg):
         regime_params = {r: flat for r in REGIMES}
     blended = blend_params(weights, regime_params)
 
-    # FIX-4: params.json missing → blend returns zeros → SL/TP broken
     using_fallback = False
     if blended.get("threshold", 0.0) <= 0.0:
         using_fallback = True
@@ -648,7 +650,7 @@ def build_ensemble(md, cfg):
     elif not corr_ok:
         notes.append(f"MACRO: {corr_msg}")
     elif combined < threshold:
-        notes.append(f"GATED[{dom}]: {combined}%<{threshold:.1f}%")
+        notes.append(f"GATED[{dom}]: {combined}% under {threshold:.1f}%")
     elif not macro_ok:
         notes.append("VETO EMA200 H1")
     elif intended == "BUY" and m15_bull:
@@ -758,6 +760,11 @@ class AuditDB:
 # ============================================================================
 # 11. TELEGRAM
 # ============================================================================
+def _strip_html(text: str) -> str:
+    """Remove HTML tags for plain-text fallback."""
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def _tg_post(cfg, payload):
     if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
         return False
@@ -767,10 +774,31 @@ def _tg_post(cfg, payload):
         r = requests.post(
             f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
             json=payload, timeout=cfg.telegram_timeout)
-        if r.status_code != 200:
-            log_event(logging.ERROR, "telegram_error", code=r.status_code, body=r.text[:200])
+        if r.status_code == 200:
+            return True
+
+        # FIX-5: fallback to plain text on HTML parse error
+        if r.status_code == 400 and "parse entities" in r.text:
+            log_event(logging.WARNING, "telegram_html_retry", body=r.text[:200])
+            plain = {
+                "chat_id": payload["chat_id"],
+                "text": _strip_html(payload["text"]),
+                "disable_web_page_preview": True,
+            }
+            if "reply_markup" in payload:
+                plain["reply_markup"] = payload["reply_markup"]
+            r2 = requests.post(
+                f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
+                json=plain, timeout=cfg.telegram_timeout)
+            if r2.status_code == 200:
+                return True
+            log_event(logging.ERROR, "telegram_retry_fail",
+                      code=r2.status_code, body=r2.text[:200])
             return False
-        return True
+
+        log_event(logging.ERROR, "telegram_error",
+                  code=r.status_code, body=r.text[:200])
+        return False
     except Exception as e:
         log_event(logging.ERROR, "telegram_exc", err=str(e)[:120])
         return False
@@ -783,10 +811,13 @@ def send_signal(cfg, e, spot, levels):
         {"text": "📊 Macro", "callback_data": "macro"},
     ]]}
     w = e.regime_weights
-    fuzzy_str = (f"{e.regime} (R:{w.get('RANGING', 0):.2f} "
-                 f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
+    fuzzy_str = html.escape(
+        f"{e.regime} (R:{w.get('RANGING', 0):.2f} "
+        f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})"
+    )
+    safe_reason = html.escape(e.notes[0]) if e.notes else ""
+    safe_kelly = html.escape(levels["kelly_reason"]) if levels else ""
 
-    # FIX-4b: warn when default params in use
     fallback_warn = ""
     if e.using_fallback and e.action in ("BUY", "SELL"):
         fallback_warn = "\n⚠️ <b>DEFAULT PARAMS</b> (params.json missing → run optimizer)"
@@ -795,7 +826,7 @@ def send_signal(cfg, e, spot, levels):
         text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
                 f"⏰ <code>{now}</code>\n"
                 f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                f"Reason: {e.notes[0]}{fallback_warn}")
+                f"Reason: {safe_reason}{fallback_warn}")
     else:
         em = "🟢" if e.action == "BUY" else "🔴"
         text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
@@ -810,7 +841,7 @@ def send_signal(cfg, e, spot, levels):
                 f"BE @  : ${levels['break_even_trigger']:.2f}</code>\n"
                 f"Lot: <b>{levels['lot_size']}</b> | "
                 f"Risk: ${levels['actual_risk_usd']:.0f} ({levels['risk_pct']:.2f}%)\n"
-                f"<i>Kelly: {levels['kelly_reason']}</i>{fallback_warn}")
+                f"<i>Kelly: {safe_kelly}</i>{fallback_warn}")
     return _tg_post(cfg, {
         "chat_id": cfg.telegram_chat_id, "text": text,
         "parse_mode": "HTML", "reply_markup": kb,
@@ -823,7 +854,7 @@ def send_failure(cfg, err):
         return
     _tg_post(cfg, {
         "chat_id": cfg.telegram_chat_id,
-        "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{err[:400]}</code>",
+        "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{html.escape(err[:400])}</code>",
         "parse_mode": "HTML",
     })
 
