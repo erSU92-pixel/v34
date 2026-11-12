@@ -1,8 +1,8 @@
 """
 ================================================================================
-XAUUSD QUANTITATIVE INSTITUTIONAL SIGNAL BOT — v8.1.0 TITANIUM EDITION
+XAUUSD QUANTITATIVE INSTITUTIONAL SIGNAL BOT — v8.1.1 TITANIUM FINAL
 ================================================================================
-Data Cascade: TwelveData -> Yahoo Finance -> XAUS-API (Free/Keyless) -> TickerLayer.
+Data Cascade: TwelveData -> Yahoo Finance -> XAUS-API (Free/Keyless).
 ================================================================================
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ except ImportError:
 # ==============================================================================
 # 1. CONFIGURATION & CONSTANTS
 # ==============================================================================
-VERSION = "8.1.0"
+VERSION = "8.1.1"
 RUN_ID = uuid.uuid4().hex[:8]
 
 @dataclass
@@ -62,7 +62,7 @@ class BotConfig:
     telegram_chat_id: Optional[str] = None
     supabase_url: Optional[str] = None
     supabase_key: Optional[str] = None
-    tickerlayer_api_key: Optional[str] = None # Opsional
+    tickerlayer_api_key: Optional[str] = None
     
     @classmethod
     def load(cls) -> "BotConfig":
@@ -183,7 +183,13 @@ class DataFetcher:
         df = pd.DataFrame(vals).rename(columns={"datetime": "time"})
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open","high","low","close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+        
+        # FIX: Total rewrite for Volume handling in TwelveData
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
+            
         return df.sort_values("time").reset_index(drop=True)
 
     def _fetch_yfinance(self) -> MarketData:
@@ -196,7 +202,12 @@ class DataFetcher:
             d = d.reset_index().rename(columns={"Datetime": "time", "Date": "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
             d["time"] = pd.to_datetime(d["time"], utc=True).dt.tz_localize(None)
             for c in ["open","high","low","close"]: d[c] = pd.to_numeric(d[c], errors="coerce")
-            d["volume"] = pd.to_numeric(d.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+            
+            if "volume" in d.columns:
+                d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(1000.0)
+            else:
+                d["volume"] = 1000.0
+                
             return d.dropna(subset=["open","high","low","close"]).sort_values("time").reset_index(drop=True)
 
         h1 = _norm(h1_raw)
@@ -208,20 +219,15 @@ class DataFetcher:
         return MarketData(h1, m15, "Yahoo(synth)", True)
 
     def _fetch_xaus_api(self) -> MarketData:
-        """Fallback 3: XAUS-API (Free, Keyless, No strict rate limits)."""
-        # xaus-api menyediakan endpoint chart OHLCV. Kita ambil 1h dan 15m.
         try:
-            # Fetch H1
             url_h1 = "https://xaus.com/api/v1/chart?symbol=gold&range=1mo&interval=1h"
             r_h1 = self.session.get(url_h1, timeout=10)
             r_h1.raise_for_status()
             j_h1 = r_h1.json()
-            # Format response mungkin bervariasi; kita coba parse secara generik
             bars_h1 = j_h1.get("bars") or j_h1.get("data") or []
             if not bars_h1: raise RuntimeError("XAUS H1 empty")
             
             df_h1 = pd.DataFrame(bars_h1)
-            # Standardisasi nama kolom
             col_map = {"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
             df_h1 = df_h1.rename(columns=col_map)
             if "time" not in df_h1.columns: df_h1["time"] = df_h1.iloc[:, 0]
@@ -230,7 +236,6 @@ class DataFetcher:
             df_h1["volume"] = pd.to_numeric(df_h1.get("volume", 1000.0), errors="coerce").fillna(1000.0)
             df_h1 = df_h1.dropna(subset=["open","high","low","close"]).sort_values("time").reset_index(drop=True)
             
-            # Fetch M15
             url_m15 = "https://xaus.com/api/v1/chart?symbol=gold&range=1mo&interval=15m"
             r_m15 = self.session.get(url_m15, timeout=10)
             r_m15.raise_for_status()
@@ -250,7 +255,6 @@ class DataFetcher:
             raise RuntimeError(f"XAUS-API failed: {e}")
 
     def fetch(self) -> MarketData:
-        # Tier 1: TwelveData
         try:
             h1 = self._fetch_twelvedata("1h", 500)
             m15 = self._fetch_twelvedata("15min", 200)
@@ -267,7 +271,6 @@ class DataFetcher:
         except Exception as e:
             log_evt(logging.WARNING, "twelvedata_fail", err=str(e)[:100])
 
-        # Tier 2: Yahoo Finance
         try:
             md = self._fetch_yfinance()
             validate_ohlcv(md.h1, "YF-H1")
@@ -275,7 +278,6 @@ class DataFetcher:
         except Exception as e:
             log_evt(logging.WARNING, "yfinance_fail", err=str(e)[:100])
 
-        # Tier 3: XAUS-API (Free Keyless)
         try:
             md = self._fetch_xaus_api()
             validate_ohlcv(md.h1, "XAUS-H1")
@@ -286,13 +288,11 @@ class DataFetcher:
         raise RuntimeError("All data sources failed.")
 
     def fetch_spot(self, h1: pd.DataFrame) -> float:
-        # Coba TwelveData
         if self.cfg.twelve_data_api_key:
             try:
                 r = self.session.get(f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}", timeout=5)
                 return float(r.json().get("price", 0) or 0) or float(h1["close"].iloc[-1])
             except: pass
-        # Fallback ke XAUS-API
         try:
             r = self.session.get("https://xaus.com/api/v1/spot?compact=1", timeout=5)
             data = r.json()
