@@ -1,10 +1,8 @@
 """
 ================================================================================
-XAUUSD QUANTITATIVE INSTITUTIONAL SIGNAL BOT — v8.0 TITANIUM EDITION
+XAUUSD QUANTITATIVE INSTITUTIONAL SIGNAL BOT — v8.1.0 TITANIUM EDITION
 ================================================================================
-Architecture: Single-File, Fault-Tolerant, High-Frequency Ready (Signal Mode).
-Target      : GitHub Actions (Cron 15m) -> Telegram -> Manual MT5 Execution.
-Author      : Principal Quant Architect
+Data Cascade: TwelveData -> Yahoo Finance -> XAUS-API (Free/Keyless) -> TickerLayer.
 ================================================================================
 """
 from __future__ import annotations
@@ -17,9 +15,9 @@ import re
 import sqlite3
 import sys
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,7 +25,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Optional imports with graceful fallback
 try:
     import yfinance as yf
 except ImportError:
@@ -47,31 +44,25 @@ except ImportError:
 # ==============================================================================
 # 1. CONFIGURATION & CONSTANTS
 # ==============================================================================
-VERSION = "8.0.0"
+VERSION = "8.1.0"
 RUN_ID = uuid.uuid4().hex[:8]
 
 @dataclass
 class BotConfig:
-    # Core
     min_bars: int = 250
     retry_total: int = 3
     http_timeout: int = 12
-    
-    # Risk & Execution (XAUUSD Standard)
     account_size_usd: float = 10000.0
     risk_pct: float = 1.0
-    contract_size: float = 100.0  # 1 Lot XAUUSD = 100 oz
-    
-    # Filters
+    contract_size: float = 100.0
     signal_cooldown_min: int = 45
-    news_buffer_min: int = 45     # Blackout window before/after High-Impact news
-    
-    # Environment
+    news_buffer_min: int = 45
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
     supabase_url: Optional[str] = None
     supabase_key: Optional[str] = None
+    tickerlayer_api_key: Optional[str] = None # Opsional
     
     @classmethod
     def load(cls) -> "BotConfig":
@@ -82,11 +73,12 @@ class BotConfig:
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
             supabase_url=os.getenv("SUPABASE_URL"),
-            supabase_key=os.getenv("SUPABASE_KEY")
+            supabase_key=os.getenv("SUPABASE_KEY"),
+            tickerlayer_api_key=os.getenv("TICKERLAYER_API_KEY")
         )
 
 # ==============================================================================
-# 2. STRUCTURED LOGGING & UTILITIES
+# 2. STRUCTURED LOGGING
 # ==============================================================================
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -109,7 +101,6 @@ def log_evt(level: int, event: str, **kw) -> None:
     LOG.handle(rec)
 
 def is_market_open() -> bool:
-    """XAUUSD Market Hours: Sun 22:00 UTC to Fri 21:00 UTC"""
     now = datetime.now(timezone.utc)
     wd, h = now.weekday(), now.hour
     if wd == 5: return False
@@ -216,7 +207,50 @@ class DataFetcher:
         m15["volume"] /= 4.0
         return MarketData(h1, m15, "Yahoo(synth)", True)
 
+    def _fetch_xaus_api(self) -> MarketData:
+        """Fallback 3: XAUS-API (Free, Keyless, No strict rate limits)."""
+        # xaus-api menyediakan endpoint chart OHLCV. Kita ambil 1h dan 15m.
+        try:
+            # Fetch H1
+            url_h1 = "https://xaus.com/api/v1/chart?symbol=gold&range=1mo&interval=1h"
+            r_h1 = self.session.get(url_h1, timeout=10)
+            r_h1.raise_for_status()
+            j_h1 = r_h1.json()
+            # Format response mungkin bervariasi; kita coba parse secara generik
+            bars_h1 = j_h1.get("bars") or j_h1.get("data") or []
+            if not bars_h1: raise RuntimeError("XAUS H1 empty")
+            
+            df_h1 = pd.DataFrame(bars_h1)
+            # Standardisasi nama kolom
+            col_map = {"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+            df_h1 = df_h1.rename(columns=col_map)
+            if "time" not in df_h1.columns: df_h1["time"] = df_h1.iloc[:, 0]
+            df_h1["time"] = pd.to_datetime(df_h1["time"], unit="ms", utc=True).dt.tz_localize(None)
+            for c in ["open","high","low","close"]: df_h1[c] = pd.to_numeric(df_h1[c], errors="coerce")
+            df_h1["volume"] = pd.to_numeric(df_h1.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+            df_h1 = df_h1.dropna(subset=["open","high","low","close"]).sort_values("time").reset_index(drop=True)
+            
+            # Fetch M15
+            url_m15 = "https://xaus.com/api/v1/chart?symbol=gold&range=1mo&interval=15m"
+            r_m15 = self.session.get(url_m15, timeout=10)
+            r_m15.raise_for_status()
+            j_m15 = r_m15.json()
+            bars_m15 = j_m15.get("bars") or j_m15.get("data") or []
+            if not bars_m15: raise RuntimeError("XAUS M15 empty")
+            
+            df_m15 = pd.DataFrame(bars_m15).rename(columns=col_map)
+            if "time" not in df_m15.columns: df_m15["time"] = df_m15.iloc[:, 0]
+            df_m15["time"] = pd.to_datetime(df_m15["time"], unit="ms", utc=True).dt.tz_localize(None)
+            for c in ["open","high","low","close"]: df_m15[c] = pd.to_numeric(df_m15[c], errors="coerce")
+            df_m15["volume"] = pd.to_numeric(df_m15.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+            df_m15 = df_m15.dropna(subset=["open","high","low","close"]).sort_values("time").reset_index(drop=True)
+            
+            return MarketData(df_h1, df_m15, "XAUS-API", False)
+        except Exception as e:
+            raise RuntimeError(f"XAUS-API failed: {e}")
+
     def fetch(self) -> MarketData:
+        # Tier 1: TwelveData
         try:
             h1 = self._fetch_twelvedata("1h", 500)
             m15 = self._fetch_twelvedata("15min", 200)
@@ -233,21 +267,38 @@ class DataFetcher:
         except Exception as e:
             log_evt(logging.WARNING, "twelvedata_fail", err=str(e)[:100])
 
+        # Tier 2: Yahoo Finance
         try:
             md = self._fetch_yfinance()
             validate_ohlcv(md.h1, "YF-H1")
             return md
         except Exception as e:
             log_evt(logging.WARNING, "yfinance_fail", err=str(e)[:100])
+
+        # Tier 3: XAUS-API (Free Keyless)
+        try:
+            md = self._fetch_xaus_api()
+            validate_ohlcv(md.h1, "XAUS-H1")
+            return md
+        except Exception as e:
+            log_evt(logging.WARNING, "xaus_fail", err=str(e)[:100])
             
         raise RuntimeError("All data sources failed.")
 
     def fetch_spot(self, h1: pd.DataFrame) -> float:
+        # Coba TwelveData
+        if self.cfg.twelve_data_api_key:
+            try:
+                r = self.session.get(f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}", timeout=5)
+                return float(r.json().get("price", 0) or 0) or float(h1["close"].iloc[-1])
+            except: pass
+        # Fallback ke XAUS-API
         try:
-            r = self.session.get(f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}", timeout=5)
-            return float(r.json().get("price", 0) or 0) or float(h1["close"].iloc[-1])
-        except:
-            return float(h1["close"].iloc[-1])
+            r = self.session.get("https://xaus.com/api/v1/spot?compact=1", timeout=5)
+            data = r.json()
+            return float(data.get("xau", {}).get("price") or data.get("spot_usd_oz", 0.0)) or float(h1["close"].iloc[-1])
+        except: pass
+        return float(h1["close"].iloc[-1])
 
 # ==============================================================================
 # 5. MACRO, NEWS, & REGIME ENGINE
@@ -255,7 +306,6 @@ class DataFetcher:
 class MacroEngine:
     @staticmethod
     def check_correlation() -> Tuple[bool, str]:
-        """Veto if USD is surging (DXY > 0.4% or US10Y > 0.5% intraday)."""
         if not yf: return True, "Bypass"
         try:
             dxy = yf.Ticker("DX-Y.NYB").history(period="5d")["Close"]
@@ -273,7 +323,6 @@ class MacroEngine:
 
     @staticmethod
     def check_news(cfg: BotConfig) -> Tuple[bool, str]:
-        """Fetch ForexFactory calendar. Veto 45m before/after High-Impact USD news."""
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         try:
             r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
@@ -284,12 +333,10 @@ class MacroEngine:
                         return False, f"News Block: {e['title']}"
             return True, "Clear"
         except:
-            # Static fallback (NFP, CPI, FOMC)
             if now.weekday() in (2,4) and 12 <= now.hour <= 15: return False, "Static Macro Block"
             return True, "Static Clear"
 
 def get_fuzzy_regime(adx_val: float) -> Dict[str, float]:
-    """Membership functions for Fuzzy Logic"""
     def _tri(x, a, b, c):
         if x <= a or x >= c: return 0.0
         if x <= b: return (x - a) / (b - a)
@@ -321,31 +368,24 @@ def evaluate_market(md: MarketData, cfg: BotConfig) -> SignalResult:
     df, m15 = md.h1, md.m15
     c = float(df["close"].iloc[-1])
     
-    # 1. Regime & ATR
     adx_val = float(adx(df, 14)[0].iloc[-1])
     weights = get_fuzzy_regime(adx_val)
     dom_regime = max(weights, key=weights.get)
     atr_val = float(atr(df, 14).iloc[-1])
     
-    # 2. 21-Voter System
     votes = []
-    # SMA (6) & EMA (3)
     votes.extend([1 if c > sma(df["close"], p).iloc[-1] else -1 for p in (5,10,20,50,100,200)])
     votes.extend([1 if ema(df["close"], 9).iloc[-1] > ema(df["close"], 21).iloc[-1] else -1,
                   1 if ema(df["close"], 12).iloc[-1] > ema(df["close"], 26).iloc[-1] else -1,
                   1 if ema(df["close"], 50).iloc[-1] > ema(df["close"], 200).iloc[-1] else -1])
-    # RSI (3)
     r = float(rsi(df["close"]).iloc[-1])
     votes.extend([1 if r > 50 else -1, 1 if r < 70 else -1, 1 if r > 30 else -1])
-    # Momentum (5)
     _, p_di, m_di = adx(df, 14)
     votes.extend([1 if p_di.iloc[-1] > m_di.iloc[-1] else -1, 1 if adx_val > 20 else -1,
                   1 if c > df["close"].iloc[-2] else -1, 1 if c > df["close"].iloc[-5] else -1, 1 if c > df["close"].iloc[-10] else -1])
-    # Microstructure (2)
     for n in (5,10):
         hl = df["high"].iloc[-n:].max() - df["low"].iloc[-n:].min()
         votes.append(1 if (c - df["low"].iloc[-n:].min()) / max(hl, 1e-10) > 0.5 else -1)
-    # Volume (1) & POC (1)
     votes.append(1 if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1] else -1)
     votes.append(1 if c > volume_profile_poc(df) else -1)
 
@@ -354,7 +394,6 @@ def evaluate_market(md: MarketData, cfg: BotConfig) -> SignalResult:
     voter_agree = max(bull_count, bear_count) / 21.0
     intended = "BUY" if bull_count > bear_count else "SELL"
 
-    # 3. Forensic (Wicks & Sweeps)
     last, prev = df.iloc[-1], df.iloc[-21:-1]
     rng = max(last["high"] - last["low"], 0.01)
     wick = (max(last["high"] - max(last["open"], last["close"]), min(last["open"], last["close"]) - last["low"]) / rng) * 100
@@ -362,10 +401,8 @@ def evaluate_market(md: MarketData, cfg: BotConfig) -> SignalResult:
                   (last["low"] < prev["low"].min() and last["close"] > prev["low"].min()) else 0
     f_score = min(30 + sweep + (20 if wick > 40 else 0), 100)
 
-    # 4. Scoring
     combined = round((voter_agree * 0.6 + (f_score / 100.0) * 0.4) * 100, 1)
 
-    # 5. Filters & Thresholds
     base_th = 65.0 if dom_regime == "TRENDING" else (74.0 if dom_regime == "RANGING" else 70.0)
     macro_ok, macro_msg = MacroEngine.check_correlation()
     news_ok, news_msg = MacroEngine.check_news(cfg)
@@ -377,7 +414,6 @@ def evaluate_market(md: MarketData, cfg: BotConfig) -> SignalResult:
     elif not macro_ok: notes = f"Macro Veto: {macro_msg}"
     elif combined < base_th: notes = f"Score {combined}% < {base_th}%"
     else:
-        # Confirm with M15
         m15_bull = ema(m15["close"], 9).iloc[-1] > ema(m15["close"], 21).iloc[-1]
         if intended == "BUY" and m15_bull and c > ema(df["close"], 200).iloc[-1]:
             action = "BUY"
@@ -405,7 +441,6 @@ class DatabaseManager:
                 log_evt(logging.ERROR, "supabase_init_fail", err=str(e))
 
     def get_kelly_risk(self) -> Tuple[float, str]:
-        """Half-Kelly implementation based on past 50 trades."""
         try:
             if self.supabase:
                 res = self.supabase.table("signals").select("r_multiple").in_("action", ["BUY","SELL"]).not_.is_("r_multiple","null").order("ts", desc=True).limit(50).execute()
@@ -422,9 +457,8 @@ class DatabaseManager:
             
             p = len(wins) / len(R)
             b = (sum(wins)/len(wins)) / (sum(losses)/len(losses))
-            f_star = max((p * b - (1-p)) / b, 0.0) * 0.5 # Half-Kelly
-            
-            risk_pct = min(round(f_star * 100, 2), 3.0) # Cap 3%
+            f_star = max((p * b - (1-p)) / b, 0.0) * 0.5
+            risk_pct = min(round(f_star * 100, 2), 3.0)
             return risk_pct if risk_pct > 0 else 0.1, f"Kelly: {risk_pct}% (Win:{p:.2f}, B:{b:.2f})"
         except Exception as e:
             return self.cfg.risk_pct, "Fallback (DB Error)"
@@ -439,7 +473,7 @@ class DatabaseManager:
 def calculate_levels(action: str, price: float, atr: float, risk_pct: float, cfg: BotConfig) -> Optional[Dict]:
     if action not in ("BUY", "SELL"): return None
     
-    sl_dist = max(atr * 1.5, 2.0) # Min $2 SL for Gold
+    sl_dist = max(atr * 1.5, 2.0)
     risk_usd = cfg.account_size_usd * (risk_pct / 100.0)
     lot = round(risk_usd / (sl_dist * cfg.contract_size), 2)
     lot = max(lot, 0.01)
@@ -454,10 +488,7 @@ def calculate_levels(action: str, price: float, atr: float, risk_pct: float, cfg
 # ==============================================================================
 def send_telegram(cfg: BotConfig, sig: SignalResult, spot: float, levels: dict, risk_reason: str) -> None:
     if not cfg.telegram_bot_token or not cfg.telegram_chat_id: return
-    
-    if sig.action == "WAIT":
-        # Silent mode for WAIT to prevent spam
-        return
+    if sig.action == "WAIT": return
         
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     emoji = "🟢" if sig.action == "BUY" else "🔴"
@@ -477,7 +508,7 @@ def send_telegram(cfg: BotConfig, sig: SignalResult, spot: float, levels: dict, 
     
     try:
         r = requests.post(url, json=payload, timeout=8)
-        if r.status_code == 400: # HTML parse fallback
+        if r.status_code == 400:
             payload["text"] = re.sub(r'<[^>]+>', '', text)
             del payload["parse_mode"]
             requests.post(url, json=payload, timeout=8)
@@ -501,11 +532,9 @@ def main() -> int:
         md = fetcher.fetch()
         spot = fetcher.fetch_spot(md.h1)
         
-        # 1. Analyze
         sig = evaluate_market(md, cfg)
-        log_evt(logging.INFO, "analysis_done", action=sig.action, score=sig.score, regime=sig.regime)
+        log_evt(logging.INFO, "analysis_done", action=sig.action, score=sig.score, regime=sig.regime, note=sig.notes, source=md.source)
         
-        # 2. Risk & Execution
         if sig.action in ("BUY", "SELL"):
             risk_pct, risk_reason = db.get_kelly_risk()
             levels = calculate_levels(sig.action, spot, sig.atr, risk_pct, cfg)
@@ -515,7 +544,7 @@ def main() -> int:
                 send_telegram(cfg, sig, spot, levels, risk_reason)
                 print(f"EXECUTED: {sig.action} | Score: {sig.score}% | Lot: {levels['lot']}")
         else:
-            print(f"WAIT: {sig.notes} (Score: {sig.score}%)")
+            print(f"WAIT: {sig.notes} (Score: {sig.score}%) | Source: {md.source}")
             
         return 0
     except Exception as e:
